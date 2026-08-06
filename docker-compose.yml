@@ -1,0 +1,132 @@
+version: '3.8'
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: fusionclip_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fusionclip}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fusionclip123}
+      POSTGRES_DB: ${POSTGRES_DB:-fusionclip}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fusionclip"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: fusionclip_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: fusionclip_minio
+    restart: always
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-fusionclip_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-fusionclip_password123}
+    command: server /data --console-address ":9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fusionclip_backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql://fusionclip:fusionclip123@db:5432/fusionclip}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-minio:9000}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-fusionclip_admin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-fusionclip_password123}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-fusionclip-media}
+      - MINIO_USE_SSL=${MINIO_USE_SSL:-false}
+      - MINIO_EXTERNAL_ENDPOINT=${MINIO_EXTERNAL_ENDPOINT:-http://localhost:9000}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: fusionclip_worker
+    restart: always
+    command: celery -A app.celery_app.celery worker --loglevel=info -P threads
+    environment:
+      - DATABASE_URL=${DATABASE_URL:-postgresql://fusionclip:fusionclip123@db:5432/fusionclip}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-minio:9000}
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-fusionclip_admin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-fusionclip_password123}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-fusionclip-media}
+      - MINIO_USE_SSL=${MINIO_USE_SSL:-false}
+      - MINIO_EXTERNAL_ENDPOINT=${MINIO_EXTERNAL_ENDPOINT:-http://localhost:9000}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    # GPU integration (uncomment if you have nvidia container toolkit installed)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: fusionclip_frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  miniodata:
