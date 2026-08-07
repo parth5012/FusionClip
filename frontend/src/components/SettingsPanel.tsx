@@ -1,7 +1,8 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useStore } from '../store/useStore';
+import { deleteSecret, fetchSecretStatus, saveSecrets, SaveSecretsPayload } from '../utils/api';
 import {
   Key,
   Shield,
@@ -12,29 +13,77 @@ import {
   CheckCircle2,
   Server,
   Terminal,
+  Trash2,
   ExternalLink
 } from 'lucide-react';
 
 export default function SettingsPanel() {
-  const { apiKeys, setApiKeys, colabTunnel, setColabTunnel } = useStore();
+  const { keyStatus, setKeyStatus, colabTunnel, setColabTunnel } = useStore();
 
-  const [geminiKeyInput, setGeminiKeyInput] = useState(apiKeys.geminiKey);
-  const [elevenLabsInput, setElevenLabsInput] = useState(apiKeys.elevenLabsKey);
+  // Inputs are write-only: stored keys can never be read back from the server,
+  // so these always start empty and are cleared again after a successful save.
+  const [geminiKeyInput, setGeminiKeyInput] = useState('');
+  const [elevenLabsInput, setElevenLabsInput] = useState('');
   const [tunnelUrlInput, setTunnelUrlInput] = useState(colabTunnel.endpointUrl);
-  
+
   const [showGemini, setShowGemini] = useState(false);
   const [showEleven, setShowEleven] = useState(false);
   const [savedKeys, setSavedKeys] = useState(false);
   const [savedTunnel, setSavedTunnel] = useState(false);
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [savingKeys, setSavingKeys] = useState(false);
 
-  const saveApiKeys = (e: React.FormEvent) => {
+  const refreshKeyStatus = useCallback(async () => {
+    try {
+      setKeyStatus(await fetchSecretStatus());
+    } catch {
+      /* backend unreachable — keep whatever state we already have */
+    }
+  }, [setKeyStatus]);
+
+  useEffect(() => {
+    refreshKeyStatus();
+  }, [refreshKeyStatus]);
+
+  const saveApiKeys = async (e: React.FormEvent) => {
     e.preventDefault();
-    setApiKeys({
-      geminiKey: geminiKeyInput,
-      elevenLabsKey: elevenLabsInput,
-    });
-    setSavedKeys(true);
-    setTimeout(() => setSavedKeys(false), 3000);
+    setKeyError(null);
+
+    const payload: SaveSecretsPayload = {};
+    if (geminiKeyInput.trim()) payload.gemini_api_key = geminiKeyInput.trim();
+    if (elevenLabsInput.trim()) payload.elevenlabs_api_key = elevenLabsInput.trim();
+
+    if (Object.keys(payload).length === 0) {
+      setKeyError('Enter at least one API key before saving.');
+      return;
+    }
+
+    setSavingKeys(true);
+    try {
+      await saveSecrets(payload);
+      // Clear the plaintext out of component state immediately.
+      setGeminiKeyInput('');
+      setElevenLabsInput('');
+      setShowGemini(false);
+      setShowEleven(false);
+      await refreshKeyStatus();
+      setSavedKeys(true);
+      setTimeout(() => setSavedKeys(false), 3000);
+    } catch {
+      setKeyError('Failed to save API keys. Check that the backend is reachable.');
+    } finally {
+      setSavingKeys(false);
+    }
+  };
+
+  const removeKey = async (provider: 'gemini' | 'elevenlabs') => {
+    setKeyError(null);
+    try {
+      await deleteSecret(provider);
+      await refreshKeyStatus();
+    } catch {
+      setKeyError(`Failed to remove the ${provider} API key.`);
+    }
   };
 
   const saveTunnelSettings = (e: React.FormEvent) => {
@@ -75,15 +124,40 @@ export default function SettingsPanel() {
 
             <form onSubmit={saveApiKeys} className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-450 uppercase mb-2 tracking-wider">
-                  Google Gemini API Key
-                </label>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-xs font-semibold text-slate-450 uppercase tracking-wider">
+                    Google Gemini API Key
+                  </label>
+                  {keyStatus.gemini.configured ? (
+                    <span className="flex items-center gap-2 text-[10px]">
+                      <span className="flex items-center gap-1 text-emerald-400 font-semibold">
+                        <CheckCircle2 className="w-3 h-3" /> Configured
+                        {keyStatus.gemini.last4 && (
+                          <span className="font-mono text-slate-500">
+                            ····{keyStatus.gemini.last4}
+                          </span>
+                        )}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => removeKey('gemini')}
+                        title="Remove stored Gemini API key"
+                        className="text-rose-400 hover:text-rose-300 transition"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-amber-400 font-semibold">Not configured</span>
+                  )}
+                </div>
                 <div className="relative">
                   <input
                     type={showGemini ? 'text' : 'password'}
                     placeholder="Enter Gemini API key..."
                     value={geminiKeyInput}
                     onChange={(e) => setGeminiKeyInput(e.target.value)}
+                    autoComplete="off"
                     className="bg-slate-950 border border-slate-700 rounded-md w-full px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-sky-500 focus:border-sky-500 pr-10 font-mono"
                   />
                   <button
@@ -100,15 +174,40 @@ export default function SettingsPanel() {
               </div>
 
               <div>
-                <label className="block text-xs font-semibold text-slate-450 uppercase mb-2 tracking-wider">
-                  ElevenLabs API Key
-                </label>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-xs font-semibold text-slate-450 uppercase tracking-wider">
+                    ElevenLabs API Key
+                  </label>
+                  {keyStatus.elevenlabs.configured ? (
+                    <span className="flex items-center gap-2 text-[10px]">
+                      <span className="flex items-center gap-1 text-emerald-400 font-semibold">
+                        <CheckCircle2 className="w-3 h-3" /> Configured
+                        {keyStatus.elevenlabs.last4 && (
+                          <span className="font-mono text-slate-500">
+                            ····{keyStatus.elevenlabs.last4}
+                          </span>
+                        )}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => removeKey('elevenlabs')}
+                        title="Remove stored ElevenLabs API key"
+                        className="text-rose-400 hover:text-rose-300 transition"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-amber-400 font-semibold">Not configured</span>
+                  )}
+                </div>
                 <div className="relative">
                   <input
                     type={showEleven ? 'text' : 'password'}
                     placeholder="Enter ElevenLabs API key..."
                     value={elevenLabsInput}
                     onChange={(e) => setElevenLabsInput(e.target.value)}
+                    autoComplete="off"
                     className="bg-slate-950 border border-slate-700 rounded-md w-full px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-sky-500 focus:border-sky-500 pr-10 font-mono"
                   />
                   <button
@@ -124,12 +223,19 @@ export default function SettingsPanel() {
                 </span>
               </div>
 
+              {keyError && (
+                <p className="text-xs text-rose-400 bg-rose-950/30 border border-rose-900/50 rounded-md px-3 py-2">
+                  {keyError}
+                </p>
+              )}
+
               <div className="pt-4 flex items-center justify-between">
                 <button
                   type="submit"
-                  className="bg-sky-600 hover:bg-sky-500 text-white font-semibold text-sm px-4 py-2 rounded-md shadow-sm transition active:scale-[98%]"
+                  disabled={savingKeys}
+                  className="bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm px-4 py-2 rounded-md shadow-sm transition active:scale-[98%]"
                 >
-                  Save API Keys
+                  {savingKeys ? 'Saving…' : 'Save API Keys'}
                 </button>
 
                 {savedKeys && (
@@ -143,11 +249,13 @@ export default function SettingsPanel() {
 
           <div className="mt-8 bg-slate-950/40 border border-slate-800 p-4 rounded-md text-xs text-slate-400 space-y-2">
             <span className="font-semibold text-slate-300 block flex items-center gap-1.5">
-              <HelpCircle className="w-3.5 h-3.5 text-indigo-400" /> Sandbox Safety
+              <HelpCircle className="w-3.5 h-3.5 text-indigo-400" /> Key Handling
             </span>
             <p>
-              API keys are stored securely in local browser state storage. They never leave your
-              device except to communicate with direct endpoints.
+              API keys are sent to the FusionClip backend once and stored encrypted on the server,
+              where background workers can use them. They are never written to browser storage and
+              are never returned to the browser again — only a “configured” flag and the last four
+              characters. Clear the input and re-enter a key to rotate it.
             </p>
           </div>
         </section>

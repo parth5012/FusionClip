@@ -125,3 +125,69 @@ export async function fetchMediaCatalog(query = '', limit = 20): Promise<MediaAs
   }
   return res.json();
 }
+
+/* ── Provider API keys ─────────────────────────────────────────────────────
+ * Keys are submitted once in plaintext and stored encrypted server-side.
+ * They are never readable again: the status endpoint returns only whether a
+ * provider is configured plus the last four characters.
+ * ------------------------------------------------------------------------ */
+
+export type SecretProvider = 'gemini' | 'elevenlabs';
+
+export interface ProviderSecretStatus {
+  configured: boolean;
+  last4: string | null;
+}
+
+export interface SecretStatusResponse {
+  gemini: ProviderSecretStatus;
+  elevenlabs: ProviderSecretStatus;
+}
+
+export interface SaveSecretsPayload {
+  gemini_api_key?: string;
+  elevenlabs_api_key?: string;
+}
+
+export interface SaveSecretsResponse {
+  status: string;
+  updated: SecretProvider[];
+}
+
+export interface DeleteSecretResponse {
+  status: string;
+  provider: string;
+  deleted: boolean;
+}
+
+export async function fetchSecretStatus(): Promise<SecretStatusResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/settings/secrets`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch API key status');
+  }
+  return res.json();
+}
+
+export async function saveSecrets(payload: SaveSecretsPayload): Promise<SaveSecretsResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/settings/secrets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    throw new Error('Failed to save API keys');
+  }
+  return res.json();
+}
+
+export async function deleteSecret(provider: SecretProvider): Promise<DeleteSecretResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/settings/secrets/${provider}`, {
+    method: 'DELETE',
+  });
+
+  if (!res.ok) {
+    throw new Error(`Failed to remove ${provider} API key`);
+  }
+  return res.json();
+}

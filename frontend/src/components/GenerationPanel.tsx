@@ -5,9 +5,9 @@ import { useStore } from '../store/useStore';
 import { Sparkles, BrainCircuit, Music, Wand2, ArrowUpRight, Cpu } from 'lucide-react';
 
 export default function GenerationPanel() {
-  const { apiKeys } = useStore();
+  const { keyStatus } = useStore();
 
-  const missingKeys = !apiKeys.geminiKey || !apiKeys.elevenLabsKey;
+  const missingKeys = !keyStatus.gemini.configured || !keyStatus.elevenlabs.configured;
 
   const features = [
     {

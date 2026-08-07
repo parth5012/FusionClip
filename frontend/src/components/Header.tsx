@@ -1,13 +1,30 @@
 'use client';
 
-import React from 'react';
+import React, { useEffect } from 'react';
 import { useStore } from '../store/useStore';
+import { fetchSecretStatus } from '../utils/api';
 import { Database, HardDrive, Zap, Cpu, Menu, ShieldAlert } from 'lucide-react';
 
 export default function Header() {
-  const { toggleSidebar, sidebarOpen, colabTunnel, apiKeys } = useStore();
+  const { toggleSidebar, sidebarOpen, colabTunnel, keyStatus, setKeyStatus } = useStore();
 
-  const missingKeys = !apiKeys.geminiKey || !apiKeys.elevenLabsKey;
+  // The header is mounted on every tab, so it is the natural place to sync the
+  // server-reported key configuration state into the store on load.
+  useEffect(() => {
+    let cancelled = false;
+    fetchSecretStatus()
+      .then((status) => {
+        if (!cancelled) setKeyStatus(status);
+      })
+      .catch(() => {
+        /* backend unreachable — leave the default "not configured" state */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [setKeyStatus]);
+
+  const missingKeys = !keyStatus.gemini.configured || !keyStatus.elevenlabs.configured;
 
   return (
     <header className="h-16 flex items-center justify-between px-6 bg-slate-900 border-b border-slate-800 sticky top-0 z-30 shadow-md">

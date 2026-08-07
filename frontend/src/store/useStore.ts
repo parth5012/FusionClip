@@ -3,9 +3,14 @@ import { persist } from 'zustand/middleware';
 
 export type TabType = 'library' | 'catalog' | 'generation' | 'players' | 'settings' | 'tunnels';
 
-interface ApiKeys {
-  geminiKey: string;
-  elevenLabsKey: string;
+export interface ProviderKeyStatus {
+  configured: boolean;
+  last4: string | null;
+}
+
+export interface KeyStatus {
+  gemini: ProviderKeyStatus;
+  elevenlabs: ProviderKeyStatus;
 }
 
 interface ColabTunnel {
@@ -17,36 +22,36 @@ interface AppState {
   // Navigation
   activeTab: TabType;
   setActiveTab: (tab: TabType) => void;
-  
-  // API Keys Config
-  apiKeys: ApiKeys;
-  setApiKeys: (keys: Partial<ApiKeys>) => void;
-  
+
+  // Server-reported API key configuration state.
+  // Deliberately NOT persisted: no key material may ever reach localStorage.
+  keyStatus: KeyStatus;
+  setKeyStatus: (status: KeyStatus) => void;
+
   // Colab Tunnel Config
   colabTunnel: ColabTunnel;
   setColabTunnel: (tunnel: Partial<ColabTunnel>) => void;
-  
+
   // Layout
   sidebarOpen: boolean;
   toggleSidebar: () => void;
   setSidebarOpen: (open: boolean) => void;
 }
 
+export const EMPTY_KEY_STATUS: KeyStatus = {
+  gemini: { configured: false, last4: null },
+  elevenlabs: { configured: false, last4: null },
+};
+
 export const useStore = create<AppState>()(
   persist(
     (set) => ({
       activeTab: 'library',
       setActiveTab: (activeTab) => set({ activeTab }),
-      
-      apiKeys: {
-        geminiKey: '',
-        elevenLabsKey: '',
-      },
-      setApiKeys: (keys) =>
-        set((state) => ({
-          apiKeys: { ...state.apiKeys, ...keys },
-        })),
-      
+
+      keyStatus: EMPTY_KEY_STATUS,
+      setKeyStatus: (keyStatus) => set({ keyStatus }),
+
       colabTunnel: {
         status: 'disconnected',
         endpointUrl: '',
@@ -55,13 +60,22 @@ export const useStore = create<AppState>()(
         set((state) => ({
           colabTunnel: { ...state.colabTunnel, ...tunnel },
         })),
-      
+
       sidebarOpen: true,
       toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
       setSidebarOpen: (sidebarOpen) => set({ sidebarOpen }),
     }),
     {
       name: 'fusionclip-settings', // persisted in localStorage
+      // Allowlist of persisted slices. keyStatus is intentionally excluded so
+      // that no API key material — not even a redacted last4 — is written to
+      // localStorage. API keys themselves live only in the encrypted
+      // server-side store and are never held in client state at all.
+      partialize: (state) => ({
+        activeTab: state.activeTab,
+        colabTunnel: state.colabTunnel,
+        sidebarOpen: state.sidebarOpen,
+      }),
     }
   )
 );
