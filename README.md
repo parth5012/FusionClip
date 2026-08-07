@@ -2,6 +2,20 @@
 
 FusionClip is an open-source, self-hosted multimedia management and generation dashboard designed to coordinate video, audio, and image handling using commercial APIs, local inference models, and remote Google Colab GPU compute nodes.
 
+## Getting Started
+
+See the **[User Guide](USER_GUIDE.md)** for complete instructions on running FusionClip with Docker Compose or local development, including prerequisites, configuration, and troubleshooting.
+
+### Quick Start (Docker Compose)
+
+```bash
+git clone https://github.com/parth5012/FusionClip.git
+cd FusionClip
+docker compose up -d
+```
+
+Then open **http://localhost:3000** in your browser.
+
 ## Core Stack
 - **Frontend**: Next.js (React, TypeScript, Tailwind CSS)
 - **Backend API**: FastAPI (Python)
