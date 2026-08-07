@@ -148,21 +148,28 @@ class TestPrefixMatchingIsCaseSensitiveByDesign:
         assert keys == ["secret.gemini_api_key"]
         assert all(secret_store.is_secret_key(key) for key in keys)
 
-    @pytest.mark.parametrize("variant", ["SECRET.x", "Secret.x", " secret.x"])
-    def test_non_canonical_variants_are_not_classified_as_secret(self, variant):
+    @pytest.mark.parametrize("variant", ["SECRET.x", "Secret.x"])
+    def test_case_variants_are_classified_as_secret(self, variant):
+        """L-1 fix: is_secret_key is now casefolded, so variant-cased
+        prefixes are still recognised as secret keys — removing a footgun
+        before five branches add config keys."""
+        assert secret_store.is_secret_key(variant) is True
+
+    @pytest.mark.parametrize("variant", [" secret.x"])
+    def test_leading_whitespace_variant_is_not_classified_as_secret(self, variant):
+        """Casefolding does not strip whitespace; a leading space means the
+        key does not start with 'secret.' and is not a secret key."""
         assert secret_store.is_secret_key(variant) is False
 
-    def test_non_canonical_variant_is_stored_as_an_ordinary_visible_setting(
+    def test_non_canonical_variant_is_rejected_by_settings_endpoint(
         self, client
     ):
-        """Consequence of the above: 'SECRET.x' is accepted and IS visible.
-
-        This is not a leak of encrypted material — nothing encrypted is ever
-        written under that key — but it records the behaviour explicitly.
-        """
+        """Consequence of L-1: 'SECRET.demo' is now classified as a secret
+        key (casefolded), so the plain settings endpoint rejects it with
+        400 — it must be written via POST /api/settings/secrets."""
         res = client.post("/api/settings", json={"SECRET.demo": "ordinary-value"})
-        assert res.status_code == 200
-        assert client.get("/api/settings").json()["SECRET.demo"] == "ordinary-value"
+        assert res.status_code == 400
+        assert "secret" in res.json()["detail"].lower()
 
 
 class TestEncryptionRoundTripAndKeyRotation:
