@@ -76,6 +76,18 @@ export const useStore = create<AppState>()(
         colabTunnel: state.colabTunnel,
         sidebarOpen: state.sidebarOpen,
       }),
+      // Migration: strip any apiKeys leaked by pre-WS-1 versions. Without this,
+      // partialize only filters *writes* — existing users' plaintext keys stay
+      // on disk and are scrubbed only as an incidental side effect of the next
+      // state mutation (which never fires when the backend is unreachable).
+      version: 1,
+      migrate: (persistedState: any, _version: number) => {
+        if (persistedState && 'apiKeys' in persistedState) {
+          const { apiKeys, ...clean } = persistedState;
+          return clean;
+        }
+        return persistedState;
+      },
     }
   )
 );
