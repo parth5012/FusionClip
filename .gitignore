@@ -52,3 +52,7 @@ frontend/e2e-report/
 frontend/test-results/
 frontend/playwright-report/
 frontend/blob-report/
+
+
+.pipeline/
+graphify-out/

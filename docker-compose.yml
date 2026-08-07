@@ -67,6 +67,8 @@ services:
       - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-fusionclip-media}
       - MINIO_USE_SSL=${MINIO_USE_SSL:-false}
       - MINIO_EXTERNAL_ENDPOINT=${MINIO_EXTERNAL_ENDPOINT:-http://localhost:9000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+      - FUSIONCLIP_SECRET_KEY=${FUSIONCLIP_SECRET_KEY:-fusionclip-dev-insecure-key-change-me}
     volumes:
       - ./backend:/app
     depends_on:
@@ -93,6 +95,7 @@ services:
       - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-fusionclip-media}
       - MINIO_USE_SSL=${MINIO_USE_SSL:-false}
       - MINIO_EXTERNAL_ENDPOINT=${MINIO_EXTERNAL_ENDPOINT:-http://localhost:9000}
+      - FUSIONCLIP_SECRET_KEY=${FUSIONCLIP_SECRET_KEY:-fusionclip-dev-insecure-key-change-me}
     volumes:
       - ./backend:/app
     depends_on:
