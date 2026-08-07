@@ -1,7 +1,10 @@
+import logging
 import os
 from typing import List
 
 from pydantic_settings import BaseSettings
+
+logger = logging.getLogger(__name__)
 
 # Development-only placeholder for the secret-store master key. Any deployment
 # still running with this value is logged loudly at startup (see
@@ -27,7 +30,9 @@ class Settings(BaseSettings):
 
     # CORS — comma separated list of allowed browser origins. A wildcard is
     # deliberately NOT the default: allow_credentials=True with "*" is rejected
-    # by browsers and would leak credentials.
+    # by browsers and would leak credentials. A wildcard in the env var is
+    # rejected loudly (mirrors warn_if_dev_secret_key) so the dangerous
+    # combination can never be configured by accident.
     CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "http://localhost:3000")
 
     # Master key used to Fernet-encrypt third-party provider API keys stored in
@@ -38,8 +43,23 @@ class Settings(BaseSettings):
 
     @property
     def CORS_ORIGINS_LIST(self) -> List[str]:
-        """CORS_ORIGINS parsed into a list of individual origins."""
-        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+        """CORS_ORIGINS parsed into a list of individual origins.
+
+        Rejects a wildcard origin: pairing "*" with allow_credentials=True is
+        the exact anti-pattern T-02 was built to remove, and the secret
+        endpoints now sit behind this CORS policy. A wildcard is logged loudly
+        and replaced with an empty list so the dangerous combination is
+        impossible by construction.
+        """
+        raw = [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+        if "*" in raw:
+            logger.warning(
+                "CORS_ORIGINS contains '*' (wildcard) — this is incompatible with "
+                "allow_credentials and exposes unauthenticated secret endpoints. "
+                "Rejecting wildcard; set explicit origins instead."
+            )
+            return [o for o in raw if o != "*"]
+        return raw
 
     class Config:
         case_sensitive = True
