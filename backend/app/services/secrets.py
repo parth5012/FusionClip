@@ -41,23 +41,55 @@ class SecretStoreError(RuntimeError):
 
 
 def is_secret_key(key: str) -> bool:
-    """True when a configuration key holds encrypted secret material."""
-    return key.startswith(SECRET_KEY_PREFIX)
+    """True when a configuration key holds encrypted secret material.
+
+    Casefolded (L-1): a variant-cased prefix like `SECRET.x` is still
+    recognised as a secret key, removing a footgun before five branches
+    add config keys.
+    """
+    return key.lower().startswith(SECRET_KEY_PREFIX)
 
 
 def _fernet() -> Fernet:
     """Build a Fernet instance from the configured master key.
 
-    ``FUSIONCLIP_SECRET_KEY`` is an arbitrary passphrase, so it is hashed to
-    exactly 32 bytes and urlsafe-base64 encoded to satisfy Fernet's key format.
+    ``FUSIONCLIP_SECRET_KEY`` is an arbitrary passphrase, so it is run through
+    PBKDF2-HMAC-SHA256 (600k iters, fixed app salt) to derive exactly 32 bytes,
+    then urlsafe-base64 encoded to satisfy Fernet's key format. A bare SHA-256
+    (the previous KDF) is fast to brute-force when the master key is a human
+    passphrase; PBKDF2 raises the cost materially (M-2).
     """
-    digest = hashlib.sha256(settings.FUSIONCLIP_SECRET_KEY.encode("utf-8")).digest()
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        settings.FUSIONCLIP_SECRET_KEY.encode("utf-8"),
+        b"fusionclip-secret-store-v1",
+        600_000,
+    )
     return Fernet(base64.urlsafe_b64encode(digest))
 
 
 def warn_if_dev_secret_key() -> bool:
-    """Log a loud warning when the dev-default master key is still in use."""
+    """Log a loud warning when the dev-default master key is still in use.
+
+    Refuses to start (M-4) when the dev-default key is paired with a
+    non-localhost CORS origin — that combination "encrypts" secrets under a
+    published key while reachable from the network, which is obfuscation, not
+    encryption. Localhost-only dev is allowed to proceed with a warning.
+    """
     if settings.FUSIONCLIP_SECRET_KEY == DEV_DEFAULT_SECRET_KEY:
+        origins = settings.CORS_ORIGINS_LIST
+        non_localhost = [
+            o for o in origins
+            if "localhost" not in o and "127.0.0.1" not in o
+        ]
+        if non_localhost:
+            raise RuntimeError(
+                "FUSIONCLIP_SECRET_KEY is the insecure development default and "
+                f"CORS_ORIGINS includes non-localhost origins {non_localhost}. "
+                "Stored provider API keys would be effectively unprotected and "
+                "reachable from the network. Set FUSIONCLIP_SECRET_KEY to a strong "
+                "unique value before deploying."
+            )
         logger.warning(
             "FUSIONCLIP_SECRET_KEY is the insecure development default. "
             "Stored provider API keys are effectively unprotected. "
