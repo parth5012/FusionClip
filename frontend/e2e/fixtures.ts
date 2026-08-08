@@ -62,7 +62,9 @@ export async function apiUploadFile(
   folder = '',
 ): Promise<{ filename: string; path: string; url: string }> {
   const formData = new FormData();
-  formData.append('file', new Blob([content], { type: contentType }), name);
+  // Wrap in Uint8Array so BlobPart is valid across all TS lib configs
+  // (Buffer is a Uint8Array subclass but not always accepted as BlobPart).
+  formData.append('file', new Blob([new Uint8Array(content)], { type: contentType }), name);
 
   const res = await fetch(
     `${API_BASE}/api/storage/upload?folder=${encodeURIComponent(folder)}`,
@@ -134,6 +136,15 @@ export async function apiSaveSettings(data: Record<string, string>): Promise<voi
     body: JSON.stringify(data),
   });
   if (!res.ok) throw new Error(`API save settings failed: ${res.status}`);
+}
+
+/** Remove all stored secrets (test isolation — the secret endpoints are
+ *  unauthenticated, so earlier tests' keys persist server-side and would
+ *  make later tests' "not configured" assertions order-dependent. */
+export async function apiResetSecrets(): Promise<void> {
+  for (const provider of ['gemini', 'elevenlabs']) {
+    await fetch(`${API_BASE}/api/settings/secrets/${provider}`, { method: 'DELETE' });
+  }
 }
 
 /** Fetch media catalog */

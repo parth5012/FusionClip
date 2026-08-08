@@ -34,12 +34,14 @@ test.describe('Full Integration Happy Path', () => {
     await page.locator('button').filter({ hasText: /save api keys/i }).click();
     await expect(page.getByText('Saved!')).toBeVisible({ timeout: 5000 });
 
-    // Verify localStorage was updated
+    // Verify no key material leaked into localStorage (keys are stored
+    // server-side only — the {configured, last4} contract never returns
+    // key material to the browser).
     const stored = await page.evaluate(() => {
       const raw = localStorage.getItem('fusionclip-settings');
       return raw ? JSON.parse(raw) : null;
     });
-    expect(stored.state.apiKeys.geminiKey).toBe('e2e-gemini-key-happy-path');
+    expect(stored.state).not.toHaveProperty('apiKeys');
 
     /* ──────── Step 2: Upload Asset via File Manager ──────── */
     await navigateToTab(page, 'Media Library');

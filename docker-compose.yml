@@ -57,7 +57,11 @@ services:
     container_name: fusionclip_backend
     restart: always
     ports:
-      - "8000:8000"
+      # Bind backend to localhost only. The secret endpoints are
+      # unauthenticated (see ADR-0001); publishing on all interfaces would
+      # expose key overwrite / deletion to the network. Phase 2 turns
+      # key-overwrite into billable spend via /api/generate/*.
+      - "127.0.0.1:8000:8000"
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgresql://fusionclip:fusionclip123@db:5432/fusionclip}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}

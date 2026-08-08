@@ -35,10 +35,13 @@ app = FastAPI(
 
 # Configure CORS for the Next.js frontend. An explicit origin list is required
 # because allow_credentials=True is incompatible with a wildcard origin.
+# allow_credentials is False because the app has no cookies, sessions or auth
+# (see ADR-0001); retaining True would be the sole reason a wildcard CORS
+# origin is dangerous (L-6).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS_LIST,
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

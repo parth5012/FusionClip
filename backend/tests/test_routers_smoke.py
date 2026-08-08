@@ -257,7 +257,10 @@ class TestGenerateRouter:
         body = res.json()
         assert set(body) == {"status", "output"}
         assert body["status"] == "COMPLETED"
-        assert prompt[:15] in body["output"]
+        # Relaxed (L-4): pins the mock string today, but T-07 will replace
+        # the mock with a real Gemini call and break this assertion.
+        # Verify non-empty output + correct status only.
+        assert body["output"]
 
     def test_generate_audio_no_longer_raises_nameerror(self, client, stub_storage, db_session):
         """Regression: `time` was never imported in the old main.py (NameError)."""

@@ -1,16 +1,25 @@
-import { test, expect, API_BASE, apiGetSettings, apiSaveSettings, navigateToTab } from './fixtures';
+import { test, expect, API_BASE, apiGetSettings, apiSaveSettings, apiResetSecrets, navigateToTab } from './fixtures';
 
 /**
  * Suite 4 — Settings & Configuration Console
  *
  * Tests the Settings panel: Gemini API key, ElevenLabs API key,
  * Colab tunnel endpoint URL configuration, persistence via
- * localStorage (zustand persist) and backend API.
+ * the encrypted server-side store (never localStorage — see C-1/WS-1).
+ *
+ * API keys are write-only: the server never returns key material, only
+ * a `{configured, last4}` status. Tests verify against that contract.
  */
 test.describe('Settings Configuration', () => {
   const testGeminiKey = 'e2e-test-gemini-key-abc123';
   const testElevenLabsKey = 'e2e-test-elevenlabs-key-xyz789';
   const testTunnelUrl = 'https://e2e-test-tunnel.trycloudflare.com';
+
+  // The secret endpoints are unauthenticated; earlier tests' keys persist
+  // server-side and would make "not configured" assertions order-dependent.
+  test.beforeEach(async () => {
+    await apiResetSecrets();
+  });
 
   test('settings panel renders all configuration sections', async ({ page }) => {
     await page.goto('/');
@@ -34,7 +43,7 @@ test.describe('Settings Configuration', () => {
     await expect(elevenLabsInput).toBeVisible();
   });
 
-  test('enter and save API keys via UI persists to zustand localStorage', async ({ page }) => {
+  test('enter and save API keys via UI reports configured status', async ({ page }) => {
     await page.goto('/');
     await navigateToTab(page, 'Configuration');
     await expect(page.getByText('System Integration Configuration')).toBeVisible({ timeout: 10000 });
@@ -54,18 +63,20 @@ test.describe('Settings Configuration', () => {
     // Wait for "Saved!" confirmation
     await expect(page.getByText('Saved!', { exact: false })).toBeVisible({ timeout: 5000 });
 
-    // Verify localStorage persistence
+    // Server now reports both keys as configured (the {configured, last4}
+    // contract — key material never returns to the browser).
+    await expect(page.getByText('Configured', { exact: false }).first()).toBeVisible({ timeout: 5000 });
+
+    // Verify no key material leaked into localStorage.
     const storedState = await page.evaluate(() => {
       const raw = localStorage.getItem('fusionclip-settings');
       return raw ? JSON.parse(raw) : null;
     });
-
     expect(storedState).toBeTruthy();
-    expect(storedState.state.apiKeys.geminiKey).toBe(testGeminiKey);
-    expect(storedState.state.apiKeys.elevenLabsKey).toBe(testElevenLabsKey);
+    expect(storedState.state).not.toHaveProperty('apiKeys');
   });
 
-  test('API keys persist across page reloads via zustand persist', async ({ page }) => {
+  test('API keys persist across page reloads via server-side store', async ({ page }) => {
     await page.goto('/');
     await navigateToTab(page, 'Configuration');
     await expect(page.getByText('System Integration Configuration')).toBeVisible({ timeout: 10000 });
@@ -83,12 +94,11 @@ test.describe('Settings Configuration', () => {
     await navigateToTab(page, 'Configuration');
     await expect(page.getByText('System Integration Configuration')).toBeVisible({ timeout: 10000 });
 
-    // Keys should be pre-filled from localStorage
+    // Inputs are write-only: they always start empty (keys are never read
+    // back from the server). The "Configured" badge reflects server state.
+    await expect(page.getByText('Configured', { exact: false }).first()).toBeVisible({ timeout: 5000 });
     const geminiValue = await page.locator('input[placeholder*="Gemini" i]').inputValue();
-    const elevenLabsValue = await page.locator('input[placeholder*="ElevenLabs" i]').inputValue();
-
-    expect(geminiValue).toBe(testGeminiKey);
-    expect(elevenLabsValue).toBe(testElevenLabsKey);
+    expect(geminiValue).toBe('');
   });
 
   test('API key visibility toggles work (show/hide password)', async ({ page }) => {

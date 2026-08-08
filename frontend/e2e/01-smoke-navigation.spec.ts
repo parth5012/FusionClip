@@ -66,9 +66,9 @@ test.describe('Smoke & Navigation', () => {
     await page.goto('/');
     const header = page.locator('header');
 
-    // Should show postgres, MinIO, Redis badges
-    await expect(header).toContainText('pgvector', { timeout: 5000 });
-    await expect(header).toContainText('MinIO', { timeout: 5000 });
-    await expect(header).toContainText('Redis', { timeout: 5000 });
+    // Should show Postgres, MinIO S3, Queue badges (Header.tsx labels)
+    await expect(header).toContainText('Postgres', { timeout: 5000 });
+    await expect(header).toContainText('MinIO S3', { timeout: 5000 });
+    await expect(header).toContainText('Queue', { timeout: 5000 });
   });
 });
