@@ -103,6 +103,7 @@ def stub_storage(monkeypatch):
 def stub_redis(monkeypatch, fake_redis):
     """Point the router and Celery task modules at fakeredis."""
     monkeypatch.setattr("app.routers.tasks.redis_client", fake_redis, raising=False)
+    monkeypatch.setattr("app.routers.settings.redis_client", fake_redis, raising=False)
     monkeypatch.setattr("app.tasks.redis_client", fake_redis, raising=False)
     return fake_redis
 

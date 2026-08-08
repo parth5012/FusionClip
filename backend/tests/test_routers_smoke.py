@@ -387,3 +387,139 @@ class TestDependencyOverride:
             .value
             == "yes"
         )
+
+
+class TestColabEndpoints:
+    def test_colab_websocket_authentication(self, client):
+        # Without token
+        with pytest.raises(Exception):
+            with client.websocket_connect("/api/ws/colab") as websocket:
+                pass
+
+        # With invalid token
+        with pytest.raises(Exception):
+            with client.websocket_connect("/api/ws/colab?token=bad-token") as websocket:
+                pass
+
+    def test_colab_websocket_connect(self, client, stub_redis, db_session):
+        from app.config import settings
+        from app.models import Configuration
+        # With valid token
+        token = settings.FUSIONCLIP_SECRET_KEY
+        with client.websocket_connect(f"/api/ws/colab?token={token}") as websocket:
+            # Check DB updated status
+            status_row = db_session.query(Configuration).filter(Configuration.key == "colab_tunnel_status").first()
+            assert status_row is not None
+            assert status_row.value == "running"
+            # Check Redis state
+            assert stub_redis.get("colab:connected") == b"true"
+        
+        # After disconnect, status should be disconnected
+        db_session.expire_all()
+        status_row = db_session.query(Configuration).filter(Configuration.key == "colab_tunnel_status").first()
+        assert status_row.value == "disconnected"
+        assert stub_redis.get("colab:connected") == b"false"
+
+    def test_colab_http_endpoints_auth(self, client):
+        # 1. pending tasks
+        res = client.get("/api/colab/tasks/pending")
+        assert res.status_code == 401
+        
+        res = client.get("/api/colab/tasks/pending?token=invalid")
+        assert res.status_code == 401
+
+        # 2. update task
+        res = client.post("/api/colab/tasks/update", json={"task_id": "t1", "status": "COMPLETED", "progress": 100})
+        assert res.status_code == 401
+
+        # 3. metrics
+        res = client.post("/api/colab/metrics", json={
+            "vram_used": 1.0, "vram_total": 8.0, "ram_used": 2.0, "ram_total": 16.0, "cpu_load": 10.0
+        })
+        assert res.status_code == 401
+
+    def test_colab_http_pending_tasks(self, client, stub_redis):
+        from app.config import settings
+        token = settings.FUSIONCLIP_SECRET_KEY
+        
+        # Pull when empty
+        res = client.get(f"/api/colab/tasks/pending?token={token}")
+        assert res.status_code == 200
+        assert res.json() == {"task": None}
+        
+        # Push mock task to Redis list
+        import json
+        task_payload = {"task_id": "test_id_123", "task_type": "transcode"}
+        stub_redis.rpush("colab_pending_tasks_http", json.dumps(task_payload))
+        
+        # Pull again
+        res = client.get(f"/api/colab/tasks/pending?token={token}")
+        assert res.status_code == 200
+        assert res.json() == task_payload
+
+    def test_colab_http_update_task(self, client, stub_redis, db_session):
+        from app.config import settings
+        from app.models import Task
+        import json
+        token = settings.FUSIONCLIP_SECRET_KEY
+        
+        # Seed Task in DB
+        task_id = "test_task_http_update"
+        db_task = Task(task_id=task_id, name="transcode", status="PROCESSING", progress=50)
+        db_session.add(db_task)
+        db_session.commit()
+        
+        # Update via HTTP
+        payload = {
+            "task_id": task_id,
+            "status": "COMPLETED",
+            "progress": 100,
+            "output": {"url": "http://test-output.mp4"}
+        }
+        res = client.post(f"/api/colab/tasks/update?token={token}", json=payload)
+        assert res.status_code == 200
+        
+        # Verify DB updated
+        db_session.expire_all()
+        updated_task = db_session.query(Task).filter(Task.task_id == task_id).first()
+        assert updated_task.status == "COMPLETED"
+        assert updated_task.progress == 100
+        
+        # Verify Redis state
+        task_res = stub_redis.get(f"colab_task_result:{task_id}")
+        assert task_res is not None
+        assert json.loads(task_res)["status"] == "SUCCESS"
+
+    def test_colab_http_metrics(self, client, stub_redis, db_session):
+        from app.config import settings
+        from app.models import Configuration
+        import json
+        token = settings.FUSIONCLIP_SECRET_KEY
+        
+        # Get metrics initially empty
+        res = client.get("/api/colab/metrics")
+        assert res.status_code == 200
+        assert res.json()["status"] == "disconnected"
+        
+        # Post metrics
+        metrics_payload = {
+            "vram_used": 4.0,
+            "vram_total": 8.0,
+            "ram_used": 8.0,
+            "ram_total": 16.0,
+            "cpu_load": 45.5,
+            "active_task": "upscale"
+        }
+        res = client.post(f"/api/colab/metrics?token={token}", json=metrics_payload)
+        assert res.status_code == 200
+        
+        # Get updated metrics
+        res = client.get("/api/colab/metrics")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["status"] == "connected"
+        assert body["metrics"]["vram_used"] == 4.0
+        assert body["metrics"]["vram_percent"] == 50.0
+        assert body["metrics"]["ram_percent"] == 50.0
+        assert body["metrics"]["cpu_load"] == 45.5
+        assert body["metrics"]["active_task"] == "upscale"
