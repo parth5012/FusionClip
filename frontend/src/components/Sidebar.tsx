@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { useStore, TabType } from '../store/useStore';
-import { Folder, Sparkles, Settings, Sliders, Menu, X, Search } from 'lucide-react';
+import { Folder, Sparkles, Settings, Sliders, Menu, X, Search, Activity } from 'lucide-react';
 
 export default function Sidebar() {
   const { activeTab, setActiveTab, sidebarOpen, toggleSidebar } = useStore();
@@ -32,13 +32,19 @@ const menuItems = [
     icon: Sliders,
     description: 'Scrub Waveform',
   },
-  {
-    id: 'settings' as TabType,
-    label: 'Configuration',
-    icon: Settings,
-    description: 'API Keys & Tunnels',
-  },
-];
+    {
+      id: 'settings' as TabType,
+      label: 'Configuration',
+      icon: Settings,
+      description: 'API Keys & Tunnels',
+    },
+    {
+      id: 'monitor' as TabType,
+      label: 'Compute Monitor',
+      icon: Activity,
+      description: 'GPU / CPU Live Metrics',
+    },
+  ];
 
   return (
     <>

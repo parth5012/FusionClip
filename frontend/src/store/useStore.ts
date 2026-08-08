@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-export type TabType = 'library' | 'catalog' | 'generation' | 'players' | 'settings' | 'tunnels';
+export type TabType = 'library' | 'catalog' | 'generation' | 'players' | 'settings' | 'tunnels' | 'monitor';
 
 export interface ProviderKeyStatus {
   configured: boolean;
@@ -18,6 +18,25 @@ interface ColabTunnel {
   endpointUrl: string;
 }
 
+export interface ColabMetrics {
+  vram_used: number;
+  vram_total: number;
+  ram_used: number;
+  ram_total: number;
+  cpu_load: number;
+  active_task: string | null;
+  vram_percent: number;
+  ram_percent: number;
+  updated_at: number;
+}
+
+export interface ColabMetricsHistoryPoint {
+  timestamp: number;
+  vram_percent: number;
+  ram_percent: number;
+  cpu_load: number;
+}
+
 interface AppState {
   // Navigation
   activeTab: TabType;
@@ -31,6 +50,13 @@ interface AppState {
   // Colab Tunnel Config
   colabTunnel: ColabTunnel;
   setColabTunnel: (tunnel: Partial<ColabTunnel>) => void;
+
+  // Colab Compute Metrics
+  colabMetrics: ColabMetrics | null;
+  colabMetricsHistory: ColabMetricsHistoryPoint[];
+  setColabMetrics: (metrics: ColabMetrics | null) => void;
+  pushMetricsHistory: (point: ColabMetricsHistoryPoint) => void;
+  clearMetricsHistory: () => void;
 
   // Layout
   sidebarOpen: boolean;
@@ -60,6 +86,15 @@ export const useStore = create<AppState>()(
         set((state) => ({
           colabTunnel: { ...state.colabTunnel, ...tunnel },
         })),
+
+      colabMetrics: null,
+      colabMetricsHistory: [],
+      setColabMetrics: (colabMetrics) => set({ colabMetrics }),
+      pushMetricsHistory: (point) =>
+        set((state) => ({
+          colabMetricsHistory: [...state.colabMetricsHistory.slice(-119), point],
+        })),
+      clearMetricsHistory: () => set({ colabMetricsHistory: [] }),
 
       sidebarOpen: true,
       toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),

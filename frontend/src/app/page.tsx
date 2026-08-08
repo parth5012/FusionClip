@@ -8,6 +8,7 @@ import CatalogPanel from '../components/CatalogPanel';
 import GenerationPanel from '../components/GenerationPanel';
 import SettingsPanel from '../components/SettingsPanel';
 import PlayersPanel from '../components/PlayersPanel';
+import MonitorPanel from '../components/MonitorPanel';
 import { useStore } from '../store/useStore';
 
 export default function Home() {
@@ -36,6 +37,8 @@ export default function Home() {
       case 'settings':
       case 'tunnels':
         return <SettingsPanel />;
+      case 'monitor':
+        return <MonitorPanel />;
       default:
         return <FileManager />;
     }

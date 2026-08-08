@@ -191,3 +191,28 @@ export async function deleteSecret(provider: SecretProvider): Promise<DeleteSecr
   }
   return res.json();
 }
+
+/* ── Colab Compute Metrics ─────────────────────────────────────────────── */
+
+export interface ColabMetricsResponse {
+  status: 'connected' | 'disconnected';
+  metrics: {
+    vram_used: number;
+    vram_total: number;
+    ram_used: number;
+    ram_total: number;
+    cpu_load: number;
+    active_task: string | null;
+    vram_percent: number;
+    ram_percent: number;
+    updated_at: number;
+  } | null;
+}
+
+export async function fetchColabMetrics(): Promise<ColabMetricsResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/colab/metrics`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch Colab metrics');
+  }
+  return res.json();
+}
