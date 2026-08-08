@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 .Python
+.env
 env/
 venv/
 .venv/
@@ -43,3 +44,18 @@ build/
 # OS Files
 .DS_Store
 Thumbs.db
+
+*/.scratch/
+
+# Playwright E2E test artifacts
+frontend/e2e-report/
+frontend/test-results/
+frontend/playwright-report/
+frontend/blob-report/
+
+# TypeScript build artifacts
+frontend/*.tsbuildinfo
+
+
+.pipeline/
+graphify-out/
