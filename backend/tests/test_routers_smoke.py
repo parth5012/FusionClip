@@ -523,3 +523,123 @@ class TestColabEndpoints:
         assert body["metrics"]["ram_percent"] == 50.0
         assert body["metrics"]["cpu_load"] == 45.5
         assert body["metrics"]["active_task"] == "upscale"
+
+    def test_colab_image_generation_routing(self, client, stub_redis, db_session):
+        # Set Colab as connected
+        stub_redis.set("colab:connected", "true")
+        
+        # We need a background thread/task to pretend to be Colab and complete the task.
+        # Since this runs synchronously in pytest-fastapi-testclient, we can just pre-populate
+        # the redis result key beforehand, or run a mock to write it once published.
+        # Let's write a thread to monitor dispatches and write back a completion response!
+        import json
+        import threading
+        import time
+        
+        def mock_colab_worker():
+            # Wait for dispatch log
+            pubsub = stub_redis.pubsub()
+            pubsub.subscribe("colab_dispatches")
+            # Let's wait for message
+            start = time.time()
+            while time.time() - start < 5:
+                msg = pubsub.get_message(ignore_subscribe_messages=True)
+                if msg:
+                    data = json.loads(msg["data"].decode() if isinstance(msg["data"], bytes) else msg["data"])
+                    task_id = data["task_id"]
+                    # Write completion response
+                    stub_redis.set(f"colab_task_result:{task_id}", json.dumps({
+                        "status": "SUCCESS",
+                        "output": {
+                            "url": "http://test-colab-output/image.png",
+                            "filename": "colab_output.png"
+                        }
+                    }))
+                    break
+                time.sleep(0.05)
+            pubsub.close()
+            
+        t = threading.Thread(target=mock_colab_worker)
+        t.start()
+        
+        # Trigger generation: it will dispatch to Colab and wait for result
+        res = client.post("/api/generate/image?prompt=scenic+view")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["status"] == "COMPLETED"
+        assert body["url"] == "http://test-colab-output/image.png"
+        assert body["colab"] is True
+        
+        t.join()
+
+    def test_colab_generation_timeout(self, client, stub_redis):
+        # Set Colab as connected
+        stub_redis.set("colab:connected", "true")
+        
+        # Trigger generation: it will dispatch to Colab, wait, and timeout (we change timeout locally or mock it)
+        # To avoid waiting 60s in tests, let's mock dispatch_gen_to_colab timeout parameter to 0.5s!
+        import app.routers.generate as gen_router
+        orig_dispatch = gen_router.dispatch_gen_to_colab
+        
+        def mock_dispatch(task_type, parameters, db, timeout=60, file_extension="png", content_type="image/png"):
+            return orig_dispatch(task_type, parameters, db, timeout=0.1, file_extension=file_extension, content_type=content_type)
+            
+        gen_router.dispatch_gen_to_colab = mock_dispatch
+        try:
+            res = client.post("/api/generate/image?prompt=scenic+view")
+            assert res.status_code == 504
+        finally:
+            gen_router.dispatch_gen_to_colab = orig_dispatch
+
+    def test_colab_celery_task_routing(self, stub_redis, db_session):
+        from app.tasks import process_media_heavy
+        from app.models import Task
+        
+        # Set Colab as connected
+        stub_redis.set("colab:connected", "true")
+        
+        # We need a mock worker thread to respond to the Celery task dispatch
+        import json
+        import threading
+        import time
+        
+        task_id = "test-celery-colab-task"
+        
+        # Seed Task in DB
+        db_task = Task(task_id=task_id, name="transcode", status="PROCESSING", progress=0)
+        db_session.add(db_task)
+        db_session.commit()
+        
+        def mock_colab_worker():
+            # Wait for dispatch log
+            pubsub = stub_redis.pubsub()
+            pubsub.subscribe("colab_dispatches")
+            start = time.time()
+            while time.time() - start < 5:
+                msg = pubsub.get_message(ignore_subscribe_messages=True)
+                if msg:
+                    data = json.loads(msg["data"].decode() if isinstance(msg["data"], bytes) else msg["data"])
+                    task_id_extracted = data["task_id"]
+                    # Write completion response
+                    stub_redis.set(f"colab_task_result:{task_id_extracted}", json.dumps({
+                        "status": "SUCCESS",
+                        "output": {
+                            "url": "http://test-colab-heavy-output/processed.mp4",
+                            "filename": "processed.mp4"
+                        }
+                    }))
+                    break
+                time.sleep(0.05)
+            pubsub.close()
+            
+        t = threading.Thread(target=mock_colab_worker)
+        t.start()
+        
+        # Run Celery task on main thread (mocking self.request.id class/task reference)
+        process_media_heavy.request.id = task_id
+        result = process_media_heavy.run("raw_video.mp4", "transcode")
+        
+        assert result["status"] == "COMPLETED"
+        assert result["processed_url"] == "http://test-colab-heavy-output/processed.mp4"
+        
+        t.join()

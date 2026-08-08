@@ -160,6 +160,103 @@ def process_media_fast(self, object_name: str, task_type: str = "thumbnail"):
 # Heavy task queue endpoint
 @celery.task(bind=True, name="app.tasks.process_media_heavy")
 def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
+    logger.info(f"Processing heavy task: {task_type} {object_name}")
+    task_id = self.request.id
+
+    # Check Colab availability
+    is_colab = redis_client.get("colab:connected") == b"true"
+    if is_colab:
+        logger.info(f"Colab worker detected! Offloading heavy task {task_type} for {object_name}")
+        # Dispatch to Colab
+        task_payload = {
+            "type": "task_dispatch",
+            "task_id": task_id,
+            "task_type": task_type,
+            "parameters": {
+                "object_name": object_name,
+                "input_url": generate_url(object_name)
+            }
+        }
+        redis_client.publish("colab_dispatches", json.dumps(task_payload))
+        redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
+        redis_client.expire("colab_pending_tasks_http", 3600)
+        
+        # Wait for result on Redis
+        result_key = f"colab_task_result:{task_id}"
+        timeout = 120
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            res_data = redis_client.get(result_key)
+            if res_data:
+                res = json.loads(res_data)
+                
+                # Check status
+                db = SessionLocal()
+                try:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if res.get("status") == "SUCCESS":
+                        output = res.get("output", {})
+                        processed_url = output.get("url", "")
+                        processed_name = output.get("filename", f"processed_{object_name.split('/')[-1]}")
+                        
+                        if db_task:
+                            db_task.status = "COMPLETED"
+                            db_task.progress = 100
+                            db.commit()
+                        
+                        redis_client.publish("task_updates", json.dumps({
+                            "task_id": task_id,
+                            "status": "COMPLETED",
+                            "progress": 100,
+                            "error": None
+                        }))
+                        
+                        return {
+                            "status": "COMPLETED",
+                            "task_id": task_id,
+                            "original_object": object_name,
+                            "processed_url": processed_url
+                        }
+                    else:
+                        error_msg = res.get("error", "Task failed on Colab")
+                        if db_task:
+                            db_task.status = "FAILED"
+                            db_task.error = error_msg
+                            db.commit()
+                        
+                        redis_client.publish("task_updates", json.dumps({
+                            "task_id": task_id,
+                            "status": "FAILED",
+                            "progress": 0,
+                            "error": error_msg
+                        }))
+                        raise Exception(error_msg)
+                finally:
+                    db.close()
+            time.sleep(0.5)
+            
+        # Timeout
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = "FAILED"
+                db_task.error = "Execution timed out waiting for Colab worker response"
+                db.commit()
+        finally:
+            db.close()
+            
+        redis_client.publish("task_updates", json.dumps({
+            "task_id": task_id,
+            "status": "FAILED",
+            "progress": 0,
+            "error": "Colab execution timed out"
+        }))
+        raise TimeoutError("Colab execution timed out")
+
+    return _original_process_media_heavy(self, object_name, task_type)
+
+def _original_process_media_heavy(self, object_name: str, task_type: str = "transcode"):
     logger.info(f"Processing heavy task: {task_type} for {object_name}")
     task_id = self.request.id
     

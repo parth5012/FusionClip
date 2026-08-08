@@ -87,7 +87,7 @@ def stub_storage(monkeypatch):
             prefix += "/"
         return {"current_dir": prefix, "directories": [], "files": []}
 
-    for module in ("app.storage", "app.routers.storage", "app.routers.generate", "app.routers.media"):
+    for module in ("app.storage", "app.routers.storage", "app.routers.generate", "app.routers.media", "app.tasks"):
         for name, impl in (
             ("upload_object", _upload_object),
             ("generate_url", _generate_url),
@@ -104,8 +104,19 @@ def stub_redis(monkeypatch, fake_redis):
     """Point the router and Celery task modules at fakeredis."""
     monkeypatch.setattr("app.routers.tasks.redis_client", fake_redis, raising=False)
     monkeypatch.setattr("app.routers.settings.redis_client", fake_redis, raising=False)
+    monkeypatch.setattr("app.routers.generate.redis_client", fake_redis, raising=False)
     monkeypatch.setattr("app.tasks.redis_client", fake_redis, raising=False)
     return fake_redis
+
+
+def patch_tasks_db(monkeypatch, db_session):
+    """Ensure SessionLocal in app.tasks returns the test db_session."""
+    class MockSessionLocal:
+        def __call__(self):
+            return db_session
+    monkeypatch.setattr("app.tasks.SessionLocal", MockSessionLocal(), raising=False)
+
+patch_tasks_db = pytest.fixture(autouse=True)(patch_tasks_db)
 
 
 @pytest.fixture()
