@@ -54,6 +54,11 @@ async def upload_file(
         )
         db.add(asset)
         db.commit()
+        try:
+            from app.tasks import generate_media_embedding
+            generate_media_embedding.delay(asset.id)
+        except Exception as celery_err:
+            logger.error(f"Failed to schedule embedding task for asset {asset.id}: {celery_err}")
     except Exception as e:
         logger.error(f"Failed to save asset to db: {e}")
         db.rollback()
