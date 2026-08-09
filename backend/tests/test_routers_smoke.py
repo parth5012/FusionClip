@@ -388,7 +388,7 @@ class TestMediaRouter:
         assert res.status_code == 200
         body = res.json()
         assert len(body) == 1
-        assert set(body[0]) == self.ASSET_KEYS
+        assert self.ASSET_KEYS.issubset(set(body[0]))
         assert body[0]["title"] == "Sunset timelapse"
 
     def test_search_falls_back_when_vector_search_unavailable(
@@ -403,6 +403,47 @@ class TestMediaRouter:
     def test_search_no_matches(self, client, db_session, stub_storage):
         self._seed(db_session)
         assert client.get("/api/media/search?query=nonexistent").json() == []
+
+    def test_clip_embedding_generation_and_task(self, db_session, monkeypatch):
+        from app.tasks import CLIPEmbedder, generate_media_embedding
+        asset = MediaAsset(
+            title="A photo of a dog in a park.jpg",
+            file_path="photos/dog.jpg",
+            file_size=1024,
+            content_type="image/jpeg",
+            duration=0.0
+        )
+        db_session.add(asset)
+        db_session.commit()
+        asset_id = asset.id
+
+        mock_embedding = [0.1] * 512
+        monkeypatch.setattr(CLIPEmbedder, "embed_image", lambda x: CLIPEmbedder.pad_embedding(mock_embedding))
+        monkeypatch.setattr(CLIPEmbedder, "embed_text", lambda x: CLIPEmbedder.pad_embedding(mock_embedding))
+
+        generate_media_embedding(asset_id)
+        
+        db_asset = db_session.query(MediaAsset).filter(MediaAsset.id == asset_id).one()
+        assert db_asset.embedding is not None
+        assert len(db_asset.embedding) == 1536
+        assert db_asset.embedding[0] == 0.1
+        assert db_asset.embedding[512] == 0.0
+
+    def test_search_score_and_threshold(self, client, db_session):
+        self._seed(db_session)
+        
+        # Test default search has score 1.0 in fallback
+        res = client.get("/api/media/search?query=Sunset&threshold=0.5")
+        assert res.status_code == 200
+        body = res.json()
+        assert len(body) == 1
+        assert body[0]["title"] == "Sunset timelapse"
+        assert body[0]["score"] == 1.0
+        
+        # Test search with query of sunset and a high threshold (e.g. 1.5) filters out the item
+        res_filtered = client.get("/api/media/search?query=Sunset&threshold=1.5")
+        assert res_filtered.status_code == 200
+        assert len(res_filtered.json()) == 0
 
 
 class TestDependencyOverride:
