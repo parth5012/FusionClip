@@ -6,10 +6,11 @@ import {
   ChevronRight, Volume2, Video as VideoIcon, Image as ImageIcon,
   Loader2, Cpu, ArrowLeft, ArrowUpRight, CheckCircle2, AlertCircle
 } from 'lucide-react';
-import { 
-  fetchFiles, uploadFile, deleteFile, createFolder, 
-  startTask, getTaskStatus, StorageItem, TaskStatusResponse 
+import {
+  fetchFiles, uploadFile, deleteFile, createFolder,
+  startTask, startUpscale, getTaskStatus, StorageItem, TaskStatusResponse
 } from '../utils/api';
+import UpscalerPanel from './UpscalerPanel';
 
 export default function FileManager() {
   const [currentDir, setCurrentDir] = useState<string>('');
@@ -35,6 +36,9 @@ export default function FileManager() {
     percent?: number;
     statusText?: string;
   }>>({});
+
+  // Upscaler State
+  const [upscaleTargetFile, setUpscaleTargetFile] = useState<string | null>(null);
 
   const loadDirectory = async (dir: string) => {
     setLoading(true);
@@ -423,13 +427,13 @@ export default function FileManager() {
                       <Play className="w-3 h-3 text-sky-500" /> Transcode
                     </button>
                     <div className="w-[1px] h-3.5 bg-slate-850" />
-                    <button
-                      onClick={() => handleTriggerTask(file.path, 'upscale')}
-                      className="text-xs hover:bg-slate-800 text-slate-300 hover:text-emerald-400 p-1 px-1.5 rounded transition flex items-center gap-1"
-                      title="Upscale file resolution"
-                    >
-                      <Cpu className="w-3 h-3 text-emerald-500" /> Upscale
-                    </button>
+            <button
+              onClick={() => setUpscaleTargetFile(file.path)}
+              className="text-xs hover:bg-slate-800 text-slate-300 hover:text-emerald-400 p-1 px-1.5 rounded transition flex items-center gap-1"
+              title="Upscale file resolution"
+            >
+              <Cpu className="w-3 h-3 text-emerald-500" /> Upscale
+            </button>
                   </div>
 
                   {/* Playback / Pre-signed direct link */}
@@ -458,6 +462,30 @@ export default function FileManager() {
             ))}
           </div>
         </div>
+      )}
+
+      {upscaleTargetFile && (
+        <UpscalerPanel
+          filePath={upscaleTargetFile}
+          onClose={() => setUpscaleTargetFile(null)}
+          onStartUpscale={async (params) => {
+            try {
+              const taskRes = await startUpscale(upscaleTargetFile, params);
+              setActiveTasks((prev) => ({
+                ...prev,
+                [taskRes.task_id]: {
+                  id: taskRes.task_id,
+                  objectName: upscaleTargetFile,
+                  taskType: 'upscale',
+                  state: taskRes.status
+                }
+              }));
+              setUpscaleTargetFile(null);
+            } catch (err: any) {
+              alert(err.message || 'Upscale pipeline dispatch failed');
+            }
+          }}
+        />
       )}
     </div>
   );

@@ -6,6 +6,7 @@ import json
 import redis
 from app.celery_app import celery
 from app.storage import upload_object, generate_url
+from app.upscaler import TileUpscaler, calculate_tile_size
 from app.scratchpad import scratchpad
 from app.database import SessionLocal
 from app.models import Task, MediaAsset
@@ -345,3 +346,247 @@ def process_multimedia_task(self, object_name: str, task_type: str = "transcode"
         return process_media_fast(object_name, task_type)
     else:
         return process_media_heavy(object_name, task_type)
+
+
+@celery.task(bind=True, name="app.tasks.process_upscale_task")
+def process_upscale_task(self, task_id: str, object_name: str, params: dict):
+    logger.info(f"Starting upscale task: {task_id} for {object_name} with params {params}")
+    
+    # Check Colab availability
+    is_colab = redis_client.get("colab:connected") == b"true"
+    if is_colab:
+        logger.info(f"Colab worker detected! Offloading upscale task {task_id}")
+        task_payload = {
+            "type": "task_dispatch",
+            "task_id": task_id,
+            "task_type": "upscale",
+            "parameters": {
+                "object_name": object_name,
+                "input_url": generate_url(object_name),
+                **params
+            }
+        }
+        redis_client.publish("colab_dispatches", json.dumps(task_payload))
+        redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
+        redis_client.expire("colab_pending_tasks_http", 3600)
+        
+        # Wait for result in Redis
+        result_key = f"colab_task_result:{task_id}"
+        timeout = 180
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            res_data = redis_client.get(result_key)
+            if res_data:
+                res = json.loads(res_data)
+                
+                db = SessionLocal()
+                try:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if res.get("status") == "SUCCESS":
+                        output = res.get("output", {})
+                        processed_url = output.get("url", "")
+                        processed_name = output.get("filename", f"processed_{object_name.split('/')[-1]}")
+                        
+                        if db_task:
+                            db_task.status = "COMPLETED"
+                            db_task.progress = 100
+                        db.commit()
+                        
+                        redis_client.publish("task_updates", json.dumps({
+                            "task_id": task_id,
+                            "status": "COMPLETED",
+                            "progress": 100,
+                            "error": None
+                        }))
+                        
+                        # Create MediaAsset record
+                        asset = MediaAsset(
+                            title=f"Upscaled: {object_name.split('/')[-1]}",
+                            file_path=processed_name,
+                            file_size=0,
+                            content_type="image/png"
+                        )
+                        db.add(asset)
+                        db.commit()
+                        
+                        return {
+                            "status": "COMPLETED",
+                            "task_id": task_id,
+                            "original_object": object_name,
+                            "processed_url": processed_url
+                        }
+                    else:
+                        error_msg = res.get("error", "Task failed on Colab")
+                        if db_task:
+                            db_task.status = "FAILED"
+                            db_task.error = error_msg
+                        db.commit()
+                        
+                        redis_client.publish("task_updates", json.dumps({
+                            "task_id": task_id,
+                            "status": "FAILED",
+                            "progress": 0,
+                            "error": error_msg
+                        }))
+                        raise Exception(error_msg)
+                finally:
+                    db.close()
+            time.sleep(0.5)
+            
+        # Timeout
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = "FAILED"
+                db_task.error = "Execution timed out waiting for Colab worker response"
+            db.commit()
+        finally:
+            db.close()
+            
+        redis_client.publish("task_updates", json.dumps({
+            "task_id": task_id,
+            "status": "FAILED",
+            "progress": 0,
+            "error": "Colab execution timed out"
+        }))
+        raise TimeoutError("Colab execution timed out")
+        
+    # Local fallback processing
+    from PIL import Image
+    from app.scratchpad import scratchpad
+    
+    temp_in = scratchpad.get_temp_path(suffix="_in.png")
+    temp_out = scratchpad.get_temp_path(suffix="_out.png")
+    
+    db = SessionLocal()
+    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not db_task:
+        db_task = Task(task_id=task_id, name="upscale", status="PROCESSING", progress=0)
+        db.add(db_task)
+        db.commit()
+    db.close()
+    
+    from app.storage import s3_client
+    try:
+        # Download S3 object locally
+        s3_client.download_file(settings.MINIO_BUCKET_NAME, object_name, str(temp_in))
+        
+        # Open source image
+        img = Image.open(str(temp_in))
+        
+        # Crop for preview mode if needed
+        if params.get("preview", False):
+            w, h = img.size
+            cw, ch = min(252, w), min(252, h)
+            left = (w - cw) // 2
+            top = (h - ch) // 2
+            img = img.crop((left, top, left + cw, top + ch))
+            
+        # Progress callback setup
+        def progress_callback(percent, msg):
+            self.update_state(state="PROGRESS", meta={"percent": percent, "status": msg})
+            db = SessionLocal()
+            try:
+                db_t = db.query(Task).filter(Task.task_id == task_id).first()
+                if db_t:
+                    db_t.progress = percent
+                db.commit()
+            finally:
+                db.close()
+                
+            redis_client.publish("task_updates", json.dumps({
+                "task_id": task_id,
+                "status": "PROCESSING",
+                "progress": percent,
+                "error": None
+            }))
+            
+        # Resolve tile size
+        width, height = img.size
+        tile_size = calculate_tile_size(width, height, 16.0)
+        
+        # Execute upscaler engine with OOM protection
+        while True:
+            try:
+                upscaler = TileUpscaler(tile_size=tile_size, overlap=0.25)
+                # We scale by 2.0x default
+                upscaled_img = upscaler.upscale(
+                    img,
+                    upscale_factor=2.0,
+                    progress_callback=progress_callback,
+                    **params
+                )
+                break
+            except Exception as e:
+                is_oom = "out of memory" in str(e).lower() or "oom" in str(e).lower()
+                if is_oom and tile_size > 256:
+                    logger.warning(f"OOM error: reducing tile size from {tile_size} to {tile_size - 256} and retrying")
+                    tile_size = max(256, tile_size - 256)
+                else:
+                    raise e
+                    
+        # Save output image
+        upscaled_img.save(str(temp_out))
+        
+        # Upload scale result back
+        processed_name = f"processed/scaled_{int(time.time())}_{object_name.split('/')[-1]}"
+        with open(str(temp_out), "rb") as f:
+            upload_success = upload_object(f.read(), processed_name, content_type="image/png")
+            
+        # Final success update
+        db = SessionLocal()
+        try:
+            db_t = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_t:
+                db_t.status = "COMPLETED"
+                db_t.progress = 100
+            db.commit()
+            
+            # Create MediaAsset record
+            asset = MediaAsset(
+                title=f"Upscaled: {object_name.split('/')[-1]}",
+                file_path=processed_name,
+                file_size=os.path.getsize(str(temp_out)),
+                content_type="image/png"
+            )
+            db.add(asset)
+            db.commit()
+        finally:
+            db.close()
+            
+        redis_client.publish("task_updates", json.dumps({
+            "task_id": task_id,
+            "status": "COMPLETED",
+            "progress": 100,
+            "error": None
+        }))
+        
+        return {
+            "status": "COMPLETED",
+            "task_id": task_id,
+            "original_object": object_name,
+            "processed_url": generate_url(processed_name) if upload_success else None
+        }
+    except Exception as e:
+        logger.error(f"Error executing upscale task {task_id}: {e}")
+        db = SessionLocal()
+        try:
+            db_t = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_t:
+                db_t.status = "FAILED"
+                db_t.error = str(e)
+            db.commit()
+        finally:
+            db.close()
+            
+        redis_client.publish("task_updates", json.dumps({
+            "task_id": task_id,
+            "status": "FAILED",
+            "progress": 0,
+            "error": str(e)
+        }))
+        raise e
+    finally:
+        scratchpad.remove_path(temp_in)
+        scratchpad.remove_path(temp_out)

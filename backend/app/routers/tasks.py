@@ -4,12 +4,17 @@ import asyncio
 import logging
 
 import redis
+import uuid
 from celery.result import AsyncResult
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, Depends
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from app.celery_app import celery
 from app.config import settings
-from app.tasks import process_multimedia_task
+from app.tasks import process_multimedia_task, process_upscale_task
+from app.deps import get_db
+from app.models import Task
 
 logger = logging.getLogger(__name__)
 
@@ -83,3 +88,35 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
     finally:
         pubsub.unsubscribe("task_updates")
         pubsub.close()
+
+
+class UpscaleRequest(BaseModel):
+    denoising_strength: float = 0.35
+    controlnet_weight: float = 1.25
+    preset: str = "Portraits"
+    preview: bool = False
+
+
+@router.post("/api/upscale")
+def run_upscale_pipeline(
+    path: str = Query(..., description="Key of the image object to upscale"),
+    request: UpscaleRequest = None,
+    db: Session = Depends(get_db)
+):
+    """Orchestrate upscale task: creates database entry and dispatches Celery task."""
+    task_id = f"upscale_{uuid.uuid4().hex[:8]}"
+    
+    # Create database task record
+    db_task = Task(task_id=task_id, name="upscale", status="PROCESSING", progress=0)
+    db.add(db_task)
+    db.commit()
+    
+    params = request.dict() if request else {}
+    process_upscale_task.delay(task_id, path, params)
+    
+    return {
+        "message": "Upscale task initiated successfully",
+        "task_id": task_id,
+        "status": "PROCESSING",
+    }
+

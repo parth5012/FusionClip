@@ -88,9 +88,30 @@ export async function startTask(path: string, taskType = 'transcode'): Promise<T
   const res = await fetch(url, {
     method: 'POST',
   });
-  
+
   if (!res.ok) {
     throw new Error(`Failed to start task: ${taskType}`);
+  }
+  return res.json();
+}
+
+export async function startUpscale(
+  path: string,
+  params: {
+    denoising_strength: number;
+    controlnet_weight: number;
+    preset: string;
+    preview: boolean;
+  }
+): Promise<TaskResponse> {
+  const url = `${API_BASE_URL}/api/upscale?path=${encodeURIComponent(path)}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    throw new Error('Failed to start upscale task');
   }
   return res.json();
 }
@@ -216,3 +237,24 @@ export async function fetchColabMetrics(): Promise<ColabMetricsResponse> {
   }
   return res.json();
 }
+
+export async function fetchSettings(): Promise<Record<string, string>> {
+  const res = await fetch(`${API_BASE_URL}/api/settings`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch settings');
+  }
+  return res.json();
+}
+
+export async function saveSettings(data: Record<string, any>): Promise<any> {
+  const res = await fetch(`${API_BASE_URL}/api/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    throw new Error('Failed to save settings');
+  }
+  return res.json();
+}
+
