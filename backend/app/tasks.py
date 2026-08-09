@@ -590,3 +590,138 @@ def process_upscale_task(self, task_id: str, object_name: str, params: dict):
     finally:
         scratchpad.remove_path(temp_in)
         scratchpad.remove_path(temp_out)
+
+
+class CLIPEmbedder:
+    _model = None
+    _processor = None
+    
+    @classmethod
+    def get_model_and_processor(cls):
+        if cls._model is None or cls._processor is None:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Loading CLIP model onto {device}...")
+            cls._model = CLIPModel.from_pretrained('openai/clip-vit-base-patch32').to(device)
+            cls._processor = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch32')
+        return cls._model, cls._processor
+
+    @classmethod
+    def embed_text(cls, text: str) -> list[float]:
+        import torch
+        model, processor = cls.get_model_and_processor()
+        device = next(model.parameters()).device
+        inputs = processor(text=[text], return_tensors='pt', padding=True, truncation=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model.get_text_features(**inputs)
+            feats = outputs.pooler_output
+            feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+            emb = feats[0].tolist()
+        return cls.pad_embedding(emb)
+
+    @classmethod
+    def embed_image(cls, image_bytes: bytes) -> list[float]:
+        import torch
+        from PIL import Image
+        import io
+        model, processor = cls.get_model_and_processor()
+        device = next(model.parameters()).device
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        inputs = processor(images=img, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model.get_image_features(**inputs)
+            feats = outputs.pooler_output
+            feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+            emb = feats[0].tolist()
+        return cls.pad_embedding(emb)
+
+    @classmethod
+    def pad_embedding(cls, emb: list[float], target_dim: int = 1536) -> list[float]:
+        if len(emb) < target_dim:
+            emb = emb + [0.0] * (target_dim - len(emb))
+        return emb[:target_dim]
+
+
+@celery.task(bind=True, name="app.tasks.generate_media_embedding")
+def generate_media_embedding(self, asset_id: int):
+    logger.info(f"Generating embedding for MediaAsset id: {asset_id}")
+    db = SessionLocal()
+    try:
+        asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
+        if not asset:
+            logger.error(f"MediaAsset {asset_id} not found")
+            return
+        
+        is_image = False
+        if asset.content_type and asset.content_type.startswith("image/"):
+            is_image = True
+        
+        if is_image:
+            try:
+                from app.storage import s3_client
+                response = s3_client.get_object(Bucket=settings.MINIO_BUCKET_NAME, Key=asset.file_path)
+                file_bytes = response['Body'].read()
+                embedding = CLIPEmbedder.embed_image(file_bytes)
+            except Exception as e:
+                logger.error(f"Failed to generate image embedding for {asset.file_path}: {e}. Falling back to text embedding of title.")
+                is_image = False
+        
+        if not is_image:
+            clean_title = asset.title
+            if '.' in clean_title:
+                clean_title = clean_title.rsplit('.', 1)[0]
+            clean_title = clean_title.replace('_', ' ').replace('-', ' ').strip()
+            embedding = CLIPEmbedder.embed_text(clean_title)
+        
+        asset.embedding = embedding
+        db.commit()
+        logger.info(f"Successfully stored embedding for MediaAsset {asset_id}")
+    except Exception as e:
+        logger.error(f"Error generating embedding for asset {asset_id}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    print("Starting manual backfill of missing embeddings...")
+    db = SessionLocal()
+    try:
+        assets = db.query(MediaAsset).filter(MediaAsset.embedding == None).all()
+        print(f"Found {len(assets)} media assets with missing embeddings.")
+        for asset in assets:
+            print(f"Processing asset {asset.id}: {asset.title} ({asset.content_type})...")
+            try:
+                is_image = False
+                if asset.content_type and asset.content_type.startswith("image/"):
+                    is_image = True
+                
+                if is_image:
+                    try:
+                        from app.storage import s3_client
+                        response = s3_client.get_object(Bucket=settings.MINIO_BUCKET_NAME, Key=asset.file_path)
+                        file_bytes = response['Body'].read()
+                        embedding = CLIPEmbedder.embed_image(file_bytes)
+                    except Exception as e:
+                        print(f"failed image embedding for {asset.file_path}: {e}, falling back to title text")
+                        is_image = False
+                
+                if not is_image:
+                    clean_title = asset.title
+                    if '.' in clean_title:
+                        clean_title = clean_title.rsplit('.', 1)[0]
+                    clean_title = clean_title.replace('_', ' ').replace('-', ' ').strip()
+                    embedding = CLIPEmbedder.embed_text(clean_title)
+                
+                asset.embedding = embedding
+                db.commit()
+                print(f"Generated embedding for asset {asset.id}.")
+            except Exception as inner_e:
+                print(f"Error processing asset {asset.id}: {inner_e}")
+                db.rollback()
+        print("Backfill complete.")
+    finally:
+        db.close()
