@@ -4,6 +4,8 @@ import re
 import os
 import json
 import redis
+import traceback
+from datetime import datetime
 from app.celery_app import celery
 from app.storage import upload_object, generate_url
 from app.upscaler import TileUpscaler, calculate_tile_size
@@ -14,6 +16,80 @@ from app.config import settings
 import logging
 
 logger = logging.getLogger(__name__)
+
+TRANSIENT_ERRORS = ('out of memory', 'oom', 'timeout', 'timeouterror',
+                     'connectionerror', 'connection', '429', '503', 'temporarily')
+PERMANENT_ERRORS = ('invalid', 'validation', 'bad parameter', 'not found',
+                    '404', '403', 'forbidden', 'unauthorized', '401',
+                    'unsupported', 'corrupt', 'malformed')
+
+
+def exponential_backoff(retry_count: int) -> int:
+    return (2 ** retry_count) * 60
+
+
+def is_transient_error(error_msg: str) -> bool:
+    if not error_msg:
+        return False
+    lower = error_msg.lower()
+    if any(pe in lower for pe in PERMANENT_ERRORS):
+        return False
+    return any(te in lower for te in TRANSIENT_ERRORS)
+
+
+def categorize_error(error_msg: str) -> str:
+    if not error_msg:
+        return 'runtime'
+    lower = error_msg.lower()
+    if 'out of memory' in lower or 'oom' in lower or 'memoryerror' in lower:
+        return 'OOM'
+    if 'timeout' in lower or 'timed out' in lower:
+        return 'timeout'
+    if any(v in lower for v in ('invalid', 'validation', 'bad parameter', 'unsupported')):
+        return 'validation'
+    return 'runtime'
+
+
+def _handle_task_failure(task_id: str, error: Exception, retry_count: int, max_retries: int):
+    error_msg = str(error)
+    tb_str = traceback.format_exc()
+    error_type = categorize_error(error_msg)
+    transient = is_transient_error(error_msg)
+
+    db = SessionLocal()
+    try:
+        db_task = db.query(Task).filter(Task.task_id == task_id).first()
+        if db_task:
+            db_task.error = error_msg
+            db_task.error_type = error_type
+            db_task.traceback = tb_str
+            db_task.retry_count = retry_count
+            db_task.max_retries = max_retries
+            if transient and retry_count < max_retries:
+                db_task.status = 'PENDING_RETRY'
+            else:
+                db_task.status = 'FAILED'
+            db.commit()
+    finally:
+        db.close()
+
+    redis_client.publish("task_updates", json.dumps({
+        "task_id": task_id,
+        "status": 'PENDING_RETRY' if (transient and retry_count < max_retries) else 'FAILED',
+        "progress": 0,
+        "error": error_msg,
+        "error_type": error_type,
+        "retry_count": retry_count,
+        "max_retries": max_retries,
+        "traceback": tb_str
+    }))
+
+    if transient and retry_count < max_retries:
+        logger.info(f"Task {task_id} transient error ({error_type}), retry {retry_count}/{max_retries}")
+    else:
+        logger.error(f"Task {task_id} permanent failure ({error_type}): {error_msg}")
+
+    return transient and retry_count < max_retries
 
 # Cache redis client
 redis_client = redis.from_url(settings.REDIS_URL)
@@ -104,158 +180,156 @@ def run_ffmpeg_with_progress(cmd, duration: float, task_id: str, celery_task=Non
         db.close()
 
 # Fast task endpoint
-@celery.task(bind=True, name="app.tasks.process_media_fast")
+@celery.task(bind=True, name="app.tasks.process_media_fast", max_retries=3)
 def process_media_fast(self, object_name: str, task_type: str = "thumbnail"):
     logger.info(f"Processing fast task: {task_type} for {object_name}")
     task_id = self.request.id
-    
+    retry_count = self.request.retries
+
     db = SessionLocal()
-    # Ensure task entry exists in DB
     db_task = db.query(Task).filter(Task.task_id == task_id).first()
     if not db_task:
-        db_task = Task(task_id=task_id, name=task_type, status="PROCESSING", progress=0)
+        db_task = Task(task_id=task_id, name=task_type, status="PROCESSING", progress=0,
+                       retry_count=retry_count, max_retries=3)
         db.add(db_task)
         db.commit()
+    else:
+        db_task.retry_count = retry_count
+        db_task.status = "PROCESSING"
+        db.commit()
     db.close()
-    
-    # Simulate processing or run actual transcoding
-    # For now, let's simulate step progress and publish updates
-    steps = 4
-    for i in range(1, steps + 1):
-        time.sleep(1.0)
-        percent = int((i / steps) * 100)
-        
-        self.update_state(
-            state="PROGRESS",
-            meta={"percent": percent, "status": f"Running fast step {i}/{steps}"}
-        )
-        
-        update_payload = {
-            "task_id": task_id,
-            "status": "PROCESSING" if percent < 100 else "COMPLETED",
-            "progress": percent,
-            "error": None
-        }
-        redis_client.publish("task_updates", json.dumps(update_payload))
-        
-        db = SessionLocal()
-        db_task = db.query(Task).filter(Task.task_id == task_id).first()
-        if db_task:
-            db_task.status = "PROCESSING" if percent < 100 else "COMPLETED"
-            db_task.progress = percent
-            db.commit()
-        db.close()
 
-    # Upload cleanups/processed URLs
-    processed_name = f"processed/thumb_{object_name.split('/')[-1]}"
-    simulated_media = b"Simulated thumbnail content bytes."
-    upload_success = upload_object(simulated_media, processed_name, content_type="image/jpeg")
-    
-    return {
-        "status": "COMPLETED",
-        "task_id": task_id,
-        "original_object": object_name,
-        "processed_url": generate_url(processed_name) if upload_success else ""
-    }
+    try:
+        steps = 4
+        for i in range(1, steps + 1):
+            time.sleep(1.0)
+            percent = int((i / steps) * 100)
+
+            self.update_state(
+                state="PROGRESS",
+                meta={"percent": percent, "status": f"Running fast step {i}/{steps}"}
+            )
+
+            update_payload = {
+                "task_id": task_id,
+                "status": "PROCESSING" if percent < 100 else "COMPLETED",
+                "progress": percent,
+                "error": None
+            }
+            redis_client.publish("task_updates", json.dumps(update_payload))
+
+            db = SessionLocal()
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = "PROCESSING" if percent < 100 else "COMPLETED"
+                db_task.progress = percent
+                db.commit()
+            db.close()
+
+        processed_name = f"processed/thumb_{object_name.split('/')[-1]}"
+        simulated_media = b"Simulated thumbnail content bytes."
+        upload_success = upload_object(simulated_media, processed_name, content_type="image/jpeg")
+
+        return {
+            "status": "COMPLETED",
+            "task_id": task_id,
+            "original_object": object_name,
+            "processed_url": generate_url(processed_name) if upload_success else ""
+        }
+    except Exception as e:
+        should_retry = _handle_task_failure(task_id, e, retry_count, 3)
+        if should_retry:
+            countdown = exponential_backoff(retry_count)
+            raise self.retry(countdown=countdown, exc=e)
+        raise
 
 # Heavy task queue endpoint
-@celery.task(bind=True, name="app.tasks.process_media_heavy")
+@celery.task(bind=True, name="app.tasks.process_media_heavy", max_retries=3)
 def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
     logger.info(f"Processing heavy task: {task_type} {object_name}")
     task_id = self.request.id
+    retry_count = self.request.retries
 
-    # Check Colab availability
-    is_colab = redis_client.get("colab:connected") == b"true"
-    if is_colab:
-        logger.info(f"Colab worker detected! Offloading heavy task {task_type} for {object_name}")
-        # Dispatch to Colab
-        task_payload = {
-            "type": "task_dispatch",
-            "task_id": task_id,
-            "task_type": task_type,
-            "parameters": {
-                "object_name": object_name,
-                "input_url": generate_url(object_name)
+    db = SessionLocal()
+    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not db_task:
+        db_task = Task(task_id=task_id, name=task_type, status="PROCESSING", progress=0,
+                       retry_count=retry_count, max_retries=3)
+        db.add(db_task)
+        db.commit()
+    else:
+        db_task.retry_count = retry_count
+        db_task.status = "PROCESSING"
+        db.commit()
+    db.close()
+
+    try:
+        is_colab = redis_client.get("colab:connected") == b"true"
+        if is_colab:
+            logger.info(f"Colab worker detected! Offloading heavy task {task_type} for {object_name}")
+            task_payload = {
+                "type": "task_dispatch",
+                "task_id": task_id,
+                "task_type": task_type,
+                "parameters": {
+                    "object_name": object_name,
+                    "input_url": generate_url(object_name)
+                }
             }
-        }
-        redis_client.publish("colab_dispatches", json.dumps(task_payload))
-        redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
-        redis_client.expire("colab_pending_tasks_http", 3600)
-        
-        # Wait for result on Redis
-        result_key = f"colab_task_result:{task_id}"
-        timeout = 120
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            res_data = redis_client.get(result_key)
-            if res_data:
-                res = json.loads(res_data)
-                
-                # Check status
-                db = SessionLocal()
-                try:
-                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
-                    if res.get("status") == "SUCCESS":
-                        output = res.get("output", {})
-                        processed_url = output.get("url", "")
-                        processed_name = output.get("filename", f"processed_{object_name.split('/')[-1]}")
-                        
-                        if db_task:
-                            db_task.status = "COMPLETED"
-                            db_task.progress = 100
-                            db.commit()
-                        
-                        redis_client.publish("task_updates", json.dumps({
-                            "task_id": task_id,
-                            "status": "COMPLETED",
-                            "progress": 100,
-                            "error": None
-                        }))
-                        
-                        return {
-                            "status": "COMPLETED",
-                            "task_id": task_id,
-                            "original_object": object_name,
-                            "processed_url": processed_url
-                        }
-                    else:
-                        error_msg = res.get("error", "Task failed on Colab")
-                        if db_task:
-                            db_task.status = "FAILED"
-                            db_task.error = error_msg
-                            db.commit()
-                        
-                        redis_client.publish("task_updates", json.dumps({
-                            "task_id": task_id,
-                            "status": "FAILED",
-                            "progress": 0,
-                            "error": error_msg
-                        }))
-                        raise Exception(error_msg)
-                finally:
-                    db.close()
-            time.sleep(0.5)
-            
-        # Timeout
-        db = SessionLocal()
-        try:
-            db_task = db.query(Task).filter(Task.task_id == task_id).first()
-            if db_task:
-                db_task.status = "FAILED"
-                db_task.error = "Execution timed out waiting for Colab worker response"
-                db.commit()
-        finally:
-            db.close()
-            
-        redis_client.publish("task_updates", json.dumps({
-            "task_id": task_id,
-            "status": "FAILED",
-            "progress": 0,
-            "error": "Colab execution timed out"
-        }))
-        raise TimeoutError("Colab execution timed out")
+            redis_client.publish("colab_dispatches", json.dumps(task_payload))
+            redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
+            redis_client.expire("colab_pending_tasks_http", 3600)
 
-    return _original_process_media_heavy(self, object_name, task_type)
+            result_key = f"colab_task_result:{task_id}"
+            timeout = 120
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                res_data = redis_client.get(result_key)
+                if res_data:
+                    res = json.loads(res_data)
+                    db = SessionLocal()
+                    try:
+                        db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                        if res.get("status") == "SUCCESS":
+                            output = res.get("output", {})
+                            processed_url = output.get("url", "")
+                            processed_name = output.get("filename", f"processed_{object_name.split('/')[-1]}")
+                            if db_task:
+                                db_task.status = "COMPLETED"
+                                db_task.progress = 100
+                                db.commit()
+                            redis_client.publish("task_updates", json.dumps({
+                                "task_id": task_id, "status": "COMPLETED",
+                                "progress": 100, "error": None
+                            }))
+                            return {
+                                "status": "COMPLETED", "task_id": task_id,
+                                "original_object": object_name, "processed_url": processed_url
+                            }
+                        else:
+                            error_msg = res.get("error", "Task failed on Colab")
+                            if db_task:
+                                db_task.status = "FAILED"
+                                db_task.error = error_msg
+                                db.commit()
+                            redis_client.publish("task_updates", json.dumps({
+                                "task_id": task_id, "status": "FAILED",
+                                "progress": 0, "error": error_msg
+                            }))
+                            raise Exception(error_msg)
+                    finally:
+                        db.close()
+                time.sleep(0.5)
+
+            raise TimeoutError("Colab execution timed out")
+
+        return _original_process_media_heavy(self, object_name, task_type)
+    except Exception as e:
+        should_retry = _handle_task_failure(task_id, e, retry_count, 3)
+        if should_retry:
+            countdown = exponential_backoff(retry_count)
+            raise self.retry(countdown=countdown, exc=e)
+        raise
 
 def _original_process_media_heavy(self, object_name: str, task_type: str = "transcode"):
     logger.info(f"Processing heavy task: {task_type} for {object_name}")

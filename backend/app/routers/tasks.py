@@ -2,12 +2,15 @@
 
 import asyncio
 import logging
+from datetime import datetime
+from typing import Optional, List
 
 import redis
 import uuid
 from celery.result import AsyncResult
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, Depends
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 from pydantic import BaseModel
 
 from app.celery_app import celery
@@ -105,18 +108,129 @@ def run_upscale_pipeline(
 ):
     """Orchestrate upscale task: creates database entry and dispatches Celery task."""
     task_id = f"upscale_{uuid.uuid4().hex[:8]}"
-    
+
     # Create database task record
     db_task = Task(task_id=task_id, name="upscale", status="PROCESSING", progress=0)
     db.add(db_task)
     db.commit()
-    
+
     params = request.dict() if request else {}
     process_upscale_task.delay(task_id, path, params)
-    
+
     return {
         "message": "Upscale task initiated successfully",
         "task_id": task_id,
         "status": "PROCESSING",
     }
+
+
+class TaskListItem(BaseModel):
+    id: int
+    task_id: str
+    name: str
+    status: str
+    progress: int
+    error: Optional[str] = None
+    error_type: Optional[str] = None
+    traceback: Optional[str] = None
+    retry_count: int
+    max_retries: int
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class TaskListResponse(BaseModel):
+    tasks: List[TaskListItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class ErrorTypesResponse(BaseModel):
+    error_types: List[str]
+
+
+class RetryResponse(BaseModel):
+    message: str
+    task_id: str
+
+
+@router.get("/api/tasks/list", response_model=TaskListResponse)
+def list_tasks(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    status_filter: Optional[str] = Query(None, alias="status"),
+    task_type: Optional[str] = Query(None, alias="type"),
+    search: Optional[str] = Query(None),
+    db: Session = Depends(get_db)
+):
+    """List tasks with pagination, filtering, and search."""
+    query = db.query(Task)
+
+    if status_filter:
+        query = query.filter(Task.status == status_filter)
+    if task_type:
+        query = query.filter(Task.name == task_type)
+    if search:
+        query = query.filter(
+            Task.name.contains(search) | Task.error.contains(search)
+        )
+
+    total = query.count()
+    tasks = query.order_by(desc(Task.created_at)).offset((page - 1) * page_size).limit(page_size).all()
+
+    return TaskListResponse(
+        tasks=[
+            TaskListItem(
+                id=t.id,
+                task_id=t.task_id,
+                name=t.name,
+                status=t.status,
+                progress=t.progress,
+                error=t.error,
+                error_type=t.error_type,
+                traceback=t.traceback,
+                retry_count=t.retry_count,
+                max_retries=t.max_retries,
+                created_at=t.created_at.isoformat() if t.created_at else None,
+                updated_at=t.updated_at.isoformat() if t.updated_at else None,
+            )
+            for t in tasks
+        ],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/api/tasks/errors/types", response_model=ErrorTypesResponse)
+def get_error_types():
+    """Return available error type categories."""
+    return ErrorTypesResponse(error_types=["OOM", "timeout", "validation", "runtime"])
+
+
+@router.post("/api/tasks/{task_id}/retry", response_model=RetryResponse)
+def retry_task(task_id: str, db: Session = Depends(get_db)):
+    """Manually retry a failed task."""
+    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if db_task.status not in ("FAILED", "PENDING_RETRY"):
+        raise HTTPException(status_code=400, detail=f"Cannot retry task in {db_task.status} status")
+
+    db_task.status = "PROCESSING"
+    db_task.error = None
+    db_task.error_type = None
+    db_task.traceback = None
+    db_task.retry_count = 0
+    db_task.last_retry_at = datetime.utcnow()
+    db.commit()
+
+    if db_task.name == "upscale":
+        process_multimedia_task.delay("", "transcode")
+    else:
+        process_multimedia_task.delay("", db_task.name)
+
+    return RetryResponse(message="Task queued for retry", task_id=task_id)
 

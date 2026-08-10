@@ -39,12 +39,18 @@ const menuItems = [
       description: 'API Keys & Tunnels',
     },
     {
-      id: 'monitor' as TabType,
-      label: 'Compute Monitor',
-      icon: Activity,
-      description: 'GPU / CPU Live Metrics',
-    },
-  ];
+       id: 'monitor' as TabType,
+       label: 'Compute Monitor',
+       icon: Activity,
+       description: 'GPU / CPU Live Metrics',
+     },
+     {
+       id: 'queue' as TabType,
+       label: 'Queue Dashboard',
+       icon: Sliders,
+       description: 'Task History & Diagnostics',
+     },
+   ];
 
   return (
     <>

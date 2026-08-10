@@ -125,6 +125,69 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatusResponse>
   return res.json();
 }
 
+export interface TaskListItem {
+  id: number;
+  task_id: string;
+  name: string;
+  status: string;
+  progress: number;
+  error: string | null;
+  error_type: string | null;
+  traceback: string | null;
+  retry_count: number;
+  max_retries: number;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface TaskListResponse {
+  tasks: TaskListItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export async function fetchTasks(
+  page = 1,
+  pageSize = 25,
+  status?: string,
+  taskType?: string,
+  search?: string
+): Promise<TaskListResponse> {
+  const params = new URLSearchParams();
+  params.set('page', String(page));
+  params.set('page_size', String(pageSize));
+  if (status) params.set('status', status);
+  if (taskType) params.set('type', taskType);
+  if (search) params.set('search', search);
+
+  const url = `${API_BASE_URL}/api/tasks/list?${params.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch tasks');
+  }
+  return res.json();
+}
+
+export async function retryTask(taskId: string): Promise<{ message: string; task_id: string }> {
+  const url = `${API_BASE_URL}/api/tasks/${taskId}/retry`;
+  const res = await fetch(url, { method: 'POST' });
+  if (!res.ok) {
+    throw new Error('Failed to retry task');
+  }
+  return res.json();
+}
+
+export async function getErrorTypes(): Promise<string[]> {
+  const url = `${API_BASE_URL}/api/tasks/errors/types`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch error types');
+  }
+  const data = await res.json();
+  return data.error_types;
+}
+
 export interface MediaAsset {
   id: number;
   title: string;
