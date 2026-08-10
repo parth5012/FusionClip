@@ -109,6 +109,41 @@ class GenerationTextOut(GenerationOut):
     output: str
 
 
+class GenerationAnalyzedFile(BaseModel):
+    """One uploaded media file handed to the Gemini multimodal pipeline."""
+
+    filename: str
+    original_name: str
+    content_type: str
+    url: str
+    gemini_file: Optional[str] = None
+    gemini_uri: Optional[str] = None
+
+
+class GenerationMultimodalOut(GenerationOut):
+    """Response from /api/generate/text when media files are attached."""
+
+    output: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    analyzed_files: List[GenerationAnalyzedFile] = Field(default_factory=list)
+
+
+class GenerationGeminiImageOut(GenerationOut):
+    prompt: str
+    model: str
+    filename: str
+    url: str
+    content_type: str
+
+
+class GenerationGeminiVideoOut(GenerationOut):
+    prompt: str
+    model: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    url: Optional[str] = None
+    filename: Optional[str] = None
+
+
 class GenerationAudioOut(GenerationOut):
     type: str
     filename: str
