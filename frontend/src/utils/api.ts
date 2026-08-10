@@ -1,4 +1,4 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+﻿const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export interface StorageItem {
   name: string;
@@ -42,6 +42,9 @@ export interface TaskListItem {
   progress: number;
   error: string | null;
   logs: string | null;
+  retry_count: number;
+  max_retries: number;
+  last_retry_at: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -51,6 +54,13 @@ export interface TaskListResponse {
   page: number;
   page_size: number;
   tasks: TaskListItem[];
+}
+
+export interface RetryResponse {
+  message: string;
+  original_task_id: string;
+  new_task_id: string;
+  retry_count: number;
 }
 
 export async function fetchFiles(prefix = ''): Promise<ListResponse> {
@@ -143,6 +153,18 @@ export async function fetchTasks(
   return res.json();
 }
 
+export async function retryTask(taskId: string): Promise<RetryResponse> {
+  const url = `${API_BASE_URL}/api/tasks/${taskId}/retry`;
+  const res = await fetch(url, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || 'Failed to retry task');
+  }
+  return res.json();
+}
+
 export interface MediaAsset {
   id: number;
   title: string;
@@ -165,11 +187,7 @@ export async function fetchMediaCatalog(query = '', limit = 20): Promise<MediaAs
   return res.json();
 }
 
-/* ── Provider API keys ─────────────────────────────────────────────────────
- * Keys are submitted once in plaintext and stored encrypted server-side.
- * They are never readable again: the status endpoint returns only whether a
- * provider is configured plus the last four characters.
- * ------------------------------------------------------------------------ */
+/* -- Provider API keys -- */
 
 export type SecretProvider = 'gemini' | 'elevenlabs';
 
@@ -231,7 +249,7 @@ export async function deleteSecret(provider: SecretProvider): Promise<DeleteSecr
   return res.json();
 }
 
-/* ── Colab Compute Metrics ─────────────────────────────────────────────── */
+/* -- Colab Compute Metrics -- */
 
 export interface ColabMetricsResponse {
   status: 'connected' | 'disconnected';

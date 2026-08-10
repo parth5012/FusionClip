@@ -1,18 +1,19 @@
-"""Celery task dispatch, status polling and the task-update WebSocket feed."""
+﻿"""Celery task dispatch, status polling and the task-update WebSocket feed."""
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import redis
 from celery.result import AsyncResult
-from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect, HTTPException
 from sqlalchemy.orm import Session
 
 from app.celery_app import celery
 from app.config import settings
 from app.database import get_db
 from app.models import Task
-from app.tasks import process_multimedia_task
+from app.tasks import process_multimedia_task, exponential_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,9 @@ def list_tasks(
                 "progress": t.progress,
                 "error": t.error,
                 "logs": t.logs,
+                "retry_count": t.retry_count,
+                "max_retries": t.max_retries,
+                "last_retry_at": t.last_retry_at.isoformat() if t.last_retry_at else None,
                 "created_at": t.created_at.isoformat() if t.created_at else None,
                 "updated_at": t.updated_at.isoformat() if t.updated_at else None,
             }
@@ -103,18 +107,50 @@ def list_tasks(
     }
 
 
+@router.post("/api/tasks/{task_id}/retry")
+def retry_task(task_id: str, db: Session = Depends(get_db)):
+    """Manually retry a failed task."""
+    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if db_task.status != "FAILED":
+        raise HTTPException(status_code=400, detail="Only failed tasks can be retried")
+
+    # Reset task status for retry
+    db_task.status = "PENDING"
+    db_task.progress = 0
+    db_task.error = None
+    db_task.last_retry_at = datetime.now(timezone.utc)
+    db_task.retry_count = db_task.retry_count + 1
+    db.commit()
+
+    # Re-dispatch the task
+    result = process_multimedia_task.delay(
+        object_name=db_task.name,
+        task_type=db_task.name
+    )
+
+    logger.info(f"Manual retry of task {task_id} dispatched as {result.id}")
+
+    return {
+        "message": "Task retry initiated",
+        "original_task_id": task_id,
+        "new_task_id": result.id,
+        "retry_count": db_task.retry_count,
+    }
+
+
 @router.websocket("/api/ws/tasks")
 async def websocket_tasks_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection accepted for tasks subscription")
 
-    # Subscribe to Redis channels
     pubsub = redis_client.pubsub()
     pubsub.subscribe("task_updates")
 
     try:
         while True:
-            # Check for pubsub updates
             message = pubsub.get_message(ignore_subscribe_messages=True)
             if message:
                 data = message.get("data")
@@ -122,7 +158,6 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
                     if isinstance(data, bytes):
                         data = data.decode("utf-8")
                     await websocket.send_text(data)
-            # Yield control to prevent blocking loop
             await asyncio.sleep(0.1)
     except WebSocketDisconnect:
         logger.info("WebSocket client disconnected")

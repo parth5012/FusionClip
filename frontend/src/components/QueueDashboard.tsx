@@ -1,12 +1,12 @@
-'use client';
+﻿'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   RefreshCw, Loader2, CheckCircle2, AlertCircle, Clock,
   ChevronRight, ChevronLeft, ChevronsLeft, ChevronsRight,
-  ListFilter
+  ListFilter, RotateCcw
 } from 'lucide-react';
-import { fetchTasks, TaskListItem } from '../utils/api';
+import { fetchTasks, retryTask, TaskListItem } from '../utils/api';
 
 type StatusFilter = '' | 'pending' | 'processing' | 'completed' | 'failed';
 
@@ -30,7 +30,7 @@ const TASK_TYPE_OPTIONS = [
 function normalizeStatus(status: string): string {
   const s = status.toUpperCase();
   if (s === 'PENDING') return 'pending';
-  if (s === 'PROCESSING' || s === 'PROGRESS') return 'processing';
+  if (s === 'PROCESSING' || s === 'PROGRESS' || s === 'RETRYING') return 'processing';
   if (s === 'COMPLETED' || s === 'SUCCESS') return 'completed';
   if (s === 'FAILED' || s === 'FAILURE') return 'failed';
   return s.toLowerCase();
@@ -65,7 +65,7 @@ function progressBarColor(status: string): string {
 }
 
 function formatDuration(start: string | null, end: string | null): string {
-  if (!start) return '—';
+  if (!start) return '\u2014';
   const s = new Date(start).getTime();
   const e = end ? new Date(end).getTime() : Date.now();
   const diff = Math.max(0, e - s);
@@ -78,7 +78,7 @@ function formatDuration(start: string | null, end: string | null): string {
 }
 
 function formatTime(iso: string | null): string {
-  if (!iso) return '—';
+  if (!iso) return '\u2014';
   const d = new Date(iso);
   return d.toLocaleString();
 }
@@ -92,6 +92,7 @@ export default function QueueDashboard() {
   const [typeFilter, setTypeFilter] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [retryingIds, setRetryingIds] = useState<Set<string>>(new Set());
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -114,6 +115,22 @@ export default function QueueDashboard() {
     loadTasks();
   }, [loadTasks]);
 
+  const handleRetry = async (taskId: string) => {
+    setRetryingIds((prev) => new Set(prev).add(taskId));
+    try {
+      await retryTask(taskId);
+      await loadTasks();
+    } catch (err: any) {
+      setError(err.message || 'Failed to retry task');
+    } finally {
+      setRetryingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(taskId);
+        return next;
+      });
+    }
+  };
+
   // WebSocket for real-time updates
   useEffect(() => {
     const wsUrl = `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/ws/tasks`.replace(/^http/, 'ws');
@@ -133,6 +150,8 @@ export default function QueueDashboard() {
                     status: update.status || t.status,
                     progress: update.progress !== undefined ? update.progress : t.progress,
                     error: update.error !== undefined ? update.error : t.error,
+                    retry_count: update.retry_count !== undefined ? update.retry_count : t.retry_count,
+                    max_retries: update.max_retries !== undefined ? update.max_retries : t.max_retries,
                   }
                 : t
             )
@@ -251,21 +270,23 @@ export default function QueueDashboard() {
                 <th className="px-4 py-3 text-left">Type</th>
                 <th className="px-4 py-3 text-left">Status</th>
                 <th className="px-4 py-3 text-left min-w-[140px]">Progress</th>
+                <th className="px-4 py-3 text-left">Retries</th>
                 <th className="px-4 py-3 text-left">Duration</th>
                 <th className="px-4 py-3 text-left">Created</th>
+                <th className="px-4 py-3 text-left">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-800">
               {loading && normalizedTasks.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-12 text-center">
+                  <td colSpan={8} className="px-4 py-12 text-center">
                     <Loader2 className="w-6 h-6 animate-spin text-sky-500 mx-auto" />
                     <p className="text-slate-400 text-xs mt-2">Loading tasks...</p>
                   </td>
                 </tr>
               ) : normalizedTasks.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-12 text-center text-slate-500 text-sm">
+                  <td colSpan={8} className="px-4 py-12 text-center text-slate-500 text-sm">
                     No tasks found.
                   </td>
                 </tr>
@@ -300,11 +321,32 @@ export default function QueueDashboard() {
                         <span className="text-xs text-slate-400 w-8 text-right">{task.progress || 0}%</span>
                       </div>
                     </td>
+                    <td className="px-4 py-3">
+                      <span className="text-xs text-slate-400">
+                        {task.retry_count}/{task.max_retries}
+                      </span>
+                    </td>
                     <td className="px-4 py-3 text-slate-400 text-xs">
                       {formatDuration(task.created_at, task.updated_at)}
                     </td>
                     <td className="px-4 py-3 text-slate-400 text-xs">
                       {formatTime(task.created_at)}
+                    </td>
+                    <td className="px-4 py-3">
+                      {task.status === 'failed' && (
+                        <button
+                          onClick={() => handleRetry(task.task_id)}
+                          disabled={retryingIds.has(task.task_id)}
+                          className="p-1.5 rounded border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-sky-400 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                          title="Retry task"
+                        >
+                          {retryingIds.has(task.task_id) ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <RotateCcw className="w-3 h-3" />
+                          )}
+                        </button>
+                      )}
                     </td>
                   </tr>
                 ))
