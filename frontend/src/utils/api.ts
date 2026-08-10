@@ -34,6 +34,25 @@ export interface TaskStatusResponse {
   info: any;
 }
 
+export interface TaskListItem {
+  id: number;
+  task_id: string;
+  name: string;
+  status: string;
+  progress: number;
+  error: string | null;
+  logs: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface TaskListResponse {
+  total: number;
+  page: number;
+  page_size: number;
+  tasks: TaskListItem[];
+}
+
 export async function fetchFiles(prefix = ''): Promise<ListResponse> {
   const url = `${API_BASE_URL}/api/storage/list?prefix=${encodeURIComponent(prefix)}`;
   const res = await fetch(url);
@@ -100,6 +119,26 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatusResponse>
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error('Failed to fetch task status');
+  }
+  return res.json();
+}
+
+export async function fetchTasks(
+  page = 1,
+  pageSize = 50,
+  status?: string,
+  taskType?: string,
+): Promise<TaskListResponse> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  if (status) params.set('status', status);
+  if (taskType) params.set('task_type', taskType);
+  const url = `${API_BASE_URL}/api/tasks/list?${params.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch tasks');
   }
   return res.json();
 }

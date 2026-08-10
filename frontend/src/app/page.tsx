@@ -9,6 +9,7 @@ import GenerationPanel from '../components/GenerationPanel';
 import SettingsPanel from '../components/SettingsPanel';
 import PlayersPanel from '../components/PlayersPanel';
 import MonitorPanel from '../components/MonitorPanel';
+import QueueDashboard from '../components/QueueDashboard';
 import { useStore } from '../store/useStore';
 
 export default function Home() {
@@ -39,6 +40,8 @@ export default function Home() {
         return <SettingsPanel />;
       case 'monitor':
         return <MonitorPanel />;
+      case 'queue':
+        return <QueueDashboard />;
       default:
         return <FileManager />;
     }

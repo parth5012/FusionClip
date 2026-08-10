@@ -5,10 +5,13 @@ import logging
 
 import redis
 from celery.result import AsyncResult
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy.orm import Session
 
 from app.celery_app import celery
 from app.config import settings
+from app.database import get_db
+from app.models import Task
 from app.tasks import process_multimedia_task
 
 logger = logging.getLogger(__name__)
@@ -53,6 +56,51 @@ def get_task_status(task_id: str):
         response["info"] = str(res.result)
 
     return response
+
+
+@router.get("/api/tasks/list")
+def list_tasks(
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(50, ge=1, le=200, description="Items per page"),
+    status: str | None = Query(None, description="Filter by status"),
+    task_type: str | None = Query(None, description="Filter by task type (name)"),
+    db: Session = Depends(get_db),
+):
+    """List persisted tasks with optional filtering and pagination."""
+    query = db.query(Task)
+
+    if status:
+        query = query.filter(Task.status == status.upper())
+    if task_type:
+        query = query.filter(Task.name == task_type)
+
+    total = query.count()
+    tasks = (
+        query.order_by(Task.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    return {
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "tasks": [
+            {
+                "id": t.id,
+                "task_id": t.task_id,
+                "name": t.name,
+                "status": t.status,
+                "progress": t.progress,
+                "error": t.error,
+                "logs": t.logs,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+            }
+            for t in tasks
+        ],
+    }
 
 
 @router.websocket("/api/ws/tasks")

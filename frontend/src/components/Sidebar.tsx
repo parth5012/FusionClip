@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { useStore, TabType } from '../store/useStore';
-import { Folder, Sparkles, Settings, Sliders, Menu, X, Search, Activity } from 'lucide-react';
+import { Folder, Sparkles, Settings, Sliders, Menu, X, Search, Activity, ListOrdered } from 'lucide-react';
 
 export default function Sidebar() {
   const { activeTab, setActiveTab, sidebarOpen, toggleSidebar } = useStore();
@@ -43,6 +43,12 @@ const menuItems = [
       label: 'Compute Monitor',
       icon: Activity,
       description: 'GPU / CPU Live Metrics',
+    },
+    {
+      id: 'queue' as TabType,
+      label: 'Queue Dashboard',
+      icon: ListOrdered,
+      description: 'Background task history',
     },
   ];
 
