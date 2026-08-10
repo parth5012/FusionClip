@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.celery_app import celery
 from app.config import settings
-from app.database import get_db
+from app.deps import get_db
 from app.models import Task
 from app.tasks import process_multimedia_task, exponential_backoff
 

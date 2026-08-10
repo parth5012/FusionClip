@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 import { fetchTasks, retryTask, TaskListItem } from '../utils/api';
 
-type StatusFilter = 'pending' | 'processing' | 'completed' | 'failed';
+type StatusFilter = '' | 'pending' | 'processing' | 'completed' | 'failed';
 type ErrorTypeFilter = 'all' | 'oom' | 'timeout' | 'validation' | 'runtime';
 
 const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [

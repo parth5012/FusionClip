@@ -215,3 +215,90 @@ export async function setApiKey(provider: string, key: string): Promise<{ messag
   }
   return res.json();
 }
+
+/* ── Provider API keys (encrypted server-side) ────────────────────────── */
+
+export type SecretProvider = 'gemini' | 'elevenlabs';
+
+export interface ProviderSecretStatus {
+  configured: boolean;
+  last4: string | null;
+}
+
+export interface SecretStatusResponse {
+  gemini: ProviderSecretStatus;
+  elevenlabs: ProviderSecretStatus;
+}
+
+export interface SaveSecretsPayload {
+  gemini_api_key?: string;
+  elevenlabs_api_key?: string;
+}
+
+export interface SaveSecretsResponse {
+  status: string;
+  updated: SecretProvider[];
+}
+
+export interface DeleteSecretResponse {
+  status: string;
+  provider: string;
+  deleted: boolean;
+}
+
+export async function fetchSecretStatus(): Promise<SecretStatusResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/settings/secrets`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch API key status');
+  }
+  return res.json();
+}
+
+export async function saveSecrets(payload: SaveSecretsPayload): Promise<SaveSecretsResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/settings/secrets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    throw new Error('Failed to save API keys');
+  }
+  return res.json();
+}
+
+export async function deleteSecret(provider: SecretProvider): Promise<DeleteSecretResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/settings/secrets/${provider}`, {
+    method: 'DELETE',
+  });
+
+  if (!res.ok) {
+    throw new Error(`Failed to remove ${provider} API key`);
+  }
+  return res.json();
+}
+
+/* ── Colab Compute Metrics ─────────────────────────────────────────────── */
+
+export interface ColabMetricsResponse {
+  status: 'connected' | 'disconnected';
+  metrics: {
+    vram_used: number;
+    vram_total: number;
+    ram_used: number;
+    ram_total: number;
+    cpu_load: number;
+    active_task: string | null;
+    vram_percent: number;
+    ram_percent: number;
+    updated_at: number;
+  } | null;
+}
+
+export async function fetchColabMetrics(): Promise<ColabMetricsResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/colab/metrics`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch Colab metrics');
+  }
+  return res.json();
+}
