@@ -16,8 +16,14 @@ from app.deps import get_db
 from app.models import MediaAsset, Task
 from app.storage import generate_url, upload_object
 from app.config import settings
-from app.schemas import GenerationGeminiImageOut, GenerationGeminiVideoOut
+from app.schemas import (
+    GenerationGeminiImageOut,
+    GenerationGeminiVideoOut,
+    GenerationTtsOut,
+    GenerationVoiceListOut,
+)
 from app.services import secrets as secret_store
+from app.services import elevenlabs as elevenlabs_service
 from app.services import gemini as gemini_service
 
 logger = logging.getLogger(__name__)
@@ -28,6 +34,7 @@ redis_client = redis.from_url(settings.REDIS_URL)
 
 #: Client header consulted only when no key is stored server-side.
 GEMINI_KEY_HEADER = "X-Gemini-Key"
+ELEVENLABS_KEY_HEADER = "X-ElevenLabs-Key"
 
 
 def _resolve_gemini_key(db: Session, request: Optional[Request] = None) -> Optional[str]:
@@ -43,12 +50,30 @@ def _resolve_gemini_key(db: Session, request: Optional[Request] = None) -> Optio
     return api_key or None
 
 
+def _resolve_elevenlabs_key(db: Session, request: Optional[Request] = None) -> Optional[str]:
+    """Return the ElevenLabs API key, mirroring :func:`_resolve_gemini_key`."""
+    api_key = secret_store.get_secret("elevenlabs", db=db)
+    if not api_key and request is not None:
+        api_key = request.headers.get(ELEVENLABS_KEY_HEADER)
+    return api_key or None
+
+
 def _no_key_http_503() -> HTTPException:
     return HTTPException(
         status_code=503,
         detail=(
             "No Gemini API key configured. Add one via Settings > API Keys "
             f"(or pass an '{GEMINI_KEY_HEADER}' header)."
+        ),
+    )
+
+
+def _no_elevenlabs_key_http_503() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail=(
+            "No ElevenLabs API key configured. Add one via Settings > API Keys "
+            f"(or pass an '{ELEVENLABS_KEY_HEADER}' header)."
         ),
     )
 
@@ -318,11 +343,20 @@ def generate_gemini_video(
 
 @router.post("/api/generate/audio")
 def generate_audio(
+    request: Request,
     prompt: str = Query(...),
     type: str = Query("tts"),
-    db: Session = Depends(get_db)
+    voice_id: Optional[str] = Query(None),
+    stability: float = Query(0.5, ge=0.0, le=1.0),
+    clarity: float = Query(0.75, ge=0.0, le=1.0),
+    db: Session = Depends(get_db),
 ):
-    """Simulated ElevenLabs audio synthesis."""
+    """ElevenLabs audio synthesis.
+
+    Preference order: Colab dispatch (when connected) -> real ElevenLabs (when
+    a key is configured) -> mock fallback. ``voice_id``/``stability``/``clarity``
+    tune the synthesis when real ElevenLabs is used.
+    """
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="audio_generation",
@@ -331,31 +365,165 @@ def generate_audio(
             file_extension="mp3",
             content_type="audio/mpeg"
         )
-    filename = f"gen_audio_{int(time.time())}.mp3"
-    content = b"Mock elevenlabs generated audio bytes."
-    upload_success = upload_object(content, filename, content_type="audio/mpeg")
-    
-    # Save media assets
-    try:
-        asset = MediaAsset(
-            title=f"ElevenLabs Synthesized: {prompt[:30]}...",
-            file_path=filename,
-            file_size=len(content),
-            content_type="audio/mpeg",
-            duration=3.0
-        )
-        db.add(asset)
-        db.commit()
-    except Exception as e:
-        logger.error(f"Failed save generated audio asset: {e}")
-        db.rollback()
 
+    api_key = _resolve_elevenlabs_key(db, request)
+    if not api_key:
+        filename = f"gen_audio_{int(time.time())}.mp3"
+        content = b"Mock elevenlabs generated audio bytes."
+        upload_success = upload_object(content, filename, content_type="audio/mpeg")
+
+        # Save media assets
+        try:
+            asset = MediaAsset(
+                title=f"ElevenLabs Synthesized: {prompt[:30]}...",
+                file_path=filename,
+                file_size=len(content),
+                content_type="audio/mpeg",
+                duration=3.0
+            )
+            db.add(asset)
+            db.commit()
+        except Exception as e:
+            logger.error(f"Failed save generated audio asset: {e}")
+            db.rollback()
+
+        return {
+            "status": "COMPLETED",
+            "type": type,
+            "filename": filename,
+            "url": generate_url(filename) if upload_success else "",
+        }
+
+    try:
+        audio = elevenlabs_service.synthesize(
+            api_key,
+            prompt,
+            voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
+            stability=stability,
+            clarity=clarity,
+        )
+    except Exception as e:
+        logger.error(f"ElevenLabs audio synthesis failed: {e}")
+        raise HTTPException(status_code=502, detail=f"ElevenLabs audio synthesis failed: {e}")
+
+    filename = f"gen_audio_{int(time.time())}.mp3"
+    upload_success = upload_object(audio, filename, content_type="audio/mpeg")
+    _save_asset(
+        db,
+        title=f"ElevenLabs Synthesized: {prompt[:30]}...",
+        filename=filename,
+        content_type="audio/mpeg",
+        size=len(audio),
+    )
     return {
         "status": "COMPLETED",
         "type": type,
         "filename": filename,
         "url": generate_url(filename) if upload_success else "",
     }
+
+
+@router.post("/api/generate/tts", response_model=GenerationTtsOut)
+def generate_tts(
+    request: Request,
+    text: str = Query(...),
+    voice_id: Optional[str] = Query(None, description="ElevenLabs voice id; defaults to the standard 'Rachel' preset"),
+    stability: float = Query(0.5, ge=0.0, le=1.0),
+    clarity: float = Query(0.75, ge=0.0, le=1.0),
+    model: str = Query(elevenlabs_service.DEFAULT_MODEL),
+    db: Session = Depends(get_db),
+):
+    """Text-to-speech via real ElevenLabs, persisted to MinIO.
+
+    Preference order mirrors ``/api/generate/audio``: Colab dispatch when
+    connected, real ElevenLabs when a key is configured, and a mock fallback
+    otherwise so the client always receives a usable shape.
+    """
+    if is_colab_connected():
+        return dispatch_gen_to_colab(
+            task_type="audio_generation",
+            parameters={"text": text, "voice_id": voice_id, "stability": stability, "clarity": clarity},
+            db=db,
+            file_extension="mp3",
+            content_type="audio/mpeg",
+        )
+
+    api_key = _resolve_elevenlabs_key(db, request)
+    resolved_voice = voice_id or elevenlabs_service.DEFAULT_VOICE_ID
+    if not api_key:
+        filename = f"gen_audio_{int(time.time())}.mp3"
+        content = b"Mock elevenlabs generated audio bytes."
+        upload_success = upload_object(content, filename, content_type="audio/mpeg")
+        _save_asset(
+            db,
+            title=f"ElevenLabs Synthesized: {text[:30]}...",
+            filename=filename,
+            content_type="audio/mpeg",
+            size=len(content),
+            duration=3.0,
+        )
+        return {
+            "status": "COMPLETED",
+            "voice_id": resolved_voice,
+            "model": model,
+            "stability": stability,
+            "clarity": clarity,
+            "filename": filename,
+            "url": generate_url(filename) if upload_success else "",
+            "content_type": "audio/mpeg",
+        }
+
+    try:
+        audio = elevenlabs_service.synthesize(
+            api_key,
+            text,
+            voice_id=resolved_voice,
+            stability=stability,
+            clarity=clarity,
+            model=model,
+        )
+    except Exception as e:
+        logger.error(f"ElevenLabs TTS synthesis failed: {e}")
+        raise HTTPException(status_code=502, detail=f"ElevenLabs TTS synthesis failed: {e}")
+
+    filename = f"gen_tts_{int(time.time())}.mp3"
+    upload_success = upload_object(audio, filename, content_type="audio/mpeg")
+    _save_asset(
+        db,
+        title=f"ElevenLabs TTS: {text[:30]}...",
+        filename=filename,
+        content_type="audio/mpeg",
+        size=len(audio),
+    )
+    return {
+        "status": "COMPLETED",
+        "voice_id": resolved_voice,
+        "model": model,
+        "stability": stability,
+        "clarity": clarity,
+        "filename": filename,
+        "url": generate_url(filename) if upload_success else "",
+        "content_type": "audio/mpeg",
+    }
+
+
+@router.get("/api/generate/voice-list", response_model=GenerationVoiceListOut)
+def list_elevenlabs_voices(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """List the voices available to the configured ElevenLabs account."""
+    api_key = _resolve_elevenlabs_key(db, request)
+    if not api_key:
+        raise _no_elevenlabs_key_http_503()
+
+    try:
+        voices = elevenlabs_service.list_voices(api_key)
+    except Exception as e:
+        logger.error(f"ElevenLabs voice list fetch failed: {e}")
+        raise HTTPException(status_code=502, detail=f"ElevenLabs voice list fetch failed: {e}")
+
+    return {"status": "COMPLETED", "voices": voices}
 
 
 @router.post("/api/generate/image")

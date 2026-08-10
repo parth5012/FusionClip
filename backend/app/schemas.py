@@ -150,6 +150,32 @@ class GenerationAudioOut(GenerationOut):
     url: str
 
 
+class GenerationTtsOut(GenerationOut):
+    """Response from POST /api/generate/tts (real ElevenLabs synthesis)."""
+
+    voice_id: str
+    model: str
+    stability: float
+    clarity: float
+    filename: str
+    url: str
+    content_type: str
+
+
+class GenerationVoice(BaseModel):
+    """One ElevenLabs voice surfaced by the voice-list endpoint."""
+
+    voice_id: str
+    name: Optional[str] = None
+    labels: Dict[str, str] = Field(default_factory=dict)
+    category: Optional[str] = None
+    preview_url: Optional[str] = None
+
+
+class GenerationVoiceListOut(GenerationOut):
+    voices: List[GenerationVoice] = Field(default_factory=list)
+
+
 class GenerationImageParameters(BaseModel):
     steps: int
     scale: float
