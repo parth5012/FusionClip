@@ -1,7 +1,7 @@
 ﻿import time
 import subprocess
-import re
-import os
+import traceback
+import sys
 import json
 import redis
 from datetime import datetime, timezone
@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 # Cache redis client
 redis_client = redis.from_url(settings.REDIS_URL)
 
-# Errors that should trigger auto-retry
-TRANSIENT_ERRORS = (
+# Errors trigger auto-retry
+TRANSIENT_ERRORS = [
     "OOM",
     "out of memory",
     "MemoryError",
@@ -32,10 +32,10 @@ TRANSIENT_ERRORS = (
     "ServiceUnavailable",
     "503",
     "429",
-)
+]
 
-# Errors that should NOT be retried
-PERMANENT_ERRORS = (
+# Errors NOT retried
+PERMANENT_ERRORS = [
     "invalid file",
     "bad parameters",
     "validation error",
@@ -45,11 +45,29 @@ PERMANENT_ERRORS = (
     "403",
     "unsupported format",
     "corrupt",
-)
+]
+
+
+def categorize_error(error_msg: str) -> str:
+    """Categorize error type for diagnostics."""
+    error_lower = error_msg.lower()
+    for pattern in PERMANENT_ERRORS:
+        if pattern.lower() in error_lower:
+            return "permanent"
+    for pattern in TRANSIENT_ERRORS:
+        if pattern.lower() in error_lower:
+            return "transient"
+    if "memory" in error_lower or "oom" in error_lower:
+        return "oom"
+    if "timeout" in error_lower:
+        return "timeout"
+    if "validation" in error_lower or "parameter" in error_lower:
+        return "validation"
+    return "runtime"
 
 
 def is_transient_error(error_msg: str) -> bool:
-    """Determine if an error is transient (retryable) or permanent."""
+    """Determine if error is transient (retryable) or permanent."""
     error_lower = error_msg.lower()
     for pattern in PERMANENT_ERRORS:
         if pattern.lower() in error_lower:
@@ -65,14 +83,15 @@ def exponential_backoff(retry_count: int) -> int:
     return (2 ** retry_count) * 60
 
 
-def update_task_retry(db_task: Task, retry_count: int, db):
-    """Update retry tracking fields on a task."""
+def update_task_retry(db_task: Task, retry_count: int, db) -> None:
+    """Update retry tracking fields on task."""
     db_task.retry_count = retry_count
     db_task.last_retry_at = datetime.now(timezone.utc)
     db.commit()
 
+
 def parse_duration(file_path: str) -> float:
-    """Get the duration of a media file in seconds using ffprobe."""
+    """Get duration of media file in seconds using ffprobe."""
     try:
         cmd = [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -81,15 +100,15 @@ def parse_duration(file_path: str) -> float:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         return float(result.stdout.strip())
     except Exception as e:
-        logger.error(f"Failed to parse duration for {file_path}: {e}")
+        logger.error(f"Failed to parse duration {file_path}: {e}")
         return 0.0
 
 
-def run_ffmpeg_with_progress(cmd, duration: float, task_id: str, celery_task=None):
-    """Run an FFmpeg command in a subprocess and update progress via Redis/Celery/DB."""
+def run_ffmpeg_with_progress(cmd, duration: float, task_id: str, celery_task=None) -> None:
+    """Run FFmpeg command with subprocess and update progress via Redis/DB."""
     logger.info(f"Running FFmpeg command: {' '.join(cmd)}")
 
-    time_regex = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+    time_regex = __import__('re').compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
 
     db = SessionLocal()
     try:
@@ -108,52 +127,35 @@ def run_ffmpeg_with_progress(cmd, duration: float, task_id: str, celery_task=Non
                 current_time = hours * 3600 + minutes * 60 + seconds + ms / 100.0
                 percent = min(int((current_time / duration) * 100), 99)
 
-                if celery_task:
-                    celery_task.update_state(
-                        state="PROGRESS",
-                        meta={"percent": percent, "status": f"Processing media: {percent}%"}
-                    )
-
                 update_payload = {
                     "task_id": task_id,
-                    "status": "PROCESSING",
+                    "status": "PROGRESS",
                     "progress": percent,
                     "error": None
                 }
                 redis_client.publish("task_updates", json.dumps(update_payload))
 
-                db_task = db.query(Task).filter(Task.task_id == task_id).first()
-                if db_task:
-                    db_task.status = "PROCESSING"
-                    db_task.progress = percent
-                    db.commit()
+                try:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task:
+                        db_task.progress = percent
+                        db.commit()
+                except Exception as e:
+                    logger.error(f"Failed to update progress for task {task_id}: {e}")
 
-        process.wait()
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, cmd)
-
-    except Exception as e:
-        logger.error(f"FFmpeg process encountered an error: {e}")
-        db_task = db.query(Task).filter(Task.task_id == task_id).first()
-        if db_task:
-            db_task.status = "FAILED"
-            db_task.error = str(e)
-            db.commit()
-
-        redis_client.publish("task_updates", json.dumps({
-            "task_id": task_id,
-            "status": "FAILED",
-            "progress": 0,
-            "error": str(e)
-        }))
-        raise e
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg process encountered error: {e}")
+        raise
     finally:
         db.close()
 
 
-def _handle_task_failure(task_id: str, e: Exception, max_retries: int):
-    """Handle task failure with retry logic. Returns True if retry was scheduled."""
+def _handle_task_failure(task_id: str, e: Exception, max_retries: int) -> bool:
+    """Handle task failure retry logic. Returns True if retry scheduled."""
     error_msg = str(e)
+    tb = traceback.format_exc()
+    error_type = categorize_error(error_msg)
+
     db = SessionLocal()
     try:
         db_task = db.query(Task).filter(Task.task_id == task_id).first()
@@ -179,12 +181,15 @@ def _handle_task_failure(task_id: str, e: Exception, max_retries: int):
                 "progress": 0,
                 "error": f"Retry {new_retry_count}/{max_retries} in {countdown}s: {error_msg}",
                 "retry_count": new_retry_count,
-                "max_retries": max_retries
+                "max_retries": max_retries,
+                "error_type": error_type
             }))
             return True
         else:
             db_task.status = "FAILED"
             db_task.error = error_msg
+            db_task.traceback = tb
+            db_task.error_type = error_type
             db.commit()
 
             redis_client.publish("task_updates", json.dumps({
@@ -192,17 +197,20 @@ def _handle_task_failure(task_id: str, e: Exception, max_retries: int):
                 "status": "FAILED",
                 "progress": 0,
                 "error": error_msg,
+                "traceback": tb,
                 "retry_count": current_retry,
-                "max_retries": max_retries
+                "max_retries": max_retries,
+                "error_type": error_type
             }))
             return False
     finally:
         db.close()
 
+
 # Fast task endpoint
 @celery.task(bind=True, name="app.tasks.process_media_fast", max_retries=3)
 def process_media_fast(self, object_name: str, task_type: str = "thumbnail"):
-    logger.info(f"Processing fast task: {task_type} for {object_name}")
+    logger.info(f"Processing fast task: {task_type} {object_name}")
     task_id = self.request.id
 
     db = SessionLocal()
@@ -232,23 +240,23 @@ def process_media_fast(self, object_name: str, task_type: str = "thumbnail"):
             }
             redis_client.publish("task_updates", json.dumps(update_payload))
 
-            db = SessionLocal()
-            db_task = db.query(Task).filter(Task.task_id == task_id).first()
-            if db_task:
-                db_task.status = "PROCESSING" if percent < 100 else "COMPLETED"
-                db_task.progress = percent
-                db.commit()
-            db.close()
+        db = SessionLocal()
+        db_task = db.query(Task).filter(Task.task_id == task_id).first()
+        if db_task:
+            db_task.status = "PROCESSING" if percent < 100 else "COMPLETED"
+            db_task.progress = percent
+            db.commit()
+        db.close()
 
         processed_name = f"processed/thumb_{object_name.split('/')[-1]}"
         simulated_media = b"Simulated thumbnail content bytes."
-        upload_success = upload_object(simulated_media, processed_name, content_type="image/jpeg")
+        upload_success = upload_object(simulated_media, processed_name, content_type="image/png")
 
         return {
             "status": "COMPLETED",
             "task_id": task_id,
             "original_object": object_name,
-            "processed_url": generate_url(processed_name) if upload_success else ""
+            "processed_url": generate_url(processed_name) if upload_success else None
         }
 
     except Exception as e:
@@ -270,7 +278,7 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
 
     is_colab = redis_client.get("colab:connected") == b"true"
     if is_colab:
-        logger.info(f"Colab worker detected! Offloading heavy task {task_type} for {object_name}")
+        logger.info(f"Colab worker detected! Offloading heavy task {task_type} {object_name}")
         task_payload = {
             "type": "task_dispatch",
             "task_id": task_id,
@@ -280,6 +288,7 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
                 "input_url": generate_url(object_name)
             }
         }
+
         redis_client.publish("colab_dispatches", json.dumps(task_payload))
         redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
         redis_client.expire("colab_pending_tasks_http", 3600)
@@ -319,7 +328,7 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
                             "processed_url": processed_url
                         }
                     else:
-                        error_msg = res.get("error", "Task failed on Colab")
+                        error_msg = res.get("error", "Task failed in Colab")
                         if db_task:
                             db_task.status = "FAILED"
                             db_task.error = error_msg
@@ -356,8 +365,9 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
 
     return _original_process_media_heavy(self, object_name, task_type)
 
+
 def _original_process_media_heavy(self, object_name: str, task_type: str = "transcode"):
-    logger.info(f"Processing heavy task: {task_type} for {object_name}")
+    logger.info(f"Processing heavy task: {task_type} {object_name}")
     task_id = self.request.id
 
     temp_in = scratchpad.get_temp_path(suffix="_in.mp4")
@@ -405,7 +415,7 @@ def _original_process_media_heavy(self, object_name: str, task_type: str = "tran
             "status": "COMPLETED",
             "task_id": task_id,
             "original_object": object_name,
-            "processed_url": generate_url(processed_name) if upload_success else ""
+            "processed_url": generate_url(processed_name) if upload_success else None
         }
 
     except Exception as e:
@@ -422,7 +432,7 @@ def _original_process_media_heavy(self, object_name: str, task_type: str = "tran
         scratchpad.remove_path(temp_out)
 
 
-# For backward compatibility
+# Backward compatibility
 @celery.task(bind=True)
 def process_multimedia_task(self, object_name: str, task_type: str = "transcode"):
     if task_type in ["thumbnail", "waveform"]:

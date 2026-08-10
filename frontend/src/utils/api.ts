@@ -42,6 +42,8 @@ export interface TaskListItem {
   progress: number;
   error: string | null;
   logs: string | null;
+  traceback: string | null;
+  error_type: string | null;
   retry_count: number;
   max_retries: number;
   last_retry_at: string | null;
@@ -76,12 +78,12 @@ export async function uploadFile(file: File, folder = ''): Promise<UploadRespons
   const url = `${API_BASE_URL}/api/storage/upload?folder=${encodeURIComponent(folder)}`;
   const formData = new FormData();
   formData.append('file', file);
-  
+
   const res = await fetch(url, {
     method: 'POST',
     body: formData,
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to upload file');
   }
@@ -93,7 +95,7 @@ export async function deleteFile(path: string): Promise<{ message: string }> {
   const res = await fetch(url, {
     method: 'DELETE',
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to delete file');
   }
@@ -105,7 +107,7 @@ export async function createFolder(folderPath: string): Promise<{ message: strin
   const res = await fetch(url, {
     method: 'POST',
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to create folder');
   }
@@ -117,7 +119,7 @@ export async function startTask(path: string, taskType = 'transcode'): Promise<T
   const res = await fetch(url, {
     method: 'POST',
   });
-  
+
   if (!res.ok) {
     throw new Error(`Failed to start task: ${taskType}`);
   }
@@ -138,6 +140,8 @@ export async function fetchTasks(
   pageSize = 50,
   status?: string,
   taskType?: string,
+  search?: string,
+  errorType?: string,
 ): Promise<TaskListResponse> {
   const params = new URLSearchParams({
     page: String(page),
@@ -145,6 +149,8 @@ export async function fetchTasks(
   });
   if (status) params.set('status', status);
   if (taskType) params.set('task_type', taskType);
+  if (search) params.set('search', search);
+  if (errorType) params.set('error_type', errorType);
   const url = `${API_BASE_URL}/api/tasks/list?${params.toString()}`;
   const res = await fetch(url);
   if (!res.ok) {
@@ -187,89 +193,25 @@ export async function fetchMediaCatalog(query = '', limit = 20): Promise<MediaAs
   return res.json();
 }
 
-/* -- Provider API keys -- */
-
-export type SecretProvider = 'gemini' | 'elevenlabs';
-
-export interface ProviderSecretStatus {
-  configured: boolean;
-  last4: string | null;
-}
-
-export interface SecretStatusResponse {
-  gemini: ProviderSecretStatus;
-  elevenlabs: ProviderSecretStatus;
-}
-
-export interface SaveSecretsPayload {
-  gemini_api_key?: string;
-  elevenlabs_api_key?: string;
-}
-
-export interface SaveSecretsResponse {
-  status: string;
-  updated: SecretProvider[];
-}
-
-export interface DeleteSecretResponse {
-  status: string;
-  provider: string;
-  deleted: boolean;
-}
-
-export async function fetchSecretStatus(): Promise<SecretStatusResponse> {
-  const res = await fetch(`${API_BASE_URL}/api/settings/secrets`);
+/* Provider API keys */
+export async function getApiKey(provider: string): Promise<{ key: string | null }> {
+  const url = `${API_BASE_URL}/api/config/${provider}`;
+  const res = await fetch(url);
   if (!res.ok) {
-    throw new Error('Failed to fetch API key status');
+    throw new Error('Failed to fetch API key');
   }
   return res.json();
 }
 
-export async function saveSecrets(payload: SaveSecretsPayload): Promise<SaveSecretsResponse> {
-  const res = await fetch(`${API_BASE_URL}/api/settings/secrets`, {
+export async function setApiKey(provider: string, key: string): Promise<{ message: string }> {
+  const url = `${API_BASE_URL}/api/config/${provider}`;
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ key }),
   });
-
   if (!res.ok) {
-    throw new Error('Failed to save API keys');
-  }
-  return res.json();
-}
-
-export async function deleteSecret(provider: SecretProvider): Promise<DeleteSecretResponse> {
-  const res = await fetch(`${API_BASE_URL}/api/settings/secrets/${provider}`, {
-    method: 'DELETE',
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed to remove ${provider} API key`);
-  }
-  return res.json();
-}
-
-/* -- Colab Compute Metrics -- */
-
-export interface ColabMetricsResponse {
-  status: 'connected' | 'disconnected';
-  metrics: {
-    vram_used: number;
-    vram_total: number;
-    ram_used: number;
-    ram_total: number;
-    cpu_load: number;
-    active_task: string | null;
-    vram_percent: number;
-    ram_percent: number;
-    updated_at: number;
-  } | null;
-}
-
-export async function fetchColabMetrics(): Promise<ColabMetricsResponse> {
-  const res = await fetch(`${API_BASE_URL}/api/colab/metrics`);
-  if (!res.ok) {
-    throw new Error('Failed to fetch Colab metrics');
+    throw new Error('Failed to set API key');
   }
   return res.json();
 }

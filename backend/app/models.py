@@ -1,4 +1,5 @@
 import datetime
+import sqlalchemy
 from sqlalchemy import Column, Integer, String, Float, DateTime, Text, JSON, func
 from app.database import Base
 
@@ -7,20 +8,21 @@ try:
 except ImportError:
     from sqlalchemy.types import TypeDecorator
 
-class Vector(TypeDecorator):
-    """Fallback PGVector type using JSON/Array representation when pgvector not installed."""
-    impl = JSON
-    cache_ok = True
+    class Vector(TypeDecorator):
+        """Fallback PGVector type using JSON/Array representation when pgvector not installed."""
+        impl = JSON
+        cache_ok = True
 
-    def __init__(self, dim=1536):
-        super().__init__()
-        self.dim = dim
+        def __init__(self, dim=1536):
+            super().__init__()
+            self.dim = dim
 
-    def process_bind_param(self, value, dialect):
-        return value
+        def process_bind_param(self, value, dialect):
+            return value
 
-    def process_result_value(self, value, dialect):
-        return value
+        def process_result_value(self, value, dialect):
+            return value
+
 
 class MediaAsset(Base):
     __tablename__ = "media_assets"
@@ -35,6 +37,7 @@ class MediaAsset(Base):
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
+
 class Configuration(Base):
     __tablename__ = "configurations"
 
@@ -43,6 +46,7 @@ class Configuration(Base):
     value = Column(Text, nullable=False)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -53,9 +57,9 @@ class Task(Base):
     status = Column(String, nullable=False)
     progress = Column(Integer, default=0, nullable=False)
     error = Column(Text, nullable=True)
+    logs = Column(Text, nullable=True)
     traceback = Column(Text, nullable=True)
     error_type = Column(String, nullable=True)
-    logs = Column(Text, nullable=True)
     retry_count = Column(Integer, default=0, nullable=False)
     max_retries = Column(Integer, default=3, nullable=False)
     last_retry_at = Column(DateTime, nullable=True)
