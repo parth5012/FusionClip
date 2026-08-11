@@ -68,11 +68,10 @@ def clone_voice(
     client = build_client(api_key)
     if not os.path.exists(audio_file_path):
         raise ValueError(f"Audio file not found: {audio_file_path}")
-    voice = client.voices.add(
+    voice = client.voices.ivc.create(
         name=voice_name,
         files=[audio_file_path],
     )
-    voice.wait_until_processed(timeout=timeout)
     return voice.voice_id
 
 
@@ -92,3 +91,17 @@ def list_voices(api_key: str) -> List[Dict]:
             }
         )
     return voices
+
+
+def generate_sound_effect(
+    api_key: str,
+    text: str,
+    duration_seconds: Optional[float] = None,
+) -> bytes:
+    """Generate a sound effect from a text prompt and return raw audio bytes."""
+    client = build_client(api_key)
+    response = client.text_to_sound_effects.convert(
+        text=text,
+        duration_seconds=duration_seconds,
+    )
+    return b"".join(response)

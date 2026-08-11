@@ -532,6 +532,45 @@ def list_elevenlabs_voices(
     return {"status": "COMPLETED", "voices": voices}
 
 
+@router.post("/api/generate/sound-effect")
+def generate_sound_effect(
+    request: Request,
+    prompt: str = Form(..., description="Text prompt for the sound effect"),
+    duration_seconds: Optional[float] = Form(None, description="Duration of the sound effect in seconds (0.5-30)"),
+    db: Session = Depends(get_db),
+):
+    """Generate a sound effect from a text prompt using ElevenLabs."""
+    api_key = _resolve_elevenlabs_key(db, request)
+    if not api_key:
+        raise _no_elevenlabs_key_http_503()
+
+    try:
+        audio_bytes = elevenlabs_service.generate_sound_effect(
+            api_key,
+            text=prompt,
+            duration_seconds=duration_seconds,
+        )
+    except Exception as e:
+        logger.error(f"ElevenLabs sound effect generation failed: {e}")
+        raise HTTPException(status_code=502, detail=f"ElevenLabs sound effect generation failed: {e}")
+
+    filename = f"sfx_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp3"
+    upload_success = upload_object(audio_bytes, filename, content_type="audio/mpeg")
+    _save_asset(
+        db,
+        title=f"Sound Effect: {prompt[:30]}...",
+        filename=filename,
+        content_type="audio/mpeg",
+        size=len(audio_bytes),
+    )
+
+    return {
+        "status": "COMPLETED",
+        "filename": filename,
+        "url": generate_url(filename) if upload_success else "",
+    }
+
+
 ALLOWED_CLONE_AUDIO_TYPES = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/ogg", "application/ogg"}
 
 

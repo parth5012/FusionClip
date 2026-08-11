@@ -41,11 +41,11 @@ class TestGenerateAudioElevenLabs:
         monkeypatch.setattr(elevenlabs_service, "clone_voice", mock_clone)
         # Prepare test file
         test_file = ("test.mp3", b"dummy audio", "audio/mpeg")
-        form_data = {
-            "file": test_file,
-            "voice_name": "TestVoice",
-        }
-        response = client.post("/api/generate/voice-clone", files=form_data)
+        response = client.post(
+            "/api/generate/voice-clone",
+            data={"voice_name": "TestVoice"},
+            files={"file": test_file},
+        )
         assert response.status_code == 200
         assert response.json()["voice_id"] == mock_voice_id
         # Verify Configuration entry
@@ -55,7 +55,9 @@ class TestGenerateAudioElevenLabs:
     def test_voice_clone_no_key_is_503(self, client):
         test_file = ("test.mp3", b"dummy audio", "audio/mpeg")
         response = client.post(
-            "/api/generate/voice-clone", files={"file": test_file, "voice_name": "NoKey"}
+            "/api/generate/voice-clone",
+            data={"voice_name": "NoKey"},
+            files={"file": test_file},
         )
         assert response.status_code == 503
 
@@ -63,7 +65,9 @@ class TestGenerateAudioElevenLabs:
         secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
         test_file = ("test.jpg", b"dummy image", "image/jpeg")
         response = client.post(
-            "/api/generate/voice-clone", files={"file": test_file, "voice_name": "BadVoice"}
+            "/api/generate/voice-clone",
+            data={"voice_name": "BadVoice"},
+            files={"file": test_file},
         )
         assert response.status_code == 400
         assert "Invalid audio" in response.json()["detail"]
@@ -74,7 +78,9 @@ class TestGenerateAudioElevenLabs:
         monkeypatch.setattr("app.routers.generate.parse_duration", lambda x: 70.0)
         test_file = ("long.mp3", b"long audio", "audio/mpeg")
         response = client.post(
-            "/api/generate/voice-clone", files={"file": test_file, "voice_name": "LongVoice"}
+            "/api/generate/voice-clone",
+            data={"voice_name": "LongVoice"},
+            files={"file": test_file},
         )
         assert response.status_code == 400
         assert "exceeds 1 minute" in response.json()["detail"]
@@ -321,4 +327,54 @@ class TestGenerateVoiceList:
         monkeypatch.setattr("app.services.elevenlabs.list_voices", fake_list_voices)
 
         res = client.get("/api/generate/voice-list")
+        assert res.status_code == 502
+
+
+class TestSoundEffects:
+    def test_no_key_returns_503(self, client):
+        res = client.post("/api/generate/sound-effect", data={"prompt": "thunder storm"})
+        assert res.status_code == 503
+
+    def test_stored_key_generates_and_uploads(self, client, db_session, stub_storage, monkeypatch):
+        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        captured = {}
+
+        def fake_generate(api_key, text, duration_seconds=None):
+            captured["api_key"] = api_key
+            captured["text"] = text
+            captured["duration_seconds"] = duration_seconds
+            return b"ID3-fake-sfx-bytes"
+
+        monkeypatch.setattr("app.services.elevenlabs.generate_sound_effect", fake_generate)
+
+        res = client.post(
+            "/api/generate/sound-effect",
+            data={"prompt": "thunder storm", "duration_seconds": "4.0"},
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert set(body) == {"status", "filename", "url"}
+        assert body["status"] == "COMPLETED"
+        assert body["filename"].startswith("sfx_")
+        assert body["filename"].endswith(".mp3")
+        assert body["url"].startswith("http://test-minio/")
+        assert body["filename"] in stub_storage["uploaded"]
+        assert captured == {
+            "api_key": "xi-stored-key-0001",
+            "text": "thunder storm",
+            "duration_seconds": 4.0,
+        }
+
+        asset = db_session.query(MediaAsset).filter(MediaAsset.file_path == body["filename"]).one()
+        assert asset.content_type == "audio/mpeg"
+
+    def test_generation_failure_returns_502(self, client, db_session, monkeypatch):
+        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+
+        def fake_generate(api_key, text, duration_seconds=None):
+            raise RuntimeError("generation failed")
+
+        monkeypatch.setattr("app.services.elevenlabs.generate_sound_effect", fake_generate)
+
+        res = client.post("/api/generate/sound-effect", data={"prompt": "thunder storm"})
         assert res.status_code == 502
