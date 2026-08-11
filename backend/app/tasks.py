@@ -289,99 +289,32 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
     task_id = self.request.id
     retry_count = self.request.retries
 
-    is_colab = redis_client.get("colab:connected") == b"true"
-    if is_colab:
-        logger.info(f"Colab worker detected! Offloading heavy task {task_type} {object_name}")
-        task_payload = {
-            "type": "task_dispatch",
-            "task_id": task_id,
-            "task_type": task_type,
-            "parameters": {
-                "object_name": object_name,
-                "input_url": generate_url(object_name)
+    try:
+        is_colab = redis_client.get("colab:connected") == b"true"
+        if is_colab:
+            logger.info(f"Colab worker detected! Offloading heavy task {task_type} {object_name}")
+            task_payload = {
+                "type": "task_dispatch",
+                "task_id": task_id,
+                "task_type": task_type,
+                "parameters": {
+                    "object_name": object_name,
+                    "input_url": generate_url(object_name)
+                }
             }
-        }
 
-        redis_client.publish("colab_dispatches", json.dumps(task_payload))
-        redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
-        redis_client.expire("colab_pending_tasks_http", 3600)
+            redis_client.publish("colab_dispatches", json.dumps(task_payload))
+            redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
+            redis_client.expire("colab_pending_tasks_http", 3600)
 
-        result_key = f"colab_task_result:{task_id}"
-        timeout = 120
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            res_data = redis_client.get(result_key)
-            if res_data:
-                res = json.loads(res_data)
-
-                db = SessionLocal()
-                try:
-                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
-                    if res.get("status") == "SUCCESS":
-                        output = res.get("output", {})
-                        processed_url = output.get("url", "")
-                        processed_name = output.get("filename", f"processed_{object_name.split('/')[-1]}")
-
-                        if db_task:
-                            db_task.status = "COMPLETED"
-                            db_task.progress = 100
-                            db.commit()
-
-                        redis_client.publish("task_updates", json.dumps({
-                            "task_id": task_id,
-                            "status": "COMPLETED",
-                            "progress": 100,
-                            "error": None
-                        }))
-
-                        return {
-                            "status": "COMPLETED",
-                            "task_id": task_id,
-                            "original_object": object_name,
-                            "processed_url": processed_url
-                        }
-                    else:
-                        error_msg = res.get("error", "Task failed in Colab")
-                        if db_task:
-                            db_task.status = "FAILED"
-                            db_task.error = error_msg
-                            db.commit()
-
-                        redis_client.publish("task_updates", json.dumps({
-                            "task_id": task_id,
-                            "status": "FAILED",
-                            "progress": 0,
-                            "error": error_msg
-                        }))
-                        raise Exception(error_msg)
-                finally:
-                    db.close()
-            time.sleep(0.5)
-
-        db = SessionLocal()
-        try:
-            db_task = db.query(Task).filter(Task.task_id == task_id).first()
-            if db_task:
-                db_task.status = "FAILED"
-                db_task.error = "Execution timed out waiting for Colab worker response"
-                db.commit()
-        finally:
-            db.close()
-
-        redis_client.publish("task_updates", json.dumps({
-            "task_id": task_id,
-            "status": "FAILED",
-            "progress": 0,
-            "error": "Colab execution timed out"
-        }))
-        raise TimeoutError("Colab execution timed out")
-
+            result_key = f"colab_task_result:{task_id}"
             timeout = 120
             start_time = time.time()
             while time.time() - start_time < timeout:
                 res_data = redis_client.get(result_key)
                 if res_data:
                     res = json.loads(res_data)
+
                     db = SessionLocal()
                     try:
                         db_task = db.query(Task).filter(Task.task_id == task_id).first()
@@ -389,35 +322,60 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
                             output = res.get("output", {})
                             processed_url = output.get("url", "")
                             processed_name = output.get("filename", f"processed_{object_name.split('/')[-1]}")
+
                             if db_task:
                                 db_task.status = "COMPLETED"
                                 db_task.progress = 100
                                 db.commit()
+
                             redis_client.publish("task_updates", json.dumps({
-                                "task_id": task_id, "status": "COMPLETED",
-                                "progress": 100, "error": None
+                                "task_id": task_id,
+                                "status": "COMPLETED",
+                                "progress": 100,
+                                "error": None
                             }))
+
                             return {
-                                "status": "COMPLETED", "task_id": task_id,
-                                "original_object": object_name, "processed_url": processed_url
+                                "status": "COMPLETED",
+                                "task_id": task_id,
+                                "original_object": object_name,
+                                "processed_url": processed_url
                             }
                         else:
-                            error_msg = res.get("error", "Task failed on Colab")
+                            error_msg = res.get("error", "Task failed in Colab")
                             if db_task:
                                 db_task.status = "FAILED"
                                 db_task.error = error_msg
                                 db.commit()
+
                             redis_client.publish("task_updates", json.dumps({
-                                "task_id": task_id, "status": "FAILED",
-                                "progress": 0, "error": error_msg
+                                "task_id": task_id,
+                                "status": "FAILED",
+                                "progress": 0,
+                                "error": error_msg
                             }))
                             raise Exception(error_msg)
                     finally:
                         db.close()
                 time.sleep(0.5)
 
-            raise TimeoutError("Colab execution timed out")
+            db = SessionLocal()
+            try:
+                db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                if db_task:
+                    db_task.status = "FAILED"
+                    db_task.error = "Execution timed out waiting for Colab worker response"
+                    db.commit()
+            finally:
+                db.close()
 
+            redis_client.publish("task_updates", json.dumps({
+                "task_id": task_id,
+                "status": "FAILED",
+                "progress": 0,
+                "error": "Colab execution timed out"
+            }))
+            raise TimeoutError("Colab execution timed out")
         return _original_process_media_heavy(self, object_name, task_type)
     except Exception as e:
         should_retry = _handle_task_failure(task_id, e, retry_count, 3)
@@ -745,7 +703,6 @@ def process_upscale_task(self, task_id: str, object_name: str, params: dict):
         scratchpad.remove_path(temp_in)
         scratchpad.remove_path(temp_out)
 
-
 class CLIPEmbedder:
     _model = None
     _processor = None
@@ -879,3 +836,131 @@ if __name__ == "__main__":
         print("Backfill complete.")
     finally:
         db.close()
+
+
+# For backward compatibility
+@celery.task(bind=True)
+def process_multimedia_task(self, object_name: str, task_type: str = "transcode"):
+    # Forward to fast or heavy queue depending on task type
+    if task_type in ["thumbnail", "waveform"]:
+        return process_media_fast(object_name, task_type)
+    else:
+        return process_media_heavy(object_name, task_type)
+
+
+
+@celery.task(bind=True, name="app.tasks.export_batch_zip")
+def export_batch_zip(self, paths, export_format="original"):
+    """Zip the requested storage objects into a single archive and return its URL.
+
+    Optional per-file format conversion is attempted (video -> mp4 via ffmpeg,
+    image -> webp via Pillow). Any conversion failure falls back to the original
+    bytes so the batch export always completes.
+    """
+    import io as _io
+    import zipfile
+
+    from app.storage import get_object_stream
+
+    task_id = self.request.id
+    total = len(paths)
+    logger.info(f"Batch export task {task_id} started for {total} object(s), format={export_format}")
+
+    def _update_progress(percent, status_text, db_status):
+        self.update_state(
+            state="PROGRESS",
+            meta={"percent": percent, "status": status_text},
+        )
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = db_status
+                db_task.progress = percent
+                db.commit()
+        finally:
+            db.close()
+        redis_client.publish(
+            "task_updates",
+            json.dumps({"task_id": task_id, "status": db_status, "progress": percent}),
+        )
+
+    def _fetch_bytes(object_name):
+        return b"".join(get_object_stream(object_name))
+
+    def _convert_bytes(raw, filename, target_format):
+        """Attempt in-memory conversion; returns (converted, arc_name) or raises."""
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if target_format == "video-mp4" and ext in ("mp4", "mov", "webm", "mkv", "avi", "ogg", "m4v"):
+            import subprocess
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                src = f"{tmp}/input.{ext}"
+                dst = f"{tmp}/output.mp4"
+                with open(src, "wb") as fh:
+                    fh.write(raw)
+                cmd = ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", dst]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr[-500:])
+                with open(dst, "rb") as fh:
+                    converted = fh.read()
+                return converted, filename.rsplit(".", 1)[0] + ".mp4"
+        elif target_format == "image-webp" and ext in ("png", "jpg", "jpeg", "gif", "bmp", "webp"):
+            try:
+                from PIL import Image
+            except ImportError:
+                raise RuntimeError("Pillow not installed")
+            import io as _img_io
+            img = Image.open(_img_io.BytesIO(raw))
+            buf = _img_io.BytesIO()
+            img.save(buf, format="WEBP", quality=85)
+            return buf.getvalue(), filename.rsplit(".", 1)[0] + ".webp"
+        raise RuntimeError("unsupported conversion target")
+
+    zip_buffer = _io.BytesIO()
+    processed = 0
+    try:
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for idx, object_name in enumerate(paths, start=1):
+                percent = int((idx / total) * 100)
+                _update_progress(percent, f"Zipping {idx}/{total}: {object_name}", "PROCESSING")
+                arc_name = object_name.split("/")[-1] or "file.bin"
+                raw = _fetch_bytes(object_name)
+                if export_format and export_format != "original":
+                    try:
+                        raw, arc_name = _convert_bytes(raw, arc_name, export_format)
+                    except Exception as conv_err:
+                        logger.warning(f"Conversion failed for {object_name}: {conv_err}; using original")
+                if raw:
+                    zf.writestr(arc_name, raw)
+                    processed += 1
+
+        zip_bytes = zip_buffer.getvalue()
+        export_key = f"exports/batch_{task_id}.zip"
+        upload_object(zip_bytes, export_key, content_type="application/zip")
+        result = {
+            "url": generate_url(export_key),
+            "filename": f"batch_{task_id}.zip",
+            "count": processed,
+        }
+        self.update_state(state="SUCCESS", meta=result)
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = "COMPLETED"
+                db_task.progress = 100
+                db.commit()
+        finally:
+            db.close()
+        redis_client.publish(
+            "task_updates",
+            json.dumps({"task_id": task_id, "status": "COMPLETED", "progress": 100}),
+        )
+        logger.info(f"Batch export task {task_id} finished: {processed} file(s) -> {export_key}")
+        return result
+    except Exception as e:
+        logger.error(f"Batch export task {task_id} failed: {e}")
+        self.update_state(state="FAILURE", meta={"error": str(e)})
+        raise

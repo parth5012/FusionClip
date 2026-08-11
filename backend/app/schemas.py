@@ -199,3 +199,17 @@ class MediaAssetOut(BaseModel):
     duration: Optional[float] = None
     url: str
     created_at: Optional[str] = None
+
+
+# --- Batch Export ---------------------------------------------------------
+
+
+class BatchExportIn(BaseModel):
+    paths: list[str] = Field(..., min_length=1)
+    format: str = "original"
+
+
+class BatchExportOut(BaseModel):
+    message: str
+    task_id: str
+    status: str
