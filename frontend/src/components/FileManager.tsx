@@ -1,8 +1,8 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Folder, File, Upload, Trash2, Plus, Play, RefreshCw, 
+import {
+  Folder, File, Upload, Trash2, Plus, Play, RefreshCw,
   ChevronRight, Volume2, Video as VideoIcon, Image as ImageIcon,
   Loader2, Cpu, ArrowLeft, ArrowUpRight, CheckCircle2, AlertCircle
 } from 'lucide-react';
@@ -11,6 +11,7 @@ import {
   startTask, startUpscale, getTaskStatus, StorageItem, TaskStatusResponse
 } from '../utils/api';
 import UpscalerPanel from './UpscalerPanel';
+import { useStore } from '../store/useStore';
 
 export default function FileManager() {
   const [currentDir, setCurrentDir] = useState<string>('');
@@ -27,15 +28,8 @@ export default function FileManager() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState<boolean>(false);
 
-  // Active Celery tasks monitoring
-  const [activeTasks, setActiveTasks] = useState<Record<string, {
-    id: string;
-    objectName: string;
-    taskType: string;
-    state: string;
-    percent?: number;
-    statusText?: string;
-  }>>({});
+  // Store trigger navigation
+  const { setActiveTab } = useStore();
 
   // Upscaler State
   const [upscaleTargetFile, setUpscaleTargetFile] = useState<string | null>(null);
@@ -59,92 +53,46 @@ export default function FileManager() {
     loadDirectory('');
   }, []);
 
-  // Poll celery task statuses
-  useEffect(() => {
-    const taskIds = Object.keys(activeTasks).filter(
-      id => activeTasks[id].state === 'PENDING' || activeTasks[id].state === 'PROGRESS'
-    );
-
-    if (taskIds.length === 0) return;
-
-    const interval = setInterval(async () => {
-      for (const id of taskIds) {
-        try {
-          const status: TaskStatusResponse = await getTaskStatus(id);
-          
-          setActiveTasks(prev => {
-            const currentTask = prev[id];
-            if (!currentTask) return prev;
-
-            let updatedTask = { ...currentTask, state: status.state };
-
-            if (status.state === 'PROGRESS' && status.info) {
-              updatedTask.percent = status.info.percent;
-              updatedTask.statusText = status.info.status;
-            } else if (status.state === 'SUCCESS') {
-              updatedTask.percent = 100;
-              updatedTask.statusText = 'Completed processing task!';
-              // Reload directory to show the newly generated output file!
-              loadDirectory(currentDir);
-            } else if (status.state === 'FAILURE') {
-              updatedTask.statusText = `Error: ${status.info}`;
-            }
-
-            return { ...prev, [id]: updatedTask };
-          });
-        } catch (taskErr) {
-          console.error('Polling task error: ', taskErr);
-        }
-      }
-    }, 1500);
-
-    return () => clearInterval(interval);
-  }, [activeTasks, currentDir]);
-
   // Navigate folder level
   const handleFolderClick = (dirPath: string) => {
     loadDirectory(dirPath);
   };
 
   const handleGoBack = () => {
-    const segments = currentDir.replace(/\/$/, '').split('/');
-    segments.pop();
-    const parentPath = segments.length > 0 ? segments.join('/') + '/' : '';
-    loadDirectory(parentPath);
+    const parts = currentDir.split('/').filter(Boolean);
+    parts.pop();
+    const parentDir = parts.length > 0 ? parts.join('/') + '/' : '';
+    loadDirectory(parentDir);
   };
 
-  // Breadcrumbs utils
   const getBreadcrumbs = () => {
-    const list = [{ name: 'Root', path: '' }];
-    if (!currentDir) return list;
-    
-    const parts = currentDir.replace(/\/$/, '').split('/');
-    let accum = '';
-    parts.forEach(part => {
-      accum += part + '/';
-      list.push({ name: part, path: accum });
-    });
-    return list;
+    const parts = currentDir.split('/').filter(Boolean);
+    const breadcrumbs = [{ name: 'Root', path: '' }];
+    let accumulated = '';
+    for (const p of parts) {
+      accumulated += p + '/';
+      breadcrumbs.push({ name: p, path: accumulated });
+    }
+    return breadcrumbs;
   };
 
   // Delete handler
   const handleDelete = async (filePath: string) => {
-    if (!confirm(`Are you sure you want to delete ${filePath}?`)) return;
+    if (!confirm('Are you sure you want to delete this object permanently?')) return;
     try {
       await deleteFile(filePath);
       loadDirectory(currentDir);
     } catch (err: any) {
-      alert(err.message || 'Failed to delete file');
+      alert(err.message || 'Delete operation failed');
     }
   };
 
-  // Create folder
+  // Create folder handler
   const handleCreateFolder = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newFolderName.trim()) return;
     setCreatingFolder(true);
-    
-    // Construct absolute target key virtual location prefix
+
     const path = currentDir ? `${currentDir}${newFolderName}` : newFolderName;
     try {
       await createFolder(path);
@@ -161,7 +109,7 @@ export default function FileManager() {
   const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const filesList = e.target.files;
     if (!filesList || filesList.length === 0) return;
-    
+
     setUploading(true);
     try {
       await uploadFile(filesList[0], currentDir);
@@ -177,16 +125,9 @@ export default function FileManager() {
   // Trigger Celery Task
   const handleTriggerTask = async (filePath: string, taskType: string) => {
     try {
-      const taskRes = await startTask(filePath, taskType);
-      setActiveTasks(prev => ({
-        ...prev,
-        [taskRes.task_id]: {
-          id: taskRes.task_id,
-          objectName: filePath,
-          taskType: taskType,
-          state: taskRes.status
-        }
-      }));
+      await startTask(filePath, taskType);
+      // Immediately navigate to the centralized Queue Dashboard tab to view details
+      setActiveTab('queue');
     } catch (err: any) {
       alert(err.message || 'Pipeline dispatch failed');
     }
@@ -201,7 +142,7 @@ export default function FileManager() {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
-  // Detect file categories for icons or previewing
+  // Detect file categories icons previewing
   const getFileIcon = (fileName: string) => {
     const ext = fileName.split('.').pop()?.toLowerCase();
     if (['png', 'jpg', 'jpeg', 'svg', 'webp', 'gif'].includes(ext || '')) {
@@ -218,58 +159,12 @@ export default function FileManager() {
 
   return (
     <div className="space-y-6">
-      {/* Active Jobs panel */}
-      {Object.keys(activeTasks).length > 0 && (
-        <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
-          <h3 className="font-semibold text-slate-200 mb-3 flex items-center gap-2">
-            <Cpu className="w-4 h-4 text-sky-400 animate-pulse" />
-            Background Task Engine Tasks (Celery Status)
-          </h3>
-          <div className="space-y-3">
-            {Object.values(activeTasks).map(task => (
-              <div key={task.id} className="bg-slate-950 p-3 rounded border border-slate-900 text-sm">
-                <div className="flex justify-between items-center mb-1">
-                  <span className="font-medium text-slate-300">
-                    {task.taskType.toUpperCase()}: <span className="text-slate-400 text-xs font-mono">{task.objectName}</span>
-                  </span>
-                  <span className={`text-xs px-2 py-0.5 rounded font-mono ${
-                    task.state === 'SUCCESS' ? 'bg-emerald-950 text-emerald-400' :
-                    task.state === 'FAILURE' ? 'bg-rose-950 text-rose-400' :
-                    'bg-sky-950 text-sky-400 animate-pulse'
-                  }`}>
-                    {task.state}
-                  </span>
-                </div>
-                
-                {task.state !== 'SUCCESS' && task.state !== 'FAILURE' && (
-                  <div className="mt-2 w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                    <div 
-                      className="bg-sky-500 h-full transition-all duration-300"
-                      style={{ width: `${task.percent || 10}%` }}
-                    />
-                  </div>
-                )}
-                
-                {task.statusText && (
-                  <p className="text-xs text-slate-400 mt-1 flex items-center gap-1">
-                    {task.state === 'SUCCESS' ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /> :
-                     task.state === 'FAILURE' ? <AlertCircle className="w-3.5 h-3.5 text-rose-400" /> :
-                     <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-400" />}
-                    {task.statusText}
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
       {/* Directory operations toolbar */}
       <div className="flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center bg-slate-900 border border-slate-800 p-4 rounded-lg">
         {/* Navigation Breadcrumbs */}
         <div className="flex items-center gap-1 overflow-x-auto py-1 max-w-full">
           {currentDir && (
-            <button 
+            <button
               onClick={handleGoBack}
               className="mr-2 p-1.5 hover:bg-slate-800 rounded text-slate-400 transition"
               title="Go back a level"
@@ -306,7 +201,7 @@ export default function FileManager() {
             />
             <button
               type="submit"
-              disabled={creatingFolder || !newFolderName}
+              disabled={creatingFolder}
               className="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 px-3 py-1.5 rounded text-sm transition flex items-center gap-1.5 border border-slate-700"
             >
               {creatingFolder ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
@@ -329,7 +224,7 @@ export default function FileManager() {
             onChange={handleUpload}
             className="hidden"
           />
-          
+
           <button
             onClick={() => loadDirectory(currentDir)}
             className="p-2 border border-slate-700 rounded text-slate-400 hover:bg-slate-800 transition"
@@ -344,13 +239,13 @@ export default function FileManager() {
       {loading ? (
         <div className="flex flex-col items-center justify-center py-20 bg-slate-900/50 border border-slate-800/80 rounded-lg">
           <Loader2 className="w-8 h-8 animate-spin text-sky-500" />
-          <p className="text-slate-400 text-sm mt-3">Syncing with MinIO S3 storage buckets...</p>
+          <p className="text-slate-400 text-sm mt-3">Syncing current directory view...</p>
         </div>
       ) : error ? (
         <div className="bg-rose-950/20 border border-rose-800/80 rounded-lg p-6 text-center text-rose-300">
           <p className="font-semibold text-lg">Communication error</p>
           <p className="text-sm opacity-90 mt-1">{error}</p>
-          <button 
+          <button
             onClick={() => loadDirectory(currentDir)}
             className="mt-4 px-4 py-1.5 bg-rose-900/50 hover:bg-rose-900 border border-rose-700 text-slate-200 rounded text-sm transition"
           >
@@ -361,7 +256,7 @@ export default function FileManager() {
         <div className="flex flex-col items-center justify-center py-20 bg-slate-900/40 border border-slate-800/60 border-dashed rounded-lg text-slate-500">
           <Folder className="w-12 h-12 stroke-[1] text-slate-600 mb-2" />
           <p className="text-sm font-medium">Empty bucket path</p>
-          <p className="text-xs opacity-75 mt-1">Upload a file or create folders to get started.</p>
+          <p className="text-xs opacity-75 mt-1">Upload files or create folders to get started.</p>
         </div>
       ) : (
         <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
@@ -374,9 +269,9 @@ export default function FileManager() {
             </div>
 
             {/* Folder rows */}
-            {directories.map(dir => (
-              <div 
-                key={dir.path} 
+            {directories.map((dir) => (
+              <div
+                key={dir.path}
                 className="grid grid-cols-1 md:grid-cols-12 items-center gap-4 px-6 py-3.5 hover:bg-slate-850 transition cursor-pointer text-sm"
                 onClick={() => handleFolderClick(dir.path)}
               >
@@ -394,9 +289,9 @@ export default function FileManager() {
             ))}
 
             {/* File rows */}
-            {files.map(file => (
-              <div 
-                key={file.path} 
+            {files.map((file) => (
+              <div
+                key={file.path}
                 className="grid grid-cols-1 md:grid-cols-12 items-center gap-4 px-6 py-3.5 hover:bg-slate-850/50 transition text-sm"
               >
                 {/* File Title */}
@@ -422,7 +317,7 @@ export default function FileManager() {
                     <button
                       onClick={() => handleTriggerTask(file.path, 'transcode')}
                       className="text-xs hover:bg-slate-800 text-slate-300 hover:text-sky-400 p-1 px-1.5 rounded transition flex items-center gap-1"
-                      title="Transcode video/audio via Celery worker"
+                      title="Transcode video/audio Celery worker"
                     >
                       <Play className="w-3 h-3 text-sky-500" /> Transcode
                     </button>
@@ -438,10 +333,10 @@ export default function FileManager() {
 
                   {/* Playback / Pre-signed direct link */}
                   {file.url && (
-                    <a 
-                      href={file.url} 
-                      target="_blank" 
-                      rel="noopener noreferrer" 
+                    <a
+                      href={file.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
                       className="p-1.5 bg-slate-800 border border-slate-700 rounded text-slate-300 hover:bg-slate-700 hover:text-white transition"
                       title="Open file URL directly"
                     >
@@ -452,7 +347,7 @@ export default function FileManager() {
                   {/* Delete file */}
                   <button
                     onClick={() => handleDelete(file.path)}
-                    className="p-1.5 bg-slate-950/80 hover:bg-rose-950/60 border border-slate-855 text-slate-400 hover:text-rose-400 rounded transition"
+                    className="p-1.5 bg-slate-950/80 hover:bg-rose-950/60 border border-slate-800 text-slate-400 hover:text-rose-400 rounded transition"
                     title="Delete object"
                   >
                     <Trash2 className="w-4 h-4" />
