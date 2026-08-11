@@ -354,3 +354,40 @@ export async function saveSettings(data: Record<string, any>): Promise<any> {
   return res.json();
 }
 
+export interface BatchExportResponse {
+  message: string;
+  task_id: string;
+  status: string;
+}
+
+export async function startBatchExport(
+  paths: string[],
+  format: string = 'original'
+): Promise<BatchExportResponse> {
+  const url = `${API_BASE_URL}/api/storage/download-batch`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ paths, format }),
+  });
+
+  if (!res.ok) {
+    throw new Error('Failed to start batch export');
+  }
+  return res.json();
+}
+
+export function triggerDownload(url: string, filename?: string) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  if (filename) {
+    a.download = filename;
+  }
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}

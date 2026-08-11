@@ -50,6 +50,7 @@ const menuItems = [
       icon: ListOrdered,
       description: 'Background task history',
     },
+  ];
 
   return (
     <>
