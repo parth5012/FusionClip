@@ -1,4 +1,4 @@
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+﻿const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export interface StorageItem {
   name: string;
@@ -34,6 +34,37 @@ export interface TaskStatusResponse {
   info: any;
 }
 
+export interface TaskListItem {
+  id: number;
+  task_id: string;
+  name: string;
+  status: string;
+  progress: number;
+  error: string | null;
+  logs: string | null;
+  traceback: string | null;
+  error_type: string | null;
+  retry_count: number;
+  max_retries: number;
+  last_retry_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface TaskListResponse {
+  total: number;
+  page: number;
+  page_size: number;
+  tasks: TaskListItem[];
+}
+
+export interface RetryResponse {
+  message: string;
+  original_task_id: string;
+  new_task_id: string;
+  retry_count: number;
+}
+
 export async function fetchFiles(prefix = ''): Promise<ListResponse> {
   const url = `${API_BASE_URL}/api/storage/list?prefix=${encodeURIComponent(prefix)}`;
   const res = await fetch(url);
@@ -47,12 +78,12 @@ export async function uploadFile(file: File, folder = ''): Promise<UploadRespons
   const url = `${API_BASE_URL}/api/storage/upload?folder=${encodeURIComponent(folder)}`;
   const formData = new FormData();
   formData.append('file', file);
-  
+
   const res = await fetch(url, {
     method: 'POST',
     body: formData,
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to upload file');
   }
@@ -64,7 +95,7 @@ export async function deleteFile(path: string): Promise<{ message: string }> {
   const res = await fetch(url, {
     method: 'DELETE',
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to delete file');
   }
@@ -76,7 +107,7 @@ export async function createFolder(folderPath: string): Promise<{ message: strin
   const res = await fetch(url, {
     method: 'POST',
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to create folder');
   }
@@ -88,7 +119,7 @@ export async function startTask(path: string, taskType = 'transcode'): Promise<T
   const res = await fetch(url, {
     method: 'POST',
   });
-  
+
   if (!res.ok) {
     throw new Error(`Failed to start task: ${taskType}`);
   }
@@ -100,6 +131,42 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatusResponse>
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error('Failed to fetch task status');
+  }
+  return res.json();
+}
+
+export async function fetchTasks(
+  page = 1,
+  pageSize = 50,
+  status?: string,
+  taskType?: string,
+  search?: string,
+  errorType?: string,
+): Promise<TaskListResponse> {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  if (status) params.set('status', status);
+  if (taskType) params.set('task_type', taskType);
+  if (search) params.set('search', search);
+  if (errorType) params.set('error_type', errorType);
+  const url = `${API_BASE_URL}/api/tasks/list?${params.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch tasks');
+  }
+  return res.json();
+}
+
+export async function retryTask(taskId: string): Promise<RetryResponse> {
+  const url = `${API_BASE_URL}/api/tasks/${taskId}/retry`;
+  const res = await fetch(url, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || 'Failed to retry task');
   }
   return res.json();
 }
@@ -126,11 +193,30 @@ export async function fetchMediaCatalog(query = '', limit = 20): Promise<MediaAs
   return res.json();
 }
 
-/* ── Provider API keys ─────────────────────────────────────────────────────
- * Keys are submitted once in plaintext and stored encrypted server-side.
- * They are never readable again: the status endpoint returns only whether a
- * provider is configured plus the last four characters.
- * ------------------------------------------------------------------------ */
+/* Provider API keys */
+export async function getApiKey(provider: string): Promise<{ key: string | null }> {
+  const url = `${API_BASE_URL}/api/config/${provider}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch API key');
+  }
+  return res.json();
+}
+
+export async function setApiKey(provider: string, key: string): Promise<{ message: string }> {
+  const url = `${API_BASE_URL}/api/config/${provider}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key }),
+  });
+  if (!res.ok) {
+    throw new Error('Failed to set API key');
+  }
+  return res.json();
+}
+
+/* ── Provider API keys (encrypted server-side) ────────────────────────── */
 
 export type SecretProvider = 'gemini' | 'elevenlabs';
 

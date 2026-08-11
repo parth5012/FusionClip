@@ -1,3 +1,6 @@
+"""Multimedia generation endpoints (real Gemini, ElevenLabs, local
+Flux/SDXL/XTTS/ChatTTS/MusicGen pipelines + Colab dispatch, mock fallback)."""
+
 """Multimedia generation endpoints (real Gemini, Colab dispatch, mock fallback)."""
 
 import logging
@@ -38,6 +41,16 @@ redis_client = redis.from_url(settings.REDIS_URL)
 GEMINI_KEY_HEADER = "X-Gemini-Key"
 ELEVENLABS_KEY_HEADER = "X-ElevenLabs-Key"
 
+
+import io
+import os
+from typing import Optional
+import torch
+from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
+from diffusers import FluxPipeline, StableDiffusionXLPipeline
+from diffusers.schedulers import EulerDiscreteScheduler
+from PIL import Image
+from app.models import MediaAsset, Task
 
 def _resolve_gemini_key(db: Session, request: Optional[Request] = None) -> Optional[str]:
     """Return the Gemini API key: encrypted secret store first, then header.
@@ -95,6 +108,7 @@ def _save_asset(db: Session, title: str, filename: str, content_type: str, size:
     except Exception as e:
         logger.error(f"Failed to save generated asset {filename}: {e}")
         db.rollback()
+
 
 
 def is_colab_connected():
@@ -168,6 +182,7 @@ def dispatch_gen_to_colab(task_type: str, parameters: dict, db: Session, timeout
     db_task.error = "Execution timed out waiting for Colab connector"
     db.commit()
     raise HTTPException(status_code=504, detail="Colab execution timed out")
+
 
 
 @router.post("/api/generate/text")
@@ -265,6 +280,7 @@ def _analyze_files(api_key: str, prompt: str, files: List[UploadFile], db: Sessi
     }
 
 
+
 @router.post("/api/generate/gemini/image", response_model=GenerationGeminiImageOut)
 def generate_gemini_image(
     request: Request,
@@ -343,6 +359,7 @@ def generate_gemini_video(
     }
 
 
+
 @router.post("/api/generate/audio")
 def generate_audio(
     request: Request,
@@ -351,44 +368,57 @@ def generate_audio(
     voice_id: Optional[str] = Query(None),
     stability: float = Query(0.5, ge=0.0, le=1.0),
     clarity: float = Query(0.75, ge=0.0, le=1.0),
+    language: str = Query("en", description="Language code for local TTS"),
+    speed: float = Query(1.0, description="Speech speed multiplier"),
+    emotion: str = Query("neutral", description="Emotion: neutral, breathy, laughing, etc."),
+    reference_audio: Optional[UploadFile] = File(None, description="Reference audio for local voice cloning"),
+    use_chattts: bool = Query(False, description="Use ChatTTS (True) or XTTSv2 (False) for local TTS"),
     db: Session = Depends(get_db),
 ):
-    """ElevenLabs audio synthesis.
+    """Audio synthesis.
 
-    Preference order: Colab dispatch (when connected) -> real ElevenLabs (when
-    a key is configured) -> mock fallback. ``voice_id``/``stability``/``clarity``
-    tune the synthesis when real ElevenLabs is used.
+    Preference order: Colab dispatch (when connected), real ElevenLabs (when
+    key configured), local XTTS/ChatTTS (offloaded Colab models), mock fallback.
     """
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="audio_generation",
-            parameters={"prompt": prompt, "type": type},
+            parameters={
+                "prompt": prompt,
+                "type": type,
+                "language": language,
+                "speed": speed,
+                "emotion": emotion,
+                "use_chattts": use_chattts,
+            },
             db=db,
             file_extension="mp3",
-            content_type="audio/mpeg"
+            content_type="audio/mpeg",
         )
 
     api_key = _resolve_elevenlabs_key(db, request)
-    if not api_key:
-        filename = f"gen_audio_{int(time.time())}.mp3"
-        content = b"Mock elevenlabs generated audio bytes."
-        upload_success = upload_object(content, filename, content_type="audio/mpeg")
-
-        # Save media assets
+    if api_key:
         try:
-            asset = MediaAsset(
-                title=f"ElevenLabs Synthesized: {prompt[:30]}...",
-                file_path=filename,
-                file_size=len(content),
-                content_type="audio/mpeg",
-                duration=3.0
+            audio = elevenlabs_service.synthesize(
+                api_key,
+                prompt,
+                voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
+                stability=stability,
+                clarity=clarity,
             )
-            db.add(asset)
-            db.commit()
         except Exception as e:
-            logger.error(f"Failed save generated audio asset: {e}")
-            db.rollback()
+            logger.error(f"ElevenLabs audio synthesis failed: {e}")
+            raise HTTPException(status_code=502, detail=f"ElevenLabs audio synthesis failed: {e}")
 
+        filename = f"gen_audio_{int(time.time())}.mp3"
+        upload_success = upload_object(audio, filename, content_type="audio/mpeg")
+        _save_asset(
+            db,
+            title=f"ElevenLabs Synthesized: {prompt[:30]}...",
+            filename=filename,
+            content_type="audio/mpeg",
+            size=len(audio),
+        )
         return {
             "status": "COMPLETED",
             "type": type,
@@ -397,25 +427,21 @@ def generate_audio(
         }
 
     try:
-        audio = elevenlabs_service.synthesize(
-            api_key,
-            prompt,
-            voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
-            stability=stability,
-            clarity=clarity,
+        return _generate_local_tts_audio(
+            prompt, type, language, speed, emotion, reference_audio, use_chattts, db
         )
     except Exception as e:
-        logger.error(f"ElevenLabs audio synthesis failed: {e}")
-        raise HTTPException(status_code=502, detail=f"ElevenLabs audio synthesis failed: {e}")
+        logger.warning(f"Local TTS unavailable, falling back to mock: {e}")
 
     filename = f"gen_audio_{int(time.time())}.mp3"
-    upload_success = upload_object(audio, filename, content_type="audio/mpeg")
+    content = b"Mock elevenlabs generated audio bytes."
+    upload_success = upload_object(content, filename, content_type="audio/mpeg")
     _save_asset(
         db,
         title=f"ElevenLabs Synthesized: {prompt[:30]}...",
         filename=filename,
         content_type="audio/mpeg",
-        size=len(audio),
+        size=len(content),
     )
     return {
         "status": "COMPLETED",
@@ -423,6 +449,109 @@ def generate_audio(
         "filename": filename,
         "url": generate_url(filename) if upload_success else "",
     }
+
+def _generate_local_tts_audio(
+    prompt: str = Query(...),
+    type: str = Query("tts"),
+    language: str = Query("en", description="Language code for TTS"),
+    speed: float = Query(1.0, description="Speech speed multiplier"),
+    emotion: str = Query("neutral", description="Emotion: neutral, breathy, laughing, etc."),
+    reference_audio: Optional[UploadFile] = File(None, description="Reference audio for voice cloning"),
+    use_chattts: bool = Query(False, description="Use ChatTTS (True) or XTTS v2 (False)"),
+    db: Session = Depends(get_db)
+):
+    """Local TTS and voice cloning using XTTS v2 or ChatTTS, or offload to Colab."""
+    if is_colab_connected():
+        return dispatch_gen_to_colab(
+            task_type="audio_generation",
+            parameters={
+                "prompt": prompt, 
+                "type": type,
+                "language": language,
+                "speed": speed,
+                "emotion": emotion,
+                "use_chattts": use_chattts
+            },
+            db=db,
+            file_extension="mp3",
+            content_type="audio/mpeg"
+        )
+
+    try:
+        # Load TTS pipeline
+        if use_chattts:
+            tts_pipeline = load_chattts_pipeline()
+        else:
+            tts_pipeline = load_xtts_pipeline()
+
+        # Voice cloning with reference audio
+        if reference_audio:
+            ref_audio_data = reference_audio.file.read()
+            audio = tts_pipeline.tts(
+                text=prompt,
+                speaker_wav=ref_audio_data,
+                language=language,
+                speed=speed,
+                emotion=emotion
+            )
+        # Standard TTS
+        else:
+            audio = tts_pipeline.tts(
+                text=prompt,
+                language=language,
+                speed=speed,
+                emotion=emotion
+            )
+
+        # Convert to MP3 bytes
+        import numpy as np
+        from scipy.io import wavfile
+        import io as io_module
+
+        # TTS returns numpy array (sample_rate, audio)
+        if isinstance(audio, tuple):
+            sample_rate, audio_data = audio
+        else:
+            sample_rate = 22050
+            audio_data = audio
+
+        # Convert to 16-bit PCM
+        audio_int16 = (audio_data * 32767).astype(np.int16)
+
+        # Write to WAV buffer
+        wav_buffer = io_module.BytesIO()
+        wavfile.write(wav_buffer, sample_rate, audio_int16)
+        wav_bytes = wav_buffer.getvalue()
+
+        # Upload to MinIO
+        filename = f"gen_audio_{int(time.time())}.wav"
+        upload_success = upload_object(wav_bytes, filename, content_type="audio/wav")
+
+        # Calculate duration
+        duration = len(audio_int16) / sample_rate
+
+        # Save media asset
+        asset = MediaAsset(
+            title=f"{'ChatTTS' if use_chattts else 'XTTS'} Synthesized: {prompt[:30]}...",
+            file_path=filename,
+            file_size=len(wav_bytes),
+            content_type="audio/wav",
+            duration=duration
+        )
+        db.add(asset)
+        db.commit()
+
+        return {
+            "status": "COMPLETED",
+            "type": type,
+            "filename": filename,
+            "url": generate_url(filename) if upload_success else "",
+            "colab": False
+        }
+    except Exception as e:
+        logger.error(f"Failed to generate audio: {e}")
+        raise HTTPException(status_code=500, detail=f"Audio generation failed: {e}")
+
 
 
 @router.post("/api/generate/tts", response_model=GenerationTtsOut)
@@ -509,6 +638,7 @@ def generate_tts(
     }
 
 
+
 @router.get("/api/generate/voice-list", response_model=GenerationVoiceListOut)
 def list_elevenlabs_voices(
     request: Request,
@@ -530,6 +660,7 @@ def list_elevenlabs_voices(
         voices.append(entry)
 
     return {"status": "COMPLETED", "voices": voices}
+
 
 
 @router.post("/api/generate/sound-effect")
@@ -574,6 +705,7 @@ def generate_sound_effect(
 ALLOWED_CLONE_AUDIO_TYPES = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/ogg", "application/ogg"}
 
 
+
 def _list_cloned_voices(db: Session) -> List[dict]:
     """Return cloned voices stored in the Configuration key/value store."""
     rows = db.query(Configuration).filter(Configuration.key.like("elevenlabs.voice.%")).all()
@@ -589,6 +721,7 @@ def _list_cloned_voices(db: Session) -> List[dict]:
             }
         )
     return voices
+
 
 
 @router.post("/api/generate/voice-clone")
@@ -662,44 +795,267 @@ def clone_elevenlabs_voice(
         scratchpad.remove_path(temp_path)
 
 
+
 @router.post("/api/generate/image")
 def generate_image(
     prompt: str = Query(...),
     steps: int = Query(28),
     scale: float = Query(7.5),
+    image_strength: float = Query(0.75, description="Denoising strength for img2img (0.0-1.0)"),
+    init_image: Optional[UploadFile] = File(None, description="Initial image for img2img mode"),
+    use_flux: bool = Query(True, description="Use Flux.1 (True) or SDXL (False)"),
     db: Session = Depends(get_db)
 ):
-    """Simulated Local Flux sandbox image generation."""
+    """Generate images using local Flux.1/SDXL pipelines or offload to Colab."""
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="image_generation",
-            parameters={"prompt": prompt, "steps": steps, "scale": scale},
+            parameters={
+                "prompt": prompt, 
+                "steps": steps, 
+                "scale": scale,
+                "image_strength": image_strength,
+                "use_flux": use_flux
+            },
             db=db,
             file_extension="png",
             content_type="image/png"
         )
-    filename = f"gen_image_{int(time.time())}.png"
-    content = b"Mock local flux generated image bytes."
-    upload_success = upload_object(content, filename, content_type="image/png")
-    
-    # Save media assets
+
     try:
+        # Load pipeline
+        if use_flux:
+            pipeline = load_flux_pipeline()
+        else:
+            pipeline = load_sdxl_pipeline()
+
+        # Image-to-image mode
+        if init_image:
+            init_image_data = Image.open(io.BytesIO(init_image.file.read()))
+            image = pipeline(
+                prompt=prompt,
+                num_inference_steps=steps,
+                guidance_scale=scale,
+                strength=image_strength,
+                image=init_image_data
+            ).images[0]
+        # Text-to-image mode
+        else:
+            image = pipeline(
+                prompt=prompt,
+                num_inference_steps=steps,
+                guidance_scale=scale
+            ).images[0]
+
+        # Save image to bytes
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format="PNG")
+        img_byte_arr = img_byte_arr.getvalue()
+
+        # Upload to MinIO
+        filename = f"gen_image_{int(time.time())}.png"
+        upload_success = upload_object(img_byte_arr, filename, content_type="image/png")
+
+        # Save media asset
         asset = MediaAsset(
-            title=f"Flux Generated: {prompt[:30]}...",
+            title=f"{'Flux' if use_flux else 'SDXL'} Generated: {prompt[:30]}...",
             file_path=filename,
-            file_size=len(content),
+            file_size=len(img_byte_arr),
             content_type="image/png",
             duration=0.0
         )
         db.add(asset)
         db.commit()
-    except Exception as e:
-        logger.error(f"Failed save generated image asset: {e}")
-        db.rollback()
 
-    return {
-        "status": "COMPLETED",
-        "parameters": {"steps": steps, "scale": scale},
-        "filename": filename,
-        "url": generate_url(filename) if upload_success else "",
-    }
+        return {
+            "status": "COMPLETED",
+            "parameters": {"steps": steps, "scale": scale, "use_flux": use_flux},
+            "filename": filename,
+            "url": generate_url(filename) if upload_success else "",
+            "colab": False
+        }
+    except Exception as e:
+        logger.error(f"Failed to generate image: {e}")
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
+
+
+
+def load_flux_pipeline():
+    """Load Flux.1 pipeline with caching."""
+    global flux_pipeline
+    if flux_pipeline is None:
+        try:
+            flux_pipeline = FluxPipeline.from_pretrained(
+                "black-forest-labs/FLUX.1-schnell",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+            if torch.cuda.is_available():
+                flux_pipeline = flux_pipeline.to("cuda")
+        except Exception as e:
+            logger.error(f"Failed to load Flux pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load Flux pipeline: {e}")
+    return flux_pipeline
+
+
+def load_sdxl_pipeline():
+    """Load SDXL pipeline with caching."""
+    global sdxl_pipeline
+    if sdxl_pipeline is None:
+        try:
+            sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
+                "stabilityai/stable-diffusion-xl-base-1.0",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                variant="fp16",
+                use_safetensors=True
+            )
+            if torch.cuda.is_available():
+                sdxl_pipeline = sdxl_pipeline.to("cuda")
+        except Exception as e:
+            logger.error(f"Failed to load SDXL pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load SDXL pipeline: {e}")
+    return sdxl_pipeline
+
+
+def load_xtts_pipeline():
+    """Load XTTS v2 pipeline with caching."""
+    global xtts_pipeline
+    if xtts_pipeline is None:
+        try:
+            from TTS.api import TTS
+            xtts_pipeline = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
+        except Exception as e:
+            logger.error(f"Failed to load XTTS pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load XTTS pipeline: {e}")
+    return xtts_pipeline
+
+
+def load_chattts_pipeline():
+    """Load ChatTTS pipeline with caching."""
+    global chattts_pipeline
+    if chattts_pipeline is None:
+        try:
+            import ChatTTS
+            chattts_pipeline = ChatTTS.Chat()
+            chattts_pipeline.load(compile=False)
+        except Exception as e:
+            logger.error(f"Failed to load ChatTTS pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load ChatTTS pipeline: {e}")
+    return chattts_pipeline
+
+
+def load_musicgen_pipeline():
+    """Load MusicGen pipeline with caching."""
+    global musicgen_pipeline
+    if musicgen_pipeline is None:
+        try:
+            from transformers import MusicgenForConditionalGeneration, AutoProcessor
+            musicgen_pipeline = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+            musicgen_processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+            if torch.cuda.is_available():
+                musicgen_pipeline = musicgen_pipeline.to("cuda")
+        except Exception as e:
+            logger.error(f"Failed to load MusicGen pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load MusicGen pipeline: {e}")
+    return musicgen_pipeline, musicgen_processor
+
+
+
+@router.post("/api/generate/music")
+def generate_music(
+    prompt: str = Query(..., description="Text prompt describing the music genre and style"),
+    genre: str = Query("ambient", description="Music genre (e.g., ambient, rock, jazz, electronic)"),
+    style: str = Query("cinematic", description="Musical style (e.g., cinematic, upbeat, melancholic)"),
+    duration: int = Query(30, description="Duration in seconds (10-300)"),
+    tempo: int = Query(120, description="Tempo in BPM"),
+    instrumentation: str = Query("piano", description="Primary instruments (comma-separated)"),
+    db: Session = Depends(get_db)
+):
+    """Generate music using Meta's MusicGen via transformers, or offload to Colab."""
+    if is_colab_connected():
+        return dispatch_gen_to_colab(
+            task_type="music_generation",
+            parameters={
+                "prompt": prompt,
+                "genre": genre,
+                "style": style,
+                "duration": duration,
+                "tempo": tempo,
+                "instrumentation": instrumentation
+            },
+            db=db,
+            file_extension="wav",
+            content_type="audio/wav"
+        )
+
+    try:
+        # Build full prompt combining all parameters
+        full_prompt = f"{prompt}. Genre: {genre}. Style: {style}. Tempo: {tempo} BPM. Instruments: {instrumentation}."
+
+        # Load MusicGen pipeline
+        pipeline, processor = load_musicgen_pipeline()
+
+        # Calculate max_new_tokens based on duration (approx 25 tokens per second)
+        max_new_tokens = min(int(duration * 25.5), 1500)
+
+        # Generate music
+        inputs = processor(
+            text=[full_prompt],
+            padding=True,
+            return_tensors="pt"
+        )
+
+        if torch.cuda.is_available():
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+        audio = pipeline.generate(**inputs, max_new_tokens=max_new_tokens)
+        audio_values = audio.sequences[0].cpu().numpy()
+
+        # Convert to WAV bytes
+        import numpy as np
+        from scipy.io import wavfile
+
+        sample_rate = pipeline.config.audio_encoder.sampling_rate
+        audio_int16 = (audio_values * 32767).astype(np.int16)
+
+        wav_buffer = io.BytesIO()
+        wavfile.write(wav_buffer, sample_rate, audio_int16)
+        wav_bytes = wav_buffer.getvalue()
+
+        # Upload to MinIO
+        filename = f"gen_music_{int(time.time())}.wav"
+        upload_success = upload_object(wav_bytes, filename, content_type="audio/wav")
+
+        # Calculate duration
+        audio_duration = len(audio_int16) / sample_rate
+
+        # Save media asset
+        asset = MediaAsset(
+            title=f"MusicGen: {prompt[:30]}...",
+            file_path=filename,
+            file_size=len(wav_bytes),
+            content_type="audio/wav",
+            duration=audio_duration
+        )
+        db.add(asset)
+        db.commit()
+
+        return {
+            "status": "COMPLETED",
+            "parameters": {
+                "genre": genre,
+                "style": style,
+                "duration": duration,
+                "tempo": tempo,
+                "instrumentation": instrumentation
+            },
+            "filename": filename,
+            "url": generate_url(filename) if upload_success else "",
+            "colab": False
+        }
+    except Exception as e:
+        logger.error(f"Failed to generate music: {e}")
+        raise HTTPException(status_code=500, detail=f"Music generation failed: {e}")
+

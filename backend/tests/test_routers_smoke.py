@@ -262,16 +262,24 @@ class TestGenerateRouter:
         # Verify non-empty output + correct status only.
         assert body["output"]
 
-    def test_generate_audio_no_longer_raises_nameerror(self, client, stub_storage, db_session):
+    def test_generate_audio_no_longer_raises_nameerror(self, client, stub_storage, db_session, monkeypatch):
         """Regression: `time` was never imported in the old main.py (NameError)."""
+        # Mock TTS pipeline to avoid downloading models in tests
+        class MockTTS:
+            def tts(self, **kwargs):
+                import numpy as np
+                return (22050, np.zeros(22050, dtype=np.float32))
+        monkeypatch.setattr("app.routers.generate.load_xtts_pipeline", lambda: MockTTS())
+        monkeypatch.setattr("app.routers.generate.load_chattts_pipeline", lambda: MockTTS())
+
         res = client.post("/api/generate/audio?prompt=Smoke+test+voice&type=tts")
         assert res.status_code == 200
         body = res.json()
-        assert set(body) == {"status", "type", "filename", "url"}
+        assert set(body) == {"status", "type", "filename", "url", "colab"}
         assert body["status"] == "COMPLETED"
         assert body["type"] == "tts"
         assert body["filename"].startswith("gen_audio_")
-        assert body["filename"].endswith(".mp3")
+        assert body["filename"].endswith(".wav")
         assert body["url"]
         assert body["filename"] in stub_storage["uploaded"]
 
@@ -280,15 +288,27 @@ class TestGenerateRouter:
             .filter(MediaAsset.file_path == body["filename"])
             .one()
         )
-        assert asset.content_type == "audio/mpeg"
+        assert asset.content_type == "audio/wav"
 
-    def test_generate_image_no_longer_raises_nameerror(self, client, stub_storage, db_session):
+    def test_generate_image_no_longer_raises_nameerror(self, client, stub_storage, db_session, monkeypatch):
+        # Mock pipeline to avoid downloading models in tests
+        class MockPipeline:
+            def __call__(self, **kwargs):
+                from PIL import Image
+                img = Image.new("RGB", (64, 64), color="red")
+                class Result:
+                    images = [img]
+                return Result()
+        monkeypatch.setattr("app.routers.generate.load_flux_pipeline", lambda: MockPipeline())
+        monkeypatch.setattr("app.routers.generate.load_sdxl_pipeline", lambda: MockPipeline())
+
         res = client.post("/api/generate/image?prompt=Smoke+test+art&steps=10&scale=7.0")
         assert res.status_code == 200
         body = res.json()
-        assert set(body) == {"status", "parameters", "filename", "url"}
+        assert set(body) == {"status", "parameters", "filename", "url", "colab"}
         assert body["status"] == "COMPLETED"
-        assert body["parameters"] == {"steps": 10, "scale": 7.0}
+        assert body["parameters"]["steps"] == 10
+        assert body["parameters"]["scale"] == 7.0
         assert body["filename"].startswith("gen_image_")
         assert body["filename"].endswith(".png")
         assert body["filename"] in stub_storage["uploaded"]
@@ -300,9 +320,20 @@ class TestGenerateRouter:
         )
         assert asset.content_type == "image/png"
 
-    def test_generate_image_defaults(self, client, stub_storage):
+    def test_generate_image_defaults(self, client, stub_storage, monkeypatch):
+        class MockPipeline:
+            def __call__(self, **kwargs):
+                from PIL import Image
+                img = Image.new("RGB", (64, 64), color="red")
+                class Result:
+                    images = [img]
+                return Result()
+        monkeypatch.setattr("app.routers.generate.load_flux_pipeline", lambda: MockPipeline())
+        monkeypatch.setattr("app.routers.generate.load_sdxl_pipeline", lambda: MockPipeline())
+
         body = client.post("/api/generate/image?prompt=Defaults").json()
-        assert body["parameters"] == {"steps": 28, "scale": 7.5}
+        assert body["parameters"]["steps"] == 28
+        assert body["parameters"]["scale"] == 7.5
 
 
 class TestMediaRouter:
