@@ -9,19 +9,21 @@ import mimetypes
 
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query, HTTPException, Request, File, UploadFile
+from fastapi import APIRouter, Depends, Query, HTTPException, Request, File, UploadFile, Form
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
-from app.models import MediaAsset, Task
+from app.models import Configuration, MediaAsset, Task
 from app.storage import generate_url, upload_object
 from app.config import settings
+from app.scratchpad import scratchpad
 from app.schemas import (
     GenerationGeminiImageOut,
     GenerationGeminiVideoOut,
     GenerationTtsOut,
     GenerationVoiceListOut,
 )
+from app.tasks import parse_duration
 from app.services import secrets as secret_store
 from app.services import elevenlabs as elevenlabs_service
 from app.services import gemini as gemini_service
@@ -523,7 +525,102 @@ def list_elevenlabs_voices(
         logger.error(f"ElevenLabs voice list fetch failed: {e}")
         raise HTTPException(status_code=502, detail=f"ElevenLabs voice list fetch failed: {e}")
 
+    cloned = _list_cloned_voices(db)
+    for entry in cloned:
+        voices.append(entry)
+
     return {"status": "COMPLETED", "voices": voices}
+
+
+ALLOWED_CLONE_AUDIO_TYPES = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/ogg", "application/ogg"}
+
+
+def _list_cloned_voices(db: Session) -> List[dict]:
+    """Return cloned voices stored in the Configuration key/value store."""
+    rows = db.query(Configuration).filter(Configuration.key.like("elevenlabs.voice.%")).all()
+    voices = []
+    for row in rows:
+        voices.append(
+            {
+                "voice_id": row.value,
+                "name": row.key.split("elevenlabs.voice.", 1)[-1],
+                "labels": {"cloned": "true"},
+                "category": "cloned",
+                "preview_url": None,
+            }
+        )
+    return voices
+
+
+@router.post("/api/generate/voice-clone")
+def clone_elevenlabs_voice(
+    request: Request,
+    file: UploadFile = File(...),
+    voice_name: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """Clone a voice from an uploaded audio sample using ElevenLabs.
+
+    Validates the sample (audio mime type, <= 60s duration via ffprobe), clones
+    via the ElevenLabs Instant Voice Cloning API, and stores the returned
+    ``voice_id`` in the Configuration store under ``elevenlabs.voice.<name>``.
+    """
+    api_key = _resolve_elevenlabs_key(db, request)
+    if not api_key:
+        raise _no_elevenlabs_key_http_503()
+
+    content_type = (file.content_type or "").lower()
+    if content_type not in ALLOWED_CLONE_AUDIO_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid audio file format. Upload MP3, WAV, or OGG audio.")
+
+    temp_path = scratchpad.get_temp_path(suffix=".mp3")
+    try:
+        with open(str(temp_path), "wb") as f:
+            f.write(file.file.read())
+
+        duration = parse_duration(str(temp_path))
+        if duration > 60.0:
+            raise HTTPException(status_code=400, detail="Audio sample exceeds 1 minute; upload a sample up to 60 seconds long.")
+
+        try:
+            voice_id = elevenlabs_service.clone_voice(
+                api_key,
+                str(temp_path),
+                voice_name,
+            )
+        except Exception as e:
+            logger.error(f"ElevenLabs voice cloning failed: {e}")
+            raise HTTPException(status_code=502, detail=f"ElevenLabs voice cloning failed: {e}")
+
+        key = f"elevenlabs.voice.{voice_name}"
+        cfg = db.query(Configuration).filter(Configuration.key == key).first()
+        if cfg:
+            cfg.value = voice_id
+        else:
+            db.add(Configuration(key=key, value=voice_id))
+        db.commit()
+
+        data = file.file.read()
+        data = data or b""
+        stored_name = f"voice_clone_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp3"
+        upload_success = upload_object(data, stored_name, content_type="audio/mpeg")
+        _save_asset(
+            db,
+            title=f"Voice Clone Sample: {voice_name}",
+            filename=stored_name,
+            content_type="audio/mpeg",
+            size=len(data),
+        )
+
+        return {
+            "status": "COMPLETED",
+            "voice_id": voice_id,
+            "name": voice_name,
+            "filename": stored_name,
+            "url": generate_url(stored_name) if upload_success else "",
+        }
+    finally:
+        scratchpad.remove_path(temp_path)
 
 
 @router.post("/api/generate/image")

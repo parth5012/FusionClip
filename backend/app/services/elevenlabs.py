@@ -7,7 +7,8 @@ single module (``app.services.elevenlabs``) instead of the whole SDK surface.
 """
 
 import logging
-from typing import Dict, List
+import os
+from typing import Dict, List, Optional
 
 from elevenlabs import ElevenLabs, VoiceSettings
 
@@ -18,6 +19,7 @@ DEFAULT_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 DEFAULT_MODEL = "eleven_multilingual_v2"
 DEFAULT_OUTPUT_FORMAT = "mp3_44100_128"
 AUDIO_CONTENT_TYPE = "audio/mpeg"
+VOICE_CLONE_TIMEOUT = 300  # 5 minutes for cloning process
 
 
 def build_client(api_key: str) -> ElevenLabs:
@@ -54,6 +56,24 @@ def synthesize(
         voice_settings=voice_settings,
     )
     return b"".join(stream)
+
+
+def clone_voice(
+    api_key: str,
+    audio_file_path: str,
+    voice_name: str,
+    timeout: int = VOICE_CLONE_TIMEOUT,
+) -> str:
+    """Clone a voice from a local audio file and return the voice ID."""
+    client = build_client(api_key)
+    if not os.path.exists(audio_file_path):
+        raise ValueError(f"Audio file not found: {audio_file_path}")
+    voice = client.voices.add(
+        name=voice_name,
+        files=[audio_file_path],
+    )
+    voice.wait_until_processed(timeout=timeout)
+    return voice.voice_id
 
 
 def list_voices(api_key: str) -> List[Dict]:

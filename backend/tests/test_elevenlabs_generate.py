@@ -6,7 +6,9 @@ considered configured when a test stores one via the secret store (or sends the
 ``X-ElevenLabs-Key`` header).
 """
 
-from app.models import MediaAsset
+from app import tasks
+from app.models import Configuration, MediaAsset
+from app.services import elevenlabs as elevenlabs_service
 from app.services import secrets as secret_store
 from app.services.elevenlabs import DEFAULT_MODEL, DEFAULT_VOICE_ID
 
@@ -30,6 +32,53 @@ class TestGenerateAudioNoKey:
 
 
 class TestGenerateAudioElevenLabs:
+    def test_voice_clone_success(self, client, db_session, monkeypatch):
+        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        # Mock clone_voice
+        mock_voice_id = "cloned-voice-123"
+        def mock_clone(*args, **kwargs):
+            return mock_voice_id
+        monkeypatch.setattr(elevenlabs_service, "clone_voice", mock_clone)
+        # Prepare test file
+        test_file = ("test.mp3", b"dummy audio", "audio/mpeg")
+        form_data = {
+            "file": test_file,
+            "voice_name": "TestVoice",
+        }
+        response = client.post("/api/generate/voice-clone", files=form_data)
+        assert response.status_code == 200
+        assert response.json()["voice_id"] == mock_voice_id
+        # Verify Configuration entry
+        config = db_session.query(Configuration).filter_by(key="elevenlabs.voice.TestVoice").first()
+        assert config.value == str(mock_voice_id)
+
+    def test_voice_clone_no_key_is_503(self, client):
+        test_file = ("test.mp3", b"dummy audio", "audio/mpeg")
+        response = client.post(
+            "/api/generate/voice-clone", files={"file": test_file, "voice_name": "NoKey"}
+        )
+        assert response.status_code == 503
+
+    def test_voice_clone_invalid_format(self, client, db_session):
+        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        test_file = ("test.jpg", b"dummy image", "image/jpeg")
+        response = client.post(
+            "/api/generate/voice-clone", files={"file": test_file, "voice_name": "BadVoice"}
+        )
+        assert response.status_code == 400
+        assert "Invalid audio" in response.json()["detail"]
+
+    def test_voice_clone_too_long(self, client, db_session, monkeypatch, tmp_path):
+        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        # Mock parse_duration to return 70 seconds
+        monkeypatch.setattr("app.routers.generate.parse_duration", lambda x: 70.0)
+        test_file = ("long.mp3", b"long audio", "audio/mpeg")
+        response = client.post(
+            "/api/generate/voice-clone", files={"file": test_file, "voice_name": "LongVoice"}
+        )
+        assert response.status_code == 400
+        assert "exceeds 1 minute" in response.json()["detail"]
+
     def test_stored_key_calls_real_elevenlabs(self, client, db_session, stub_storage, monkeypatch):
         secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
         captured = {}
