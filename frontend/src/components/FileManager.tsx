@@ -10,9 +10,13 @@ import {
   fetchFiles, uploadFile, deleteFile, createFolder,
   startTask, startUpscale, getTaskStatus, StorageItem, TaskStatusResponse, startBatchExport, triggerDownload
 } from '../utils/api';
+import { useStore } from '../store/useStore';
+
 import UpscalerPanel from './UpscalerPanel';
 
+
 export default function FileManager() {
+  const { setActiveTab, setUpscaleTarget } = useStore();
   const [currentDir, setCurrentDir] = useState<string>('');
   const [directories, setDirectories] = useState<StorageItem[]>([]);
   const [files, setFiles] = useState<StorageItem[]>([]);
@@ -705,7 +709,13 @@ export default function FileManager() {
                     </button>
                     <div className="w-[1px] h-3.5 bg-slate-850" />
                     <button
-                      onClick={() => setUpscaleTargetFile(file.path)}
+                      onClick={() => {
+                        // Open the dedicated Upscaler panel with this file
+                        // preselected (map #57/#59 controls live there).
+                        setUpscaleTarget(file.path);
+                        setActiveTab('upscaler');
+                      }}
+
                       className="text-xs hover:bg-slate-800 text-slate-300 hover:text-emerald-400 p-1 px-1.5 rounded transition flex items-center gap-1"
                       title="Upscale file resolution"
                     >
@@ -741,29 +751,6 @@ export default function FileManager() {
         </div>
       )}
 
-        {upscaleTargetFile && (
-          <UpscalerPanel
-            filePath={upscaleTargetFile}
-            onClose={() => setUpscaleTargetFile(null)}
-            onStartUpscale={async (params) => {
-              try {
-                const taskRes = await startUpscale(upscaleTargetFile, params);
-                setActiveTasks((prev) => ({
-                  ...prev,
-                  [taskRes.task_id]: {
-                    id: taskRes.task_id,
-                    objectName: upscaleTargetFile,
-                    taskType: 'upscale',
-                    state: taskRes.status
-                  }
-                }));
-                setUpscaleTargetFile(null);
-              } catch (err: any) {
-                alert(err.message || 'Upscale pipeline dispatch failed');
-              }
-            }}
-          />
-        )}
     </div>
 
   );

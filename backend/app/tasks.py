@@ -283,13 +283,56 @@ def process_media_fast(self, object_name: str, task_type: str = "thumbnail"):
         raise
 
 # Heavy task queue endpoint
+def record_upscaled_asset(db, object_name: str, processed_name: str, processed_url: str, params=None):
+    """Create (or update) a MediaAsset for an upscaled output.
+
+    The upscaled asset records ``source_path`` pointing back at the original
+    so the before/after comparison UI can pair them (map #58).
+    """
+    if not processed_name:
+        return None
+    asset = (
+        db.query(MediaAsset)
+        .filter(MediaAsset.file_path == processed_name)
+        .first()
+    )
+    title = f"Upscaled: {object_name.split('/')[-1]}"
+    if asset:
+        asset.title = title
+        asset.source_path = object_name
+        db.commit()
+        return asset
+    asset = MediaAsset(
+        title=title,
+        file_path=processed_name,
+        file_size=0,
+        content_type="image/png",
+        duration=0.0,
+        source_path=object_name,
+    )
+    db.add(asset)
+    db.commit()
+    return asset
+
 @celery.task(bind=True, name="app.tasks.process_media_heavy", max_retries=3)
-def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
+def process_media_heavy(self, object_name: str, task_type: str = "transcode", **upscale_kwargs):
     logger.info(f"Processing heavy task: {task_type} {object_name}")
     task_id = self.request.id
     retry_count = self.request.retries
 
     try:
+        # Parse optional upscale controls (forwarded to the Colab diffusion
+        # worker when connected, or applied locally via the CPU fallback).
+        params = None
+        if task_type == "upscale":
+            from app.upscaler import UpscaleParams
+            params = UpscaleParams(
+                denoise=float(upscale_kwargs.get("denoise", 0.35)),
+                controlnet_weight=float(upscale_kwargs.get("controlnet_weight", 0.8)),
+                hdr=float(upscale_kwargs.get("hdr", 0.0)),
+                fractality=float(upscale_kwargs.get("fractality", 0.0)),
+                prompt=upscale_kwargs.get("prompt", "") or "",
+            )
         is_colab = redis_client.get("colab:connected") == b"true"
         if is_colab:
             logger.info(f"Colab worker detected! Offloading heavy task {task_type} {object_name}")
@@ -303,6 +346,8 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
                 }
             }
 
+            if params is not None:
+                task_payload["parameters"].update(params.as_colab_parameters())
             redis_client.publish("colab_dispatches", json.dumps(task_payload))
             redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
             redis_client.expire("colab_pending_tasks_http", 3600)
@@ -376,7 +421,40 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
                 "error": "Colab execution timed out"
             }))
             raise TimeoutError("Colab execution timed out")
-        return _original_process_media_heavy(self, object_name, task_type)
+        if task_type == "upscale":
+            from app.upscaler import run_upscale_task
+            try:
+                result = run_upscale_task(object_name, params, task_id=task_id)
+                with SessionLocal() as db:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task:
+                        db_task.status = "COMPLETED"
+                        db_task.progress = 100
+                        db.commit()
+                    record_upscaled_asset(db, object_name, result.get("processed_name"), result.get("processed_url"), params)
+                redis_client.publish("task_updates", json.dumps({
+                    "task_id": task_id,
+                    "status": "COMPLETED",
+                    "progress": 100,
+                    "error": None,
+                }))
+                return result
+            except Exception as e:
+                logger.error(f"Error executing local upscale task {task_id}: {e}")
+                with SessionLocal() as db:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task:
+                        db_task.status = "FAILED"
+                        db_task.error = str(e)
+                        db.commit()
+                redis_client.publish("task_updates", json.dumps({
+                    "task_id": task_id,
+                    "status": "FAILED",
+                    "progress": 0,
+                    "error": str(e),
+                }))
+                raise
+        return _original_process_media_heavy(self, object_name, task_type, params)
     except Exception as e:
         should_retry = _handle_task_failure(task_id, e, retry_count, 3)
         if should_retry:
@@ -385,7 +463,7 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode"):
         raise
 
 
-def _original_process_media_heavy(self, object_name: str, task_type: str = "transcode"):
+def _original_process_media_heavy(self, object_name: str, task_type: str = "transcode", params=None):
     logger.info(f"Processing heavy task: {task_type} {object_name}")
     task_id = self.request.id
 
@@ -453,11 +531,11 @@ def _original_process_media_heavy(self, object_name: str, task_type: str = "tran
 
 # Backward compatibility
 @celery.task(bind=True)
-def process_multimedia_task(self, object_name: str, task_type: str = "transcode"):
+def process_multimedia_task(self, object_name: str, task_type: str = "transcode", **upscale_kwargs):
     if task_type in ["thumbnail", "waveform"]:
         return process_media_fast(object_name, task_type)
     else:
-        return process_media_heavy(object_name, task_type)
+        return process_media_heavy(object_name, task_type, **upscale_kwargs)
 
 
 @celery.task(bind=True, name="app.tasks.process_upscale_task")

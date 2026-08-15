@@ -6,6 +6,7 @@ import Header from '../components/Header';
 import FileManager from '../components/FileManager';
 import CatalogPanel from '../components/CatalogPanel';
 import GenerationPanel from '../components/GenerationPanel';
+import UpscalerPanel from '../components/UpscalerPanel';
 import SettingsPanel from '../components/SettingsPanel';
 import PlayersPanel from '../components/PlayersPanel';
 import MonitorPanel from '../components/MonitorPanel';
@@ -33,6 +34,8 @@ export default function Home() {
         return <CatalogPanel />;
       case 'generation':
         return <GenerationPanel />;
+      case 'upscaler':
+        return <UpscalerPanel />;
       case 'players':
         return <PlayersPanel />;
       case 'settings':

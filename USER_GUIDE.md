@@ -138,6 +138,23 @@ alembic upgrade head
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
+> **Upgrading an existing install**: if the database was created before
+> migrations were introduced (i.e. `init_db()` ran `create_all` and there is
+> no `alembic_version` table), `alembic upgrade head` will fail because the
+> tables already exist. Either stamp the schema first and then upgrade, or
+> apply the pending column by hand:
+>
+> ```bash
+> # Option A — stamp the init migration, then apply the new one
+> alembic stamp 95c3d48285e2
+> alembic upgrade head
+>
+> # Option B — apply the pending change directly (adds the
+> # source_path column used by the before/after comparison UI)
+> psql $DATABASE_URL -c "ALTER TABLE media_assets ADD COLUMN IF NOT EXISTS source_path VARCHAR;"
+> psql $DATABASE_URL -c "CREATE INDEX IF NOT EXISTS ix_media_assets_source_path ON media_assets (source_path);"
+> ```
+
 The API is now available at **http://localhost:8000**.
 
 ### 4. Start the Celery Worker

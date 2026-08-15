@@ -1,294 +1,392 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import { X, Sliders, Save, Image as ImageIcon, Sparkles, Cpu, Loader2 } from 'lucide-react';
-import { fetchSettings, saveSettings } from '../utils/api';
+import React, { useCallback, useEffect, useState } from 'react';
+import { useStore } from '../store/useStore';
+import {
+  startTask,
+  getTaskStatus,
+  fetchMediaCatalog,
+  MediaAsset,
+  UpscaleParams,
+  TaskResponse,
+} from '../utils/api';
+import {
+  Sparkles,
+  Loader2,
+  Play,
+  CheckCircle2,
+  AlertCircle,
+  Wand2,
+  ArrowLeftRight,
+} from 'lucide-react';
+import BeforeAfterModal from './BeforeAfterModal';
 
+/* Presets from features.md §5 (Upscaler presets). */
 interface Preset {
   name: string;
-  denoisingStrength: number;
-  controlNetWeight: number;
+  denoise: number;
+  controlnet_weight: number;
+  hdr: number;
+  fractality: number;
 }
 
-const DEFAULT_PRESETS: Record<string, Preset> = {
-  Portraits: { name: 'Portraits', denoisingStrength: 0.35, controlNetWeight: 1.25 },
-  Anime: { name: 'Anime', denoisingStrength: 0.45, controlNetWeight: 1.10 },
-  Landscapes: { name: 'Landscapes', denoisingStrength: 0.60, controlNetWeight: 0.85 },
-  'Product Photography': { name: 'Product Photography', denoisingStrength: 0.25, controlNetWeight: 1.50 },
-  '3D Renderings': { name: '3D Renderings', denoisingStrength: 0.40, controlNetWeight: 1.15 }
-};
+const PRESETS: Preset[] = [
+  { name: 'Portraits', denoise: 0.30, controlnet_weight: 0.85, hdr: 0.25, fractality: 0.15 },
+  { name: 'Anime', denoise: 0.45, controlnet_weight: 0.75, hdr: 0.10, fractality: 0.20 },
+  { name: 'Landscapes', denoise: 0.35, controlnet_weight: 0.80, hdr: 0.30, fractality: 0.25 },
+  { name: 'Product Photography', denoise: 0.25, controlnet_weight: 0.90, hdr: 0.35, fractality: 0.10 },
+  { name: '3D Renderings', denoise: 0.40, controlnet_weight: 0.70, hdr: 0.20, fractality: 0.30 },
+];
 
-interface UpscalerPanelProps {
-  filePath: string;
-  onClose: () => void;
-  onStartUpscale: (params: {
-    denoising_strength: number;
-    controlnet_weight: number;
-    preset: string;
-    preview: boolean;
-  }) => Promise<void>;
+interface SliderRow {
+  key: keyof UpscaleParams;
+  label: string;
+  brand: string;
+  hint: string;
+  min: number;
+  max: number;
+  step: number;
 }
 
-export default function UpscalerPanel({ filePath, onClose, onStartUpscale }: UpscalerPanelProps) {
-  const [preset, setPreset] = useState<string>('Portraits');
-  const [denoisingStrength, setDenoisingStrength] = useState<number>(0.35);
-  const [controlNetWeight, setControlNetWeight] = useState<number>(1.25);
-  const [preview, setPreview] = useState<boolean>(false);
-  const [customPresets, setCustomPresets] = useState<Record<string, Preset>>({});
-  const [newPresetName, setNewPresetName] = useState<string>('');
-  const [isSavingPreset, setIsSavingPreset] = useState<boolean>(false);
-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+const SLIDERS: SliderRow[] = [
+  { key: 'denoise', label: 'Denoising Strength', brand: 'Creativity', hint: 'Amount of raw generative texture hallucinated', min: 0, max: 1, step: 0.01 },
+  { key: 'controlnet_weight', label: 'ControlNet Weight', brand: 'Resemblance', hint: 'Enforces adherence to the low-res spatial structure', min: 0, max: 1, step: 0.01 },
+  { key: 'hdr', label: 'HDR', brand: 'HDR', hint: 'UnsharpMask + Contrast post-pass (zero GPU cost)', min: 0, max: 1, step: 0.01 },
+  { key: 'fractality', label: 'Fractality', brand: 'Fractality', hint: 'Pre-tile noise injection + guidance bump 7→12', min: 0, max: 1, step: 0.01 },
+];
 
-  // Load custom presets from base configurations
+interface RunningTask {
+  id: string;
+  state: string;
+  percent?: number;
+  statusText?: string;
+}
+
+export default function UpscalerPanel() {
+  const { upscaleTarget, setUpscaleTarget, activeTab } = useStore();
+
+  const [assets, setAssets] = useState<MediaAsset[]>([]);
+  const [loadingAssets, setLoadingAssets] = useState(false);
+  const [selectedPath, setSelectedPath] = useState<string | null>(upscaleTarget);
+
+  const [params, setParams] = useState<UpscaleParams>({
+    denoise: 0.35,
+    controlnet_weight: 0.8,
+    hdr: 0.0,
+    fractality: 0.0,
+    prompt: '',
+  });
+  const [activePreset, setActivePreset] = useState<string | null>(null);
+
+  const [runningTask, setRunningTask] = useState<RunningTask | null>(null);
+  const [taskError, setTaskError] = useState<string | null>(null);
+  const [lastResult, setLastResult] = useState<{ beforeUrl: string; afterUrl: string; title: string } | null>(null);
+  const [showCompare, setShowCompare] = useState(false);
+
+  // Sync selection when FileManager/catalog sets a new upscale target.
   useEffect(() => {
-    async function loadPresets() {
-      try {
-        const configs = await fetchSettings();
-        if (configs['upscaler:custom_presets']) {
-          const parsed = JSON.parse(configs['upscaler:custom_presets']);
-          setCustomPresets(parsed);
-        }
-      } catch (err) {
-        console.error('Failed to load custom presets from configurations:', err);
-      }
+    if (upscaleTarget) {
+      setSelectedPath(upscaleTarget);
     }
-    loadPresets();
+  }, [upscaleTarget]);
+
+  const loadAssets = useCallback(async () => {
+    setLoadingAssets(true);
+    try {
+      const catalog = await fetchMediaCatalog('', 50);
+      setAssets(catalog.filter((a) => a.content_type.toLowerCase().startsWith('image/')));
+    } catch {
+      /* backend unreachable — keep whatever we have */
+    } finally {
+      setLoadingAssets(false);
+    }
   }, []);
 
-  // Update sliders when preset changes
   useEffect(() => {
-    if (preset === 'Custom') return;
+    loadAssets();
+  }, [loadAssets, activeTab]);
 
-    const selectedPreset = DEFAULT_PRESETS[preset] || customPresets[preset];
-    if (selectedPreset) {
-      setDenoisingStrength(selectedPreset.denoisingStrength);
-      setControlNetWeight(selectedPreset.controlNetWeight);
-    }
-  }, [preset, customPresets]);
+  const updateParam = (key: keyof UpscaleParams, value: number | string) => {
+    setParams((prev) => ({ ...prev, [key]: value }));
+    setActivePreset(null);
+  };
 
-  // Handle slider changes (if changed manually, switch preset to Custom)
-  const handleSliderChange = (type: 'denoising' | 'weight', val: number) => {
-    if (type === 'denoising') {
-      setDenoisingStrength(val);
-    } else {
-      setControlNetWeight(val);
+  const applyPreset = (preset: Preset) => {
+    setParams({
+      ...params,
+      denoise: preset.denoise,
+      controlnet_weight: preset.controlnet_weight,
+      hdr: preset.hdr,
+      fractality: preset.fractality,
+    });
+    setActivePreset(preset.name);
+  };
+
+  const handleRun = async () => {
+    if (!selectedPath) {
+      setTaskError('Select an image to upscale first.');
+      return;
     }
-    
-    // Check if values match any preset, if not, set to Custom
-    let matched = false;
-    const allPresets = { ...DEFAULT_PRESETS, ...customPresets };
-    for (const [key, p] of Object.entries(allPresets)) {
-      if (
-        Math.abs(p.denoisingStrength - (type === 'denoising' ? val : denoisingStrength)) < 0.01 &&
-        Math.abs(p.controlNetWeight - (type === 'weight' ? val : controlNetWeight)) < 0.01
-      ) {
-        setPreset(key);
-        matched = true;
-        break;
-      }
-    }
-    if (!matched) {
-      setPreset('Custom');
+    setTaskError(null);
+    setLastResult(null);
+    try {
+      const res: TaskResponse = await startTask(selectedPath, 'upscale', params);
+      setRunningTask({ id: res.task_id, state: res.status, percent: 0 });
+    } catch (err: any) {
+      setTaskError(err.message || 'Failed to dispatch upscale task');
     }
   };
 
-  const handleSavePreset = async () => {
-    if (!newPresetName.trim()) return alert('Please enter a name for the custom preset');
-    
-    setIsSavingPreset(true);
-    try {
-      const updatedCustom = {
-        ...customPresets,
-        [newPresetName.trim()]: {
-          name: newPresetName.trim(),
-          denoisingStrength,
-          controlNetWeight
+  // Poll the running task to completion.
+  useEffect(() => {
+    if (!runningTask) return;
+    const interval = setInterval(async () => {
+      try {
+        const status = await getTaskStatus(runningTask.id);
+        const next: RunningTask = { ...runningTask, state: status.state };
+        if (status.state === 'PROGRESS' && status.info) {
+          next.percent = status.info.percent;
+          next.statusText = status.info.status;
+        } else if (status.state === 'SUCCESS') {
+          next.percent = 100;
+          next.statusText = 'Completed';
+          const info = status.info || {};
+          if (info.processed_url && info.original_object) {
+            // Find the original asset URL from the loaded catalog so the
+            // before/after modal can pair them (#58).
+            const originalAsset = assets.find(
+              (a) => a.file_path === info.original_object
+            );
+            setLastResult({
+              beforeUrl: originalAsset?.url || '',
+              afterUrl: info.processed_url,
+              title: info.processed_name || selectedPath || 'Upscale Comparison',
+            });
+          }
+          setRunningTask(null);
+          clearInterval(interval);
+          loadAssets();
+          return;
+        } else if (status.state === 'FAILURE') {
+          next.statusText = `Error: ${status.info}`;
+          setTaskError(typeof status.info === 'string' ? status.info : 'Upscale failed');
+          setRunningTask(null);
+          clearInterval(interval);
+          return;
         }
-      };
-      
-      await saveSettings({
-        'upscaler:custom_presets': JSON.stringify(updatedCustom)
-      });
-      
-      setCustomPresets(updatedCustom);
-      setPreset(newPresetName.trim());
-      setNewPresetName('');
-      alert('Custom preset saved successfully!');
-    } catch (err: any) {
-      alert(err.message || 'Failed to save custom preset');
-    } finally {
-      setIsSavingPreset(false);
-    }
-  };
+        setRunningTask(next);
+      } catch {
+        /* transient poll failure — keep polling */
+      }
+    }, 1500);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runningTask?.id]);
 
-  const handleSubmit = async () => {
-    setIsSubmitting(true);
-    try {
-      await onStartUpscale({
-        denoising_strength: denoisingStrength,
-        controlnet_weight: controlNetWeight,
-        preset,
-        preview
-      });
-    } catch (err: any) {
-      alert(err.message || 'Upscaling request failed');
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const allPresetKeys = [
-    ...Object.keys(DEFAULT_PRESETS),
-    ...Object.keys(customPresets),
-    'Custom'
-  ];
+  const percent = runningTask?.percent ?? 0;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
-      <div className="relative bg-slate-900 border border-slate-800 rounded-lg p-6 max-w-md w-full shadow-2xl animate-in fade-in zoom-in-95 duration-200">
-        
-        {/* Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-slate-800">
-          <div className="flex items-center gap-2">
-            <Cpu className="w-5 h-5 text-emerald-400" />
-            <h3 className="text-base font-bold text-slate-200">Magnific Upscaler Settings</h3>
-          </div>
-          <button
-            onClick={onClose}
-            className="text-slate-500 hover:text-slate-400 p-1 rounded-md hover:bg-slate-800 transition"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
+    <div className="space-y-8 animate-fadeIn max-w-6xl">
+      {/* Top Banner */}
+      <div className="bg-slate-900 border border-slate-800 rounded-lg p-6">
+        <h2 className="text-xl font-bold text-white flex items-center gap-2 mb-2">
+          <Wand2 className="w-5 h-5 text-sky-400" /> Magnific-Style Generative Upscaler
+        </h2>
+        <p className="text-sm text-slate-400 max-w-3xl">
+          Tile-based upscaling with ControlNet Tile + SDXL/Flux. Additive HDR and Fractality
+          controls (map #57) and optional text-prompt guidance (map #59) — forwarded to the
+          Colab diffusion worker, or run through the local CPU fallback pipeline when no
+          worker is connected.
+        </p>
+      </div>
 
-        {/* Target Info */}
-        <div className="mt-4 bg-slate-950/40 border border-slate-850 p-2 px-3 rounded flex items-center gap-2">
-          <ImageIcon className="w-4 h-4 text-slate-500 flex-shrink-0" />
-          <span className="text-xs text-slate-400 truncate font-mono">{filePath.split('/').pop()}</span>
-        </div>
-
-        {/* Form controls */}
-        <div className="mt-4 space-y-4">
-          {/* Preset drop down */}
-          <div>
-            <label className="block text-xs font-semibold text-slate-450 mb-1.5">Upscaling Preset</label>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        {/* Left: target + controls */}
+        <div className="space-y-6">
+          {/* Target image */}
+          <section className="bg-slate-900 border border-slate-800 rounded-lg p-5">
+            <h3 className="text-sm font-bold text-slate-200 mb-4 flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-sky-400" /> Target Image
+            </h3>
             <select
-              value={preset}
-              onChange={(e) => setPreset(e.target.value)}
-              className="w-full text-sm bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-slate-300 focus:outline-none focus:border-emerald-500"
+              value={selectedPath ?? ''}
+              onChange={(e) => setSelectedPath(e.target.value || null)}
+              className="w-full bg-slate-950 border border-slate-700 rounded-md px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-1 focus:ring-sky-500 focus:border-sky-500"
             >
-              {allPresetKeys.map((key) => (
-                <option key={key} value={key}>
-                  {key}
+              <option value="">Select an image…</option>
+              {assets.map((asset) => (
+                <option key={asset.id} value={asset.file_path}>
+                  {asset.title}
                 </option>
               ))}
             </select>
-          </div>
+            {loadingAssets && (
+              <p className="text-[10px] text-slate-500 mt-2 flex items-center gap-1">
+                <Loader2 className="w-3 h-3 animate-spin" /> Loading catalog images…
+              </p>
+            )}
+            {selectedPath && !loadingAssets && (
+              <p className="text-[10px] text-slate-500 mt-2 font-mono break-all">{selectedPath}</p>
+            )}
+          </section>
 
-          {/* Denoising Slider */}
-          <div>
-            <div className="flex justify-between items-center mb-1">
-              <label className="text-xs font-semibold text-slate-450">Denoising Strength (Creativity)</label>
-              <span className="text-xs font-mono font-bold text-emerald-400">{denoisingStrength.toFixed(2)}</span>
-            </div>
-            <input
-              type="range"
-              min="0.1"
-              max="1.0"
-              step="0.05"
-              value={denoisingStrength}
-              onChange={(e) => handleSliderChange('denoising', parseFloat(e.target.value))}
-              className="w-full accent-emerald-500 h-1.5 bg-slate-950 rounded-lg cursor-pointer"
-            />
-            <p className="text-[10px] text-slate-500 mt-1">Controls high-frequency texture generation and hallucination amount (0.1=low, 1.0=high)</p>
-          </div>
+          {/* Sliders */}
+          <section className="bg-slate-900 border border-slate-800 rounded-lg p-5 space-y-5">
+            <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-sky-400" /> Fidelity Controls
+            </h3>
+            {SLIDERS.map((slider) => {
+              const value = (params[slider.key] as number) ?? 0;
+              return (
+                <div key={slider.key}>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-xs font-semibold text-slate-300">
+                      {slider.label}
+                      {slider.brand && slider.brand !== slider.label && (
+                        <span className="text-slate-500 font-normal"> — {slider.brand}</span>
+                      )}
+                    </label>
+                    <span className="text-xs font-mono text-sky-400">{value.toFixed(2)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={slider.min}
+                    max={slider.max}
+                    step={slider.step}
+                    value={value}
+                    onChange={(e) => updateParam(slider.key, parseFloat(e.target.value))}
+                    className="w-full accent-sky-500"
+                  />
+                  <p className="text-[10px] text-slate-500 mt-1">{slider.hint}</p>
+                </div>
+              );
+            })}
+          </section>
 
-          {/* ControlNet Weight Slider */}
-          <div>
-            <div className="flex justify-between items-center mb-1">
-              <label className="text-xs font-semibold text-slate-450">ControlNet Weight (Resemblance)</label>
-              <span className="text-xs font-mono font-bold text-emerald-400">{controlNetWeight.toFixed(2)}</span>
-            </div>
-            <input
-              type="range"
-              min="0.0"
-              max="2.0"
-              step="0.05"
-              value={controlNetWeight}
-              onChange={(e) => handleSliderChange('weight', parseFloat(e.target.value))}
-              className="w-full accent-emerald-500 h-1.5 bg-slate-950 rounded-lg cursor-pointer"
-            />
-            <p className="text-[10px] text-slate-500 mt-1">Controls shape and structural adherence to the source image (0.0=none, 2.0=strict)</p>
-          </div>
-
-          {/* Render Mode check */}
-          <div className="flex items-center justify-between p-2.5 bg-slate-950/20 border border-slate-850 rounded">
+          {/* Prompt + presets */}
+          <section className="bg-slate-900 border border-slate-800 rounded-lg p-5 space-y-5">
+            <h3 className="text-sm font-bold text-slate-200 flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-sky-400" /> Prompt Guidance
+            </h3>
             <div>
-              <span className="block text-xs font-semibold text-slate-350">Preview Mode (Small Region)</span>
-              <span className="block text-[9px] text-slate-500">Upscales only a central 256x256 crop quickly before committing to a full render</span>
-            </div>
-            <input
-              type="checkbox"
-              checked={preview}
-              onChange={(e) => setPreview(e.target.checked)}
-              className="w-4 h-4 rounded text-emerald-500 focus:ring-emerald-500 focus:ring-offset-slate-900 focus:ring-2 bg-slate-900 border-slate-750"
-            />
-          </div>
-
-          {/* Save custom preset form */}
-          <div className="pt-3 border-t border-slate-850">
-            <label className="block text-xs font-semibold text-slate-450 mb-1">Save Current as Custom Preset</label>
-            <div className="flex gap-2">
+              <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                Optional img2img prompt
+              </label>
               <input
                 type="text"
-                placeholder="My Preset"
-                value={newPresetName}
-                onChange={(e) => setNewPresetName(e.target.value)}
-                className="flex-1 text-xs bg-slate-950 border border-slate-800 rounded px-2 py-1 text-slate-300 focus:outline-none focus:border-emerald-500"
+                placeholder="e.g. ultra-detailed skin pores, sharp foliage"
+                value={params.prompt || ''}
+                onChange={(e) => updateParam('prompt', e.target.value)}
+                className="w-full bg-slate-950 border border-slate-700 rounded-md px-3 py-2 text-sm text-slate-100 placeholder-slate-600 focus:outline-none focus:ring-1 focus:ring-sky-500 focus:border-sky-500"
               />
-              <button
-                type="button"
-                onClick={handleSavePreset}
-                disabled={isSavingPreset}
-                className="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-[11px] font-semibold text-slate-300 px-3 py-1 rounded transition flex items-center gap-1 border border-slate-700"
-              >
-                {isSavingPreset ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
-                Save
-              </button>
+              <p className="text-[10px] text-slate-500 mt-1">
+                Used as the positive prompt for each tile pass. Empty = current behavior (map #59).
+              </p>
             </div>
-          </div>
-        </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-300 mb-2">Presets</label>
+              <div className="flex flex-wrap gap-1.5">
+                {PRESETS.map((preset) => (
+                  <button
+                    key={preset.name}
+                    onClick={() => applyPreset(preset)}
+                    className={`text-[10px] font-semibold px-2.5 py-1 rounded border transition ${
+                      activePreset === preset.name
+                        ? 'bg-sky-950 text-sky-300 border-sky-800'
+                        : 'bg-slate-950 text-slate-400 border-slate-700 hover:border-slate-500 hover:text-slate-200'
+                    }`}
+                  >
+                    {preset.name}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </section>
 
-        {/* Footer actions */}
-        <div className="mt-5 pt-4 border-t border-slate-800 flex justify-end gap-2.5">
-          <button
-            type="button"
-            onClick={onClose}
-            className="text-xs bg-transparent hover:bg-slate-850 border border-slate-800 hover:border-slate-700 text-slate-400 hover:text-slate-300 font-semibold px-4 py-2 rounded-md transition"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={handleSubmit}
-            disabled={isSubmitting}
-            className="text-xs bg-emerald-600 hover:bg-emerald-500 disabled:bg-emerald-700 disabled:opacity-60 text-slate-100 font-bold px-4 py-2 rounded-md transition flex items-center gap-1.5 shadow-md shadow-emerald-950/20"
-          >
-            {isSubmitting ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                Initializing...
-              </>
-            ) : (
-              <>
-                <Sparkles className="w-3.5 h-3.5" />
-                Run Upscale
-              </>
+          {/* Run */}
+          <section className="bg-slate-900 border border-slate-800 rounded-lg p-5">
+            <button
+              onClick={handleRun}
+              disabled={!!runningTask}
+              className="w-full flex items-center justify-center gap-2 bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm px-6 py-3 rounded-md transition active:scale-[98%]"
+            >
+              {runningTask ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+              {runningTask ? 'Upscaling…' : 'Run Upscale'}
+            </button>
+
+            {runningTask && (
+              <div className="mt-4">
+                <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                  <div className="bg-sky-500 h-full transition-all duration-300" style={{ width: `${Math.max(percent, 5)}%` }} />
+                </div>
+                <p className="text-xs text-slate-400 mt-2 flex items-center gap-1.5">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-sky-400" />
+                  {runningTask.statusText || `Processing… ${Math.round(percent)}%`}
+                </p>
+              </div>
             )}
-          </button>
+
+            {taskError && (
+              <p className="text-xs text-rose-400 mt-3 flex items-center gap-1.5 bg-rose-950/30 border border-rose-900/50 rounded-md px-3 py-2">
+                <AlertCircle className="w-3.5 h-3.5" /> {taskError}
+              </p>
+            )}
+
+            {lastResult && (
+              <div className="mt-4 bg-emerald-950/20 border border-emerald-900/60 rounded-md p-3 flex items-center justify-between gap-3">
+                <p className="text-xs text-emerald-300 flex items-center gap-1.5">
+                  <CheckCircle2 className="w-4 h-4" /> Upscale complete — result saved to catalog.
+                </p>
+                <button
+                  onClick={() => setShowCompare(true)}
+                  className="flex items-center gap-1.5 text-xs font-semibold bg-emerald-800/60 hover:bg-emerald-700/60 text-emerald-100 border border-emerald-700 px-3 py-1.5 rounded transition"
+                >
+                  <ArrowLeftRight className="w-3.5 h-3.5" /> Compare
+                </button>
+              </div>
+            )}
+          </section>
         </div>
 
+        {/* Right: guide panel */}
+        <div className="space-y-6">
+          <section className="bg-slate-900 border border-slate-800 rounded-lg p-5">
+            <h3 className="text-sm font-bold text-slate-200 mb-3">How controls map to the pipeline</h3>
+            <ul className="space-y-3 text-xs text-slate-400">
+              <li>
+                <strong className="text-slate-200">Denoising Strength — Creativity</strong>
+                <p className="text-slate-500 mt-0.5">img2img denoise strength per tile pass.</p>
+              </li>
+              <li>
+                <strong className="text-slate-200">ControlNet Weight — Resemblance</strong>
+                <p className="text-slate-500 mt-0.5">Tile ControlNet conditioning weight.</p>
+              </li>
+              <li>
+                <strong className="text-slate-200">HDR</strong>
+                <p className="text-slate-500 mt-0.5">PIL UnsharpMask + Contrast post-pass — zero GPU cost (map #61).</p>
+              </li>
+              <li>
+                <strong className="text-slate-200">Fractality</strong>
+                <p className="text-slate-500 mt-0.5">Pre-tile Gaussian noise injection + guidance_scale bump 7→12 (map #61).</p>
+              </li>
+              <li>
+                <strong className="text-slate-200">Prompt</strong>
+                <p className="text-slate-500 mt-0.5">img2img positive prompt per tile; empty preserves current behavior (map #59).</p>
+              </li>
+            </ul>
+          </section>
+        </div>
       </div>
+
+      {showCompare && lastResult && lastResult.beforeUrl && (
+        <BeforeAfterModal
+          beforeUrl={lastResult.beforeUrl}
+          afterUrl={lastResult.afterUrl}
+          title={lastResult.title}
+          onClose={() => setShowCompare(false)}
+        />
+      )}
+
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-export type TabType = 'library' | 'catalog' | 'generation' | 'players' | 'settings' | 'tunnels' | 'monitor' | 'queue';
+export type TabType = 'library' | 'catalog' | 'generation' | 'upscaler' | 'players' | 'settings' | 'tunnels' | 'monitor' | "queue";
 
 export interface ProviderKeyStatus {
   configured: boolean;
@@ -58,6 +58,10 @@ interface AppState {
   pushMetricsHistory: (point: ColabMetricsHistoryPoint) => void;
   clearMetricsHistory: () => void;
 
+  // Upscaler — file currently being upscaled (set from FileManager / catalog)
+  upscaleTarget: string | null;
+  setUpscaleTarget: (path: string | null) => void;
+
   // Layout
   sidebarOpen: boolean;
   toggleSidebar: () => void;
@@ -95,6 +99,9 @@ export const useStore = create<AppState>()(
           colabMetricsHistory: [...state.colabMetricsHistory.slice(-119), point],
         })),
       clearMetricsHistory: () => set({ colabMetricsHistory: [] }),
+
+      upscaleTarget: null,
+      setUpscaleTarget: (upscaleTarget) => set({ upscaleTarget }),
 
       sidebarOpen: true,
       toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),

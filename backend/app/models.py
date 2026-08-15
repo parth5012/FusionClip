@@ -34,6 +34,10 @@ class MediaAsset(Base):
     content_type = Column(String, nullable=False)
     duration = Column(Float, nullable=True)
     embedding = Column(Vector(1536), nullable=True)
+    # Optional link to the source asset this one was derived from (e.g. an
+    # upscaled output pointing at the original it was generated from).
+    # Used by the before/after comparison UI to pair originals with results.
+    source_path = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
