@@ -153,6 +153,16 @@ def generate_presigned_upload_url(object_name: str, content_type: str = "applica
         logger.error(f"Failed to generate presigned upload URL {object_name}: {e}")
         return ""
 
+def download_bytes(object_name: str) -> bytes:
+    """Fetch the full contents of an object as bytes."""
+    try:
+        response = s3_client.get_object(Bucket=settings.MINIO_BUCKET_NAME, Key=object_name)
+        return response["Body"].read()
+    except Exception as e:
+        logger.error(f"Failed to download object {object_name} from MinIO: {e}")
+        return b""
+
+
 def get_object_stream(object_name: str) -> Generator:
     """Stream an S3 object chunk by chunk."""
     try:

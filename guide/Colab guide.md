@@ -78,6 +78,25 @@ The Google Colab Compute Connector bridges the FusionClip multimedia platform wi
 | `text_generation` | POST `/api/generate/text` | `{ prompt }` |
 | `audio_generation` | POST `/api/generate/audio` | `{ prompt, type }` |
 | `image_generation` | POST `/api/generate/image` | `{ prompt, steps, scale }` |
+| `upscale` | POST `/api/tasks/process?task_type=upscale` | `{ object_name, input_url, denoise, controlnet_weight, guidance_scale, hdr, fractality, prompt }` |
+
+**Upscale task contract (Magnific-style parity, map #56):** the upscale
+payload carries the panel's fidelity controls so the notebook can apply them
+during sampling:
+
+- `denoise` — img2img denoise strength per tile pass (Denoising Strength / Creativity).
+- `controlnet_weight` — ControlNet Tile conditioning weight (Resemblance).
+- `guidance_scale` — `7.0` normally, bumped to `12.0` when Fractality is active.
+- `hdr` — 0..1; if the notebook runs a diffusion HDR pass it can use this;
+  the backend also applies a zero-GPU PIL UnsharpMask + Contrast post-pass.
+- `fractality` — 0..1; pre-tile Gaussian noise injection + guidance bump.
+- `prompt` — optional img2img positive prompt for each tile pass; empty
+  preserves legacy no-prompt behavior.
+
+Expected notebook behaviour for `upscale`: return `task_complete` with an
+`output.url` (and `output.filename`) pointing at the upscaled image. The
+backend records the result as a `MediaAsset` linked back to the original via
+`source_path`, which powers the before/after comparison UI.
 
 **Dispatch flow:**
 1. User clicks generate in the FusionClip UI

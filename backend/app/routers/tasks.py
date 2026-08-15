@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import Optional
 
 import redis
 from celery.result import AsyncResult
@@ -24,9 +25,33 @@ def run_processing_pipeline(
     task_type: str = Query(
         "transcode", description="Generation pipeline: transcode, audio_extract, upscale"
     ),
+    denoise: Optional[float] = Query(
+        None, description="Upscale: Denoising Strength (Creativity)"
+    ),
+    controlnet_weight: Optional[float] = Query(
+        None, description="Upscale: ControlNet Weight (Resemblance)"
+    ),
+    hdr: Optional[float] = Query(None, description="Upscale: HDR post-pass strength"),
+    fractality: Optional[float] = Query(
+        None, description="Upscale: Fractality noise + guidance bump"
+    ),
+    prompt: Optional[str] = Query(
+        None, description="Upscale: optional img2img positive prompt"
+    ),
 ):
     """Dispatch long-running celery worker multimedia task processing pipeline."""
-    task = process_multimedia_task.delay(path, task_type)
+    kwargs = {}
+    if denoise is not None:
+        kwargs["denoise"] = denoise
+    if controlnet_weight is not None:
+        kwargs["controlnet_weight"] = controlnet_weight
+    if hdr is not None:
+        kwargs["hdr"] = hdr
+    if fractality is not None:
+        kwargs["fractality"] = fractality
+    if prompt is not None:
+        kwargs["prompt"] = prompt
+    task = process_multimedia_task.delay(path, task_type, **kwargs)
     return {
         "message": "Processing pipeline initiated successfully",
         "task_id": task.id,

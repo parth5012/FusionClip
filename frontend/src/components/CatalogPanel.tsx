@@ -3,9 +3,10 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Search, Volume2, Video, Image as ImageIcon, File, 
-  Loader2, ArrowUpRight, Calendar, HardDrive, RefreshCw, X, Clock
+  Loader2, ArrowUpRight, Calendar, HardDrive, RefreshCw, X, Clock, ArrowLeftRight
 } from 'lucide-react';
 import { fetchMediaCatalog, MediaAsset } from '../utils/api';
+import BeforeAfterModal from './BeforeAfterModal';
 
 export default function CatalogPanel() {
   const [query, setQuery] = useState('');
@@ -14,6 +15,8 @@ export default function CatalogPanel() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedFilter, setSelectedFilter] = useState<'all' | 'audio' | 'video' | 'image'>('all');
+  // Before/after comparison (map #58): pairs a source asset with its upscaled output.
+  const [compare, setCompare] = useState<{ beforeUrl: string; afterUrl: string; title: string } | null>(null);
 
   const loadCatalog = async (searchQuery = '') => {
     setLoading(true);
@@ -328,11 +331,40 @@ export default function CatalogPanel() {
                       Access Asset Direct URL
                     </a>
                   )}
+
+                  {/* Before/after comparison (map #58) — available when this asset
+                      has an upscaled output, or when it IS an upscaled output. */}
+                  {(file.upscaled_assets?.length > 0 || file.source_url) && (
+                    <button
+                      onClick={() => {
+                        if (file.upscaled_assets?.length > 0) {
+                          const child = file.upscaled_assets[0];
+                          setCompare({ beforeUrl: file.url, afterUrl: child.url, title: file.title });
+                        } else if (file.source_url) {
+                          setCompare({ beforeUrl: file.source_url, afterUrl: file.url, title: file.title });
+                        }
+                      }}
+                      className="mt-3 flex items-center justify-center gap-1.5 bg-emerald-950/60 hover:bg-emerald-900/70 text-emerald-300 border border-emerald-900 px-3 py-1.5 rounded-md text-xs font-semibold transition"
+                      title="Compare original vs upscaled"
+                    >
+                      <ArrowLeftRight className="w-3.5 h-3.5" />
+                      Compare
+                    </button>
+                  )}
                 </div>
               </div>
             );
           })}
         </div>
+      )}
+
+      {compare && (
+        <BeforeAfterModal
+          beforeUrl={compare.beforeUrl}
+          afterUrl={compare.afterUrl}
+          title={`Compare — ${compare.title}`}
+          onClose={() => setCompare(null)}
+        />
       )}
     </div>
   );

@@ -129,6 +129,15 @@ class GenerationImageOut(GenerationOut):
 # --- Media -----------------------------------------------------------------
 
 
+class UpscaledAssetOut(BaseModel):
+    """A derived asset (e.g. an upscaled output) linked to a source asset."""
+
+    id: int
+    title: str
+    file_path: str
+    url: str
+
+
 class MediaAssetOut(BaseModel):
     id: int
     title: str
@@ -137,4 +146,9 @@ class MediaAssetOut(BaseModel):
     content_type: str
     duration: Optional[float] = None
     url: str
+    # Before/after comparison support (#58): the original this asset was
+    # derived from, plus any upscaled outputs derived from this asset.
+    source_path: Optional[str] = None
+    source_url: Optional[str] = None
+    upscaled_assets: List[UpscaledAssetOut] = Field(default_factory=list)
     created_at: Optional[str] = None

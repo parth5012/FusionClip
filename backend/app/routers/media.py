@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["media"])
 
 
-def _serialize_asset(asset: MediaAsset) -> dict:
+def _serialize_asset(asset: MediaAsset, upscaled_children: list = None) -> dict:
     return {
         "id": asset.id,
         "title": asset.title,
@@ -23,14 +23,41 @@ def _serialize_asset(asset: MediaAsset) -> dict:
         "content_type": asset.content_type,
         "duration": asset.duration,
         "url": generate_url(asset.file_path) if asset.file_path else "",
+        # Before/after comparison support (#58): expose the original this
+        # asset was derived from, plus any upscaled outputs derived from it.
+        "source_path": asset.source_path,
+        "source_url": generate_url(asset.source_path) if asset.source_path else None,
+        "upscaled_assets": [
+            {
+                "id": child.id,
+                "title": child.title,
+                "file_path": child.file_path,
+                "url": generate_url(child.file_path) if child.file_path else "",
+            }
+            for child in (upscaled_children or [])
+        ],
         "created_at": asset.created_at.isoformat() if asset.created_at else None,
     }
+
+
+def _serialize_catalog(db, assets) -> list:
+    """Serialize a list of assets, attaching each asset's upscaled outputs."""
+    if not assets:
+        return []
+    by_path = {asset.file_path: asset for asset in assets}
+    children: dict = {}
+    for asset in assets:
+        if asset.source_path and asset.source_path in by_path:
+            children.setdefault(asset.source_path, []).append(asset)
+    return [
+        _serialize_asset(asset, children.get(asset.file_path, [])) for asset in assets
+    ]
 
 
 @router.get("/api/media")
 def list_media(db: Session = Depends(get_db)):
     assets = db.query(MediaAsset).all()
-    return [_serialize_asset(asset) for asset in assets]
+    return _serialize_catalog(db, assets)
 
 
 @router.get("/api/media/search")
@@ -66,4 +93,4 @@ def search_media(
             .all()
         )
 
-    return [_serialize_asset(asset) for asset in assets]
+    return _serialize_catalog(db, assets)

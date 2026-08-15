@@ -174,6 +174,54 @@ class TestTasksRouter:
         }
         assert recorded["args"] == ("clip.mp4", "thumbnail")
 
+    def test_process_forwards_upscale_params(self, client, monkeypatch):
+        """The upscale controls (map #57/#59) reach the Celery task as kwargs."""
+        class _FakeAsyncResult:
+            id = "upscale-task-id"
+            status = "PENDING"
+
+        recorded = {}
+
+        def _fake_delay(path, task_type, **kwargs):
+            recorded["args"] = (path, task_type)
+            recorded["kwargs"] = kwargs
+            return _FakeAsyncResult()
+
+        monkeypatch.setattr(
+            "app.routers.tasks.process_multimedia_task.delay", _fake_delay, raising=True
+        )
+
+        res = client.post(
+            "/api/tasks/process?path=photo.png&task_type=upscale"
+            "&denoise=0.5&controlnet_weight=0.9&hdr=0.4&fractality=0.6&prompt=sharp+details"
+        )
+        assert res.status_code == 200
+        assert recorded["args"] == ("photo.png", "upscale")
+        assert recorded["kwargs"] == {
+            "denoise": 0.5,
+            "controlnet_weight": 0.9,
+            "hdr": 0.4,
+            "fractality": 0.6,
+            "prompt": "sharp details",
+        }
+
+    def test_process_without_upscale_params_sends_none(self, client, monkeypatch):
+        class _FakeAsyncResult:
+            id = "plain-task-id"
+            status = "PENDING"
+
+        recorded = {}
+
+        def _fake_delay(path, task_type, **kwargs):
+            recorded["kwargs"] = kwargs
+            return _FakeAsyncResult()
+
+        monkeypatch.setattr(
+            "app.routers.tasks.process_multimedia_task.delay", _fake_delay, raising=True
+        )
+        client.post("/api/tasks/process?path=clip.mp4&task_type=transcode")
+        assert recorded["kwargs"] == {}
+
     def test_status_shape(self, client, monkeypatch):
         class _Result:
             state = "SUCCESS"
@@ -314,6 +362,9 @@ class TestMediaRouter:
         "content_type",
         "duration",
         "url",
+        "source_path",
+        "source_url",
+        "upscaled_assets",
         "created_at",
     }
 
@@ -372,6 +423,45 @@ class TestMediaRouter:
     def test_search_no_matches(self, client, db_session, stub_storage):
         self._seed(db_session)
         assert client.get("/api/media/search?query=nonexistent").json() == []
+
+    def test_upscaled_asset_relation_exposed(self, client, db_session, stub_storage):
+        """An upscaled output exposes source_path/source_url and its original
+        lists it under upscaled_assets (map #58 before/after pairing)."""
+        original = MediaAsset(
+            title="portrait.png",
+            file_path="originals/portrait.png",
+            file_size=512,
+            content_type="image/png",
+            duration=0.0,
+        )
+        upscaled = MediaAsset(
+            title="Upscaled: portrait.png",
+            file_path="processed/upscaled_portrait.png",
+            file_size=4096,
+            content_type="image/png",
+            duration=0.0,
+            source_path="originals/portrait.png",
+        )
+        db_session.add_all([original, upscaled])
+        db_session.commit()
+
+        catalog = client.get("/api/media").json()
+        original_item = next(
+            (a for a in catalog if a["file_path"] == "originals/portrait.png"), None
+        )
+        upscaled_item = next(
+            (a for a in catalog if a["file_path"] == "processed/upscaled_portrait.png"), None
+        )
+
+        assert original_item is not None
+        assert original_item["source_path"] is None
+        assert len(original_item["upscaled_assets"]) == 1
+        assert original_item["upscaled_assets"][0]["file_path"] == "processed/upscaled_portrait.png"
+        assert original_item["upscaled_assets"][0]["url"].startswith("http://test-minio/")
+
+        assert upscaled_item is not None
+        assert upscaled_item["source_path"] == "originals/portrait.png"
+        assert upscaled_item["source_url"].startswith("http://test-minio/")
 
 
 class TestDependencyOverride:

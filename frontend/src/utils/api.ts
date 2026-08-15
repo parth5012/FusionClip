@@ -83,8 +83,27 @@ export async function createFolder(folderPath: string): Promise<{ message: strin
   return res.json();
 }
 
-export async function startTask(path: string, taskType = 'transcode'): Promise<TaskResponse> {
-  const url = `${API_BASE_URL}/api/tasks/process?path=${encodeURIComponent(path)}&task_type=${encodeURIComponent(taskType)}`;
+export interface UpscaleParams {
+  denoise?: number; // Denoising Strength (Creativity)
+  controlnet_weight?: number; // ControlNet Weight (Resemblance)
+  hdr?: number; // HDR post-pass strength
+  fractality?: number; // Fractality noise + guidance bump
+  prompt?: string; // optional img2img positive prompt
+}
+
+export async function startTask(
+  path: string,
+  taskType = 'transcode',
+  upscaleParams?: UpscaleParams
+): Promise<TaskResponse> {
+  let url = `${API_BASE_URL}/api/tasks/process?path=${encodeURIComponent(path)}&task_type=${encodeURIComponent(taskType)}`;
+  if (upscaleParams) {
+    if (upscaleParams.denoise !== undefined) url += `&denoise=${encodeURIComponent(upscaleParams.denoise)}`;
+    if (upscaleParams.controlnet_weight !== undefined) url += `&controlnet_weight=${encodeURIComponent(upscaleParams.controlnet_weight)}`;
+    if (upscaleParams.hdr !== undefined) url += `&hdr=${encodeURIComponent(upscaleParams.hdr)}`;
+    if (upscaleParams.fractality !== undefined) url += `&fractality=${encodeURIComponent(upscaleParams.fractality)}`;
+    if (upscaleParams.prompt) url += `&prompt=${encodeURIComponent(upscaleParams.prompt)}`;
+  }
   const res = await fetch(url, {
     method: 'POST',
   });
@@ -104,6 +123,13 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatusResponse>
   return res.json();
 }
 
+export interface UpscaledAsset {
+  id: number;
+  title: string;
+  file_path: string;
+  url: string;
+}
+
 export interface MediaAsset {
   id: number;
   title: string;
@@ -112,6 +138,11 @@ export interface MediaAsset {
   content_type: string;
   duration: number;
   url: string;
+  // Before/after comparison support (#58): the original this asset was
+  // derived from, plus any upscaled outputs derived from this asset.
+  source_path: string | null;
+  source_url: string | null;
+  upscaled_assets: UpscaledAsset[];
   created_at: string | null;
 }
 

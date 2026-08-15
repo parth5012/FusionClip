@@ -93,14 +93,28 @@ export async function apiDeleteFile(path: string): Promise<void> {
 }
 
 /** Start a processing task via the API */
+export interface UpscaleTaskParams {
+  denoise?: number;
+  controlnet_weight?: number;
+  hdr?: number;
+  fractality?: number;
+  prompt?: string;
+}
+
 export async function apiStartTask(
   path: string,
   taskType = 'transcode',
+  upscaleParams?: UpscaleTaskParams,
 ): Promise<{ task_id: string; status: string }> {
-  const res = await fetch(
-    `${API_BASE}/api/tasks/process?path=${encodeURIComponent(path)}&task_type=${encodeURIComponent(taskType)}`,
-    { method: 'POST' },
-  );
+  let url = `${API_BASE}/api/tasks/process?path=${encodeURIComponent(path)}&task_type=${encodeURIComponent(taskType)}`;
+  if (upscaleParams) {
+    if (upscaleParams.denoise !== undefined) url += `&denoise=${encodeURIComponent(upscaleParams.denoise)}`;
+    if (upscaleParams.controlnet_weight !== undefined) url += `&controlnet_weight=${encodeURIComponent(upscaleParams.controlnet_weight)}`;
+    if (upscaleParams.hdr !== undefined) url += `&hdr=${encodeURIComponent(upscaleParams.hdr)}`;
+    if (upscaleParams.fractality !== undefined) url += `&fractality=${encodeURIComponent(upscaleParams.fractality)}`;
+    if (upscaleParams.prompt) url += `&prompt=${encodeURIComponent(upscaleParams.prompt)}`;
+  }
+  const res = await fetch(url, { method: 'POST' });
   if (!res.ok) throw new Error(`API start task failed: ${res.status}`);
   return res.json();
 }

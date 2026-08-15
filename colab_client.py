@@ -118,7 +118,14 @@ class ColabComputeWorker:
         """Simulate GPU task execution with progress reporting."""
         logger.info(f"Starting task {task_id} of type: {task_type}")
         self.active_task = f"{task_type} (ID: {task_id})"
-        
+
+        # Upscale tasks carry the Magnific-style fidelity controls (map #56):
+        # denoise, controlnet_weight, guidance_scale, hdr, fractality, prompt.
+        # A real notebook implementation should feed these into its SDXL/Flux
+        # + ControlNet Tile sampling and return the upscaled image URL.
+        if task_type == "upscale":
+            logger.info(f"Upscale controls received: {json.dumps(parameters)}")
+
         try:
             steps = 5
             for i in range(1, steps + 1):
