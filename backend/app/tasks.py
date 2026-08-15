@@ -1,11 +1,13 @@
-import time
+﻿import time
 import subprocess
-import re
-import os
+import traceback
+import sys
 import json
 import redis
+from datetime import datetime, timezone
 from app.celery_app import celery
 from app.storage import upload_object, generate_url
+from app.upscaler import TileUpscaler, calculate_tile_size
 from app.scratchpad import scratchpad
 from app.database import SessionLocal
 from app.models import Task, MediaAsset
@@ -14,9 +16,273 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Cache redis client
-redis_client = redis.from_url(settings.REDIS_URL)
+TRANSIENT_ERRORS = ('out of memory', 'oom', 'timeout', 'timeouterror',
+                     'connectionerror', 'connection', '429', '503', 'temporarily')
+PERMANENT_ERRORS = ('invalid', 'validation', 'bad parameter', 'not found',
+                    '404', '403', 'forbidden', 'unauthorized', '401',
+                    'unsupported', 'corrupt', 'malformed')
 
+
+def exponential_backoff(retry_count: int) -> int:
+    return (2 ** retry_count) * 60
+
+
+def is_transient_error(error_msg: str) -> bool:
+    if not error_msg:
+        return False
+    lower = error_msg.lower()
+    if any(pe in lower for pe in PERMANENT_ERRORS):
+        return False
+    return any(te in lower for te in TRANSIENT_ERRORS)
+
+
+def categorize_error(error_msg: str) -> str:
+    if not error_msg:
+        return 'runtime'
+    lower = error_msg.lower()
+    if 'out of memory' in lower or 'oom' in lower or 'memoryerror' in lower:
+        return 'OOM'
+    if 'timeout' in lower or 'timed out' in lower:
+        return 'timeout'
+    if any(v in lower for v in ('invalid', 'validation', 'bad parameter', 'unsupported')):
+        return 'validation'
+    return 'runtime'
+
+
+def _handle_task_failure(task_id: str, error: Exception, retry_count: int, max_retries: int):
+    error_msg = str(error)
+    tb_str = traceback.format_exc()
+    error_type = categorize_error(error_msg)
+    transient = is_transient_error(error_msg)
+
+    db = SessionLocal()
+    try:
+        db_task = db.query(Task).filter(Task.task_id == task_id).first()
+        if db_task:
+            db_task.error = error_msg
+            db_task.error_type = error_type
+            db_task.traceback = tb_str
+            db_task.retry_count = retry_count
+            db_task.max_retries = max_retries
+            if transient and retry_count < max_retries:
+                db_task.status = 'PENDING_RETRY'
+            else:
+                db_task.status = 'FAILED'
+            db.commit()
+    finally:
+        db.close()
+
+    redis_client.publish("task_updates", json.dumps({
+        "task_id": task_id,
+        "status": 'PENDING_RETRY' if (transient and retry_count < max_retries) else 'FAILED',
+        "progress": 0,
+        "error": error_msg,
+        "error_type": error_type,
+        "retry_count": retry_count,
+        "max_retries": max_retries,
+        "traceback": tb_str
+    }))
+
+    if transient and retry_count < max_retries:
+        logger.info(f"Task {task_id} transient error ({error_type}), retry {retry_count}/{max_retries}")
+    else:
+        logger.error(f"Task {task_id} permanent failure ({error_type}): {error_msg}")
+
+    return transient and retry_count < max_retries
+
+
+def update_task_retry(db_task: Task, retry_count: int, db) -> None:
+    """Update retry tracking fields on task."""
+    db_task.retry_count = retry_count
+    db_task.last_retry_at = datetime.now(timezone.utc)
+    db.commit()
+
+
+def parse_duration(file_path: str) -> float:
+    """Get duration of media file in seconds using ffprobe."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", file_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        return float(result.stdout.strip())
+    except Exception as e:
+        logger.error(f"Failed to parse duration {file_path}: {e}")
+        return 0.0
+
+
+def run_ffmpeg_with_progress(cmd, duration: float, task_id: str, celery_task=None) -> None:
+    """Run FFmpeg command with subprocess and update progress via Redis/DB."""
+    logger.info(f"Running FFmpeg command: {' '.join(cmd)}")
+
+    time_regex = __import__('re').compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+
+    db = SessionLocal()
+    try:
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+
+            match = time_regex.search(line)
+            if match and duration > 0:
+                hours, minutes, seconds, ms = map(int, match.groups())
+                current_time = hours * 3600 + minutes * 60 + seconds + ms / 100.0
+                percent = min(int((current_time / duration) * 100), 99)
+
+                update_payload = {
+                    "task_id": task_id,
+                    "status": "PROGRESS",
+                    "progress": percent,
+                    "error": None
+                }
+                redis_client.publish("task_updates", json.dumps(update_payload))
+
+                try:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task:
+                        db_task.progress = percent
+                        db.commit()
+                except Exception as e:
+                    logger.error(f"Failed to update progress for task {task_id}: {e}")
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg process encountered error: {e}")
+        raise
+    finally:
+        db.close()
+
+def _handle_task_failure(task_id: str, e: Exception, max_retries: int) -> bool:
+    """Handle task failure retry logic. Returns True if retry scheduled."""
+    error_msg = str(e)
+    tb = traceback.format_exc()
+    error_type = categorize_error(error_msg)
+
+    db = SessionLocal()
+    try:
+        db_task = db.query(Task).filter(Task.task_id == task_id).first()
+        if not db_task:
+            return False
+
+        current_retry = db_task.retry_count
+
+        if current_retry < max_retries and is_transient_error(error_msg):
+            new_retry_count = current_retry + 1
+            countdown = exponential_backoff(new_retry_count)
+            logger.info(
+                f"Transient error for task {task_id}, "
+                f"scheduling retry {new_retry_count}/{max_retries} in {countdown}s"
+            )
+            update_task_retry(db_task, new_retry_count, db)
+            db_task.status = "RETRYING"
+            db.commit()
+
+            redis_client.publish("task_updates", json.dumps({
+                "task_id": task_id,
+                "status": "RETRYING",
+                "progress": 0,
+                "error": f"Retry {new_retry_count}/{max_retries} in {countdown}s: {error_msg}",
+                "retry_count": new_retry_count,
+                "max_retries": max_retries,
+                "error_type": error_type
+            }))
+            return True
+        else:
+            db_task.status = "FAILED"
+            db_task.error = error_msg
+            db_task.traceback = tb
+            db_task.error_type = error_type
+            db.commit()
+
+            redis_client.publish("task_updates", json.dumps({
+                "task_id": task_id,
+                "status": "FAILED",
+                "progress": 0,
+                "error": error_msg,
+                "traceback": tb,
+                "retry_count": current_retry,
+                "max_retries": max_retries,
+                "error_type": error_type
+            }))
+            return False
+    finally:
+        db.close()
+
+
+# Fast task endpoint
+@celery.task(bind=True, name="app.tasks.process_media_fast", max_retries=3)
+def process_media_fast(self, object_name: str, task_type: str = "thumbnail"):
+    logger.info(f"Processing fast task: {task_type} {object_name}")
+    task_id = self.request.id
+    retry_count = self.request.retries
+
+    db = SessionLocal()
+    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not db_task:
+        db_task = Task(task_id=task_id, name=task_type, status="PROCESSING", progress=0,
+                       retry_count=retry_count, max_retries=3)
+        db.add(db_task)
+        db.commit()
+    else:
+        db_task.retry_count = retry_count
+        db_task.status = "PROCESSING"
+        db.commit()
+    db.close()
+
+    try:
+        steps = 4
+        for i in range(1, steps + 1):
+            time.sleep(1.0)
+            percent = int((i / steps) * 100)
+
+            self.update_state(
+                state="PROGRESS",
+                meta={"percent": percent, "status": f"Running fast step {i}/{steps}"}
+            )
+
+            update_payload = {
+                "task_id": task_id,
+                "status": "PROCESSING" if percent < 100 else "COMPLETED",
+                "progress": percent,
+                "error": None
+            }
+            redis_client.publish("task_updates", json.dumps(update_payload))
+
+        db = SessionLocal()
+        db_task = db.query(Task).filter(Task.task_id == task_id).first()
+        if db_task:
+            db_task.status = "PROCESSING" if percent < 100 else "COMPLETED"
+            db_task.progress = percent
+            db.commit()
+        db.close()
+
+        processed_name = f"processed/thumb_{object_name.split('/')[-1]}"
+        simulated_media = b"Simulated thumbnail content bytes."
+        upload_success = upload_object(simulated_media, processed_name, content_type="image/png")
+
+        return {
+            "status": "COMPLETED",
+            "task_id": task_id,
+            "original_object": object_name,
+            "processed_url": generate_url(processed_name) if upload_success else None
+        }
+
+    except Exception as e:
+        logger.error(f"Error executing fast task {task_id}: {e}")
+        should_retry = _handle_task_failure(task_id, e, max_retries=3)
+        if should_retry:
+            raise self.retry(
+                exc=e,
+                countdown=exponential_backoff(self.request.retries + 1)
+            )
+        raise
+
+# Heavy task queue endpoint
 def record_upscaled_asset(db, object_name: str, processed_name: str, processed_url: str, params=None):
     """Create (or update) a MediaAsset for an upscaled output.
 
@@ -48,197 +314,261 @@ def record_upscaled_asset(db, object_name: str, processed_name: str, processed_u
     db.commit()
     return asset
 
+@celery.task(bind=True, name="app.tasks.process_media_heavy", max_retries=3)
+def process_media_heavy(self, object_name: str, task_type: str = "transcode", **upscale_kwargs):
+    logger.info(f"Processing heavy task: {task_type} {object_name}")
+    task_id = self.request.id
+    retry_count = self.request.retries
 
-def parse_duration(file_path: str) -> float:
-    """Get the duration of a media file in seconds using ffprobe."""
     try:
-        cmd = [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", file_path
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        return float(result.stdout.strip())
-    except Exception as e:
-        logger.error(f"Failed to parse duration for {file_path}: {e}")
-        return 0.0
-
-def run_ffmpeg_with_progress(cmd, duration: float, task_id: str, celery_task=None):
-    """Run an FFmpeg command in a subprocess and update progress via Redis/Celery/DB."""
-    logger.info(f"Running FFmpeg command: {' '.join(cmd)}")
-    
-    # regex to match time=HH:MM:SS.MS in ffmpeg output
-    time_regex = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
-    
-    db = SessionLocal()
-    try:
-        # Start subprocess
-        process = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-        )
-        
-        while True:
-            line = process.stdout.readline()
-            if not line:
-                break
-            
-            # Scrape time status
-            match = time_regex.search(line)
-            if match and duration > 0:
-                hours, minutes, seconds, ms = map(int, match.groups())
-                current_time = hours * 3600 + minutes * 60 + seconds + ms / 100.0
-                percent = min(int((current_time / duration) * 100), 99)
-                
-                # Update Celery
-                if celery_task:
-                    celery_task.update_state(
-                        state="PROGRESS",
-                        meta={"percent": percent, "status": f"Processing media: {percent}%"}
-                    )
-                
-                # Publish to Redis Pub/Sub
-                update_payload = {
-                    "task_id": task_id,
-                    "status": "PROCESSING",
-                    "progress": percent,
-                    "error": None
+        # Parse optional upscale controls (forwarded to the Colab diffusion
+        # worker when connected, or applied locally via the CPU fallback).
+        params = None
+        if task_type == "upscale":
+            from app.upscaler import UpscaleParams
+            params = UpscaleParams(
+                denoise=float(upscale_kwargs.get("denoise", 0.35)),
+                controlnet_weight=float(upscale_kwargs.get("controlnet_weight", 0.8)),
+                hdr=float(upscale_kwargs.get("hdr", 0.0)),
+                fractality=float(upscale_kwargs.get("fractality", 0.0)),
+                prompt=upscale_kwargs.get("prompt", "") or "",
+            )
+        is_colab = redis_client.get("colab:connected") == b"true"
+        if is_colab:
+            logger.info(f"Colab worker detected! Offloading heavy task {task_type} {object_name}")
+            task_payload = {
+                "type": "task_dispatch",
+                "task_id": task_id,
+                "task_type": task_type,
+                "parameters": {
+                    "object_name": object_name,
+                    "input_url": generate_url(object_name)
                 }
-                redis_client.publish("task_updates", json.dumps(update_payload))
-                
-                # Update Database
+            }
+
+            if params is not None:
+                task_payload["parameters"].update(params.as_colab_parameters())
+            redis_client.publish("colab_dispatches", json.dumps(task_payload))
+            redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
+            redis_client.expire("colab_pending_tasks_http", 3600)
+
+            result_key = f"colab_task_result:{task_id}"
+            timeout = 120
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                res_data = redis_client.get(result_key)
+                if res_data:
+                    res = json.loads(res_data)
+
+                    db = SessionLocal()
+                    try:
+                        db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                        if res.get("status") == "SUCCESS":
+                            output = res.get("output", {})
+                            processed_url = output.get("url", "")
+                            processed_name = output.get("filename", f"processed_{object_name.split('/')[-1]}")
+
+                            if db_task:
+                                db_task.status = "COMPLETED"
+                                db_task.progress = 100
+                                db.commit()
+
+                            redis_client.publish("task_updates", json.dumps({
+                                "task_id": task_id,
+                                "status": "COMPLETED",
+                                "progress": 100,
+                                "error": None
+                            }))
+
+                            return {
+                                "status": "COMPLETED",
+                                "task_id": task_id,
+                                "original_object": object_name,
+                                "processed_url": processed_url
+                            }
+                        else:
+                            error_msg = res.get("error", "Task failed in Colab")
+                            if db_task:
+                                db_task.status = "FAILED"
+                                db_task.error = error_msg
+                                db.commit()
+
+                            redis_client.publish("task_updates", json.dumps({
+                                "task_id": task_id,
+                                "status": "FAILED",
+                                "progress": 0,
+                                "error": error_msg
+                            }))
+                            raise Exception(error_msg)
+                    finally:
+                        db.close()
+                time.sleep(0.5)
+
+            db = SessionLocal()
+            try:
                 db_task = db.query(Task).filter(Task.task_id == task_id).first()
                 if db_task:
-                    db_task.status = "PROCESSING"
-                    db_task.progress = percent
+                    db_task.status = "FAILED"
+                    db_task.error = "Execution timed out waiting for Colab worker response"
                     db.commit()
-                    
-        process.wait()
-        if process.returncode != 0:
-            raise subprocess.CalledProcessError(process.returncode, cmd)
-            
-    except Exception as e:
-        logger.error(f"FFmpeg process encountered an error: {e}")
-        # Update fail state
-        db_task = db.query(Task).filter(Task.task_id == task_id).first()
-        if db_task:
-            db_task.status = "FAILED"
-            db_task.error = str(e)
-            db.commit()
-            
-        redis_client.publish("task_updates", json.dumps({
-            "task_id": task_id,
-            "status": "FAILED",
-            "progress": 0,
-            "error": str(e)
-        }))
-        raise e
-    finally:
-        db.close()
+            finally:
+                db.close()
 
-# Fast task endpoint
-@celery.task(bind=True, name="app.tasks.process_media_fast")
-def process_media_fast(self, object_name: str, task_type: str = "thumbnail"):
-    logger.info(f"Processing fast task: {task_type} for {object_name}")
+            redis_client.publish("task_updates", json.dumps({
+                "task_id": task_id,
+                "status": "FAILED",
+                "progress": 0,
+                "error": "Colab execution timed out"
+            }))
+            raise TimeoutError("Colab execution timed out")
+        if task_type == "upscale":
+            from app.upscaler import run_upscale_task
+            try:
+                result = run_upscale_task(object_name, params, task_id=task_id)
+                with SessionLocal() as db:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task:
+                        db_task.status = "COMPLETED"
+                        db_task.progress = 100
+                        db.commit()
+                    record_upscaled_asset(db, object_name, result.get("processed_name"), result.get("processed_url"), params)
+                redis_client.publish("task_updates", json.dumps({
+                    "task_id": task_id,
+                    "status": "COMPLETED",
+                    "progress": 100,
+                    "error": None,
+                }))
+                return result
+            except Exception as e:
+                logger.error(f"Error executing local upscale task {task_id}: {e}")
+                with SessionLocal() as db:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task:
+                        db_task.status = "FAILED"
+                        db_task.error = str(e)
+                        db.commit()
+                redis_client.publish("task_updates", json.dumps({
+                    "task_id": task_id,
+                    "status": "FAILED",
+                    "progress": 0,
+                    "error": str(e),
+                }))
+                raise
+        return _original_process_media_heavy(self, object_name, task_type, params)
+    except Exception as e:
+        should_retry = _handle_task_failure(task_id, e, retry_count, 3)
+        if should_retry:
+            countdown = exponential_backoff(retry_count)
+            raise self.retry(countdown=countdown, exc=e)
+        raise
+
+
+def _original_process_media_heavy(self, object_name: str, task_type: str = "transcode", params=None):
+    logger.info(f"Processing heavy task: {task_type} {object_name}")
     task_id = self.request.id
-    
+
+    temp_in = scratchpad.get_temp_path(suffix="_in.mp4")
+    temp_out = scratchpad.get_temp_path(suffix="_out.mp4")
+
     db = SessionLocal()
-    # Ensure task entry exists in DB
     db_task = db.query(Task).filter(Task.task_id == task_id).first()
     if not db_task:
         db_task = Task(task_id=task_id, name=task_type, status="PROCESSING", progress=0)
         db.add(db_task)
         db.commit()
     db.close()
-    
-    # Simulate processing or run actual transcoding
-    # For now, let's simulate step progress and publish updates
-    steps = 4
-    for i in range(1, steps + 1):
-        time.sleep(1.0)
-        percent = int((i / steps) * 100)
-        
-        self.update_state(
-            state="PROGRESS",
-            meta={"percent": percent, "status": f"Running fast step {i}/{steps}"}
-        )
-        
-        update_payload = {
-            "task_id": task_id,
-            "status": "PROCESSING" if percent < 100 else "COMPLETED",
-            "progress": percent,
-            "error": None
-        }
-        redis_client.publish("task_updates", json.dumps(update_payload))
-        
+
+    from app.storage import s3_client
+    try:
+        s3_client.download_file(settings.MINIO_BUCKET_NAME, object_name, str(temp_in))
+
+        duration = parse_duration(str(temp_in))
+        if duration == 0.0:
+            duration = 10.0
+
+        cmd = ["ffmpeg", "-y", "-i", str(temp_in), "-vcodec", "libx264", "-acodec", "aac", str(temp_out)]
+        run_ffmpeg_with_progress(cmd, duration, task_id, celery_task=self)
+
+        processed_name = f"processed/{object_name.split('/')[-1]}"
+        with open(str(temp_out), "rb") as f:
+            upload_success = upload_object(f.read(), processed_name, content_type="video/mp4")
+
         db = SessionLocal()
         db_task = db.query(Task).filter(Task.task_id == task_id).first()
         if db_task:
-            db_task.status = "PROCESSING" if percent < 100 else "COMPLETED"
-            db_task.progress = percent
+            db_task.status = "COMPLETED"
+            db_task.progress = 100
             db.commit()
         db.close()
 
-    # Upload cleanups/processed URLs
-    processed_name = f"processed/thumb_{object_name.split('/')[-1]}"
-    simulated_media = b"Simulated thumbnail content bytes."
-    upload_success = upload_object(simulated_media, processed_name, content_type="image/jpeg")
+        redis_client.publish("task_updates", json.dumps({
+            "task_id": task_id,
+            "status": "COMPLETED",
+            "progress": 100,
+            "error": None
+        }))
+
+        return {
+            "status": "COMPLETED",
+            "task_id": task_id,
+            "original_object": object_name,
+            "processed_url": generate_url(processed_name) if upload_success else None
+        }
+
+    except Exception as e:
+        logger.error(f"Error executing heavy task {task_id}: {e}")
+        should_retry = _handle_task_failure(task_id, e, max_retries=3)
+        if should_retry:
+            raise self.retry(
+                exc=e,
+                countdown=exponential_backoff(self.request.retries + 1)
+            )
+        raise
+    finally:
+        scratchpad.remove_path(temp_in)
+        scratchpad.remove_path(temp_out)
+
+
+# Backward compatibility
+@celery.task(bind=True)
+def process_multimedia_task(self, object_name: str, task_type: str = "transcode", **upscale_kwargs):
+    if task_type in ["thumbnail", "waveform"]:
+        return process_media_fast(object_name, task_type)
+    else:
+        return process_media_heavy(object_name, task_type, **upscale_kwargs)
+
+
+@celery.task(bind=True, name="app.tasks.process_upscale_task")
+def process_upscale_task(self, task_id: str, object_name: str, params: dict):
+    logger.info(f"Starting upscale task: {task_id} for {object_name} with params {params}")
     
-    return {
-        "status": "COMPLETED",
-        "task_id": task_id,
-        "original_object": object_name,
-        "processed_url": generate_url(processed_name) if upload_success else ""
-    }
-
-# Heavy task queue endpoint
-@celery.task(bind=True, name="app.tasks.process_media_heavy")
-def process_media_heavy(self, object_name: str, task_type: str = "transcode", **upscale_kwargs):
-    logger.info(f"Processing heavy task: {task_type} {object_name}")
-    task_id = self.request.id
-
-    # Parse optional upscale controls (forwarded to the Colab diffusion
-    # worker when connected, or applied locally via the CPU fallback).
-    from app.upscaler import UpscaleParams
-    params = UpscaleParams(
-        denoise=float(upscale_kwargs.get("denoise", 0.35)),
-        controlnet_weight=float(upscale_kwargs.get("controlnet_weight", 0.8)),
-        hdr=float(upscale_kwargs.get("hdr", 0.0)),
-        fractality=float(upscale_kwargs.get("fractality", 0.0)),
-        prompt=upscale_kwargs.get("prompt", "") or "",
-    )
-
     # Check Colab availability
     is_colab = redis_client.get("colab:connected") == b"true"
     if is_colab:
-        logger.info(f"Colab worker detected! Offloading heavy task {task_type} for {object_name}")
-        # Dispatch to Colab — include the upscale controls so the notebook's
-        # diffusion pipeline can apply them (denoise, ControlNet weight,
-        # prompt, HDR/Fractality params and the guidance bump).
-        colab_params = {
-            "object_name": object_name,
-            "input_url": generate_url(object_name),
-        }
-        if task_type == "upscale":
-            colab_params.update(params.as_colab_parameters())
+        logger.info(f"Colab worker detected! Offloading upscale task {task_id}")
         task_payload = {
             "type": "task_dispatch",
             "task_id": task_id,
-            "task_type": task_type,
-            "parameters": colab_params
+            "task_type": "upscale",
+            "parameters": {
+                "object_name": object_name,
+                "input_url": generate_url(object_name),
+                **params
+            }
         }
         redis_client.publish("colab_dispatches", json.dumps(task_payload))
         redis_client.rpush("colab_pending_tasks_http", json.dumps(task_payload))
         redis_client.expire("colab_pending_tasks_http", 3600)
         
-        # Wait for result on Redis
+        # Wait for result in Redis
         result_key = f"colab_task_result:{task_id}"
-        timeout = 120
+        timeout = 180
         start_time = time.time()
         while time.time() - start_time < timeout:
             res_data = redis_client.get(result_key)
             if res_data:
                 res = json.loads(res_data)
                 
-                # Check status
                 db = SessionLocal()
                 try:
                     db_task = db.query(Task).filter(Task.task_id == task_id).first()
@@ -250,7 +580,7 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
                         if db_task:
                             db_task.status = "COMPLETED"
                             db_task.progress = 100
-                            db.commit()
+                        db.commit()
                         
                         redis_client.publish("task_updates", json.dumps({
                             "task_id": task_id,
@@ -258,14 +588,17 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
                             "progress": 100,
                             "error": None
                         }))
-
-                        # Persist the source→output relation so the catalog
-                        # can pair the original with its upscaled result (#58).
-                        if task_type == "upscale":
-                            record_upscaled_asset(
-                                db, object_name, processed_name, processed_url, params
-                            )
-
+                        
+                        # Create MediaAsset record
+                        asset = MediaAsset(
+                            title=f"Upscaled: {object_name.split('/')[-1]}",
+                            file_path=processed_name,
+                            file_size=0,
+                            content_type="image/png"
+                        )
+                        db.add(asset)
+                        db.commit()
+                        
                         return {
                             "status": "COMPLETED",
                             "task_id": task_id,
@@ -277,7 +610,7 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
                         if db_task:
                             db_task.status = "FAILED"
                             db_task.error = error_msg
-                            db.commit()
+                        db.commit()
                         
                         redis_client.publish("task_updates", json.dumps({
                             "task_id": task_id,
@@ -297,7 +630,7 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
             if db_task:
                 db_task.status = "FAILED"
                 db_task.error = "Execution timed out waiting for Colab worker response"
-                db.commit()
+            db.commit()
         finally:
             db.close()
             
@@ -308,79 +641,18 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
             "error": "Colab execution timed out"
         }))
         raise TimeoutError("Colab execution timed out")
-
-    # Upscale runs through the local CPU fallback pipeline when no Colab
-    # worker is available (tile-based upscale + HDR/Fractality post-processing).
-    if task_type == "upscale":
-        from app.upscaler import run_upscale_task
-        try:
-            result = run_upscale_task(object_name, params, task_id=task_id)
-
-            db = SessionLocal()
-            try:
-                db_task = db.query(Task).filter(Task.task_id == task_id).first()
-                if not db_task:
-                    db_task = Task(task_id=task_id, name=task_type, status="PROCESSING", progress=0)
-                    db.add(db_task)
-                    db.commit()
-                db_task = db.query(Task).filter(Task.task_id == task_id).first()
-                if db_task:
-                    db_task.status = "COMPLETED"
-                    db_task.progress = 100
-                    db.commit()
-                # Persist the source→output relation (#58).
-                record_upscaled_asset(
-                    db,
-                    object_name,
-                    result.get("processed_name", ""),
-                    result.get("processed_url", ""),
-                    params,
-                )
-            finally:
-                db.close()
-
-            redis_client.publish("task_updates", json.dumps({
-                "task_id": task_id,
-                "status": "COMPLETED",
-                "progress": 100,
-                "error": None
-            }))
-            return result
-        except Exception as e:
-            logger.error(f"Error executing local upscale task {task_id}: {e}")
-            db = SessionLocal()
-            try:
-                db_task = db.query(Task).filter(Task.task_id == task_id).first()
-                if db_task:
-                    db_task.status = "FAILED"
-                    db_task.error = str(e)
-                    db.commit()
-            finally:
-                db.close()
-
-            redis_client.publish("task_updates", json.dumps({
-                "task_id": task_id,
-                "status": "FAILED",
-                "progress": 0,
-                "error": str(e)
-            }))
-            raise e
-
-    return _original_process_media_heavy(self, object_name, task_type, params)
-
-def _original_process_media_heavy(self, object_name: str, task_type: str = "transcode", params=None):
-    logger.info(f"Processing heavy task: {task_type} for {object_name}")
-    task_id = self.request.id
+        
+    # Local fallback processing
+    from PIL import Image
+    from app.scratchpad import scratchpad
     
-    # We simulate download file, process with FFmpeg, upload back
-    # Retrieve file from S3 to temporary scratchpad path
-    temp_in = scratchpad.get_temp_path(suffix="_in.mp4")
-    temp_out = scratchpad.get_temp_path(suffix="_out.mp4")
+    temp_in = scratchpad.get_temp_path(suffix="_in.png")
+    temp_out = scratchpad.get_temp_path(suffix="_out.png")
     
     db = SessionLocal()
     db_task = db.query(Task).filter(Task.task_id == task_id).first()
     if not db_task:
-        db_task = Task(task_id=task_id, name=task_type, status="PROCESSING", progress=0)
+        db_task = Task(task_id=task_id, name="upscale", status="PROCESSING", progress=0)
         db.add(db_task)
         db.commit()
     db.close()
@@ -390,29 +662,89 @@ def _original_process_media_heavy(self, object_name: str, task_type: str = "tran
         # Download S3 object locally
         s3_client.download_file(settings.MINIO_BUCKET_NAME, object_name, str(temp_in))
         
-        # Parse duration
-        duration = parse_duration(str(temp_in))
-        if duration == 0.0:
-            duration = 10.0 # fallback
-            
-        # Run ffmpeg to transcode video
-        cmd = ["ffmpeg", "-y", "-i", str(temp_in), "-vcodec", "libx264", "-acodec", "aac", str(temp_out)]
-        run_ffmpeg_with_progress(cmd, duration, task_id, celery_task=self)
+        # Open source image
+        img = Image.open(str(temp_in))
         
-        # Upload output from temp path
-        processed_name = f"processed/{object_name.split('/')[-1]}"
+        # Crop for preview mode if needed
+        if params.get("preview", False):
+            w, h = img.size
+            cw, ch = min(252, w), min(252, h)
+            left = (w - cw) // 2
+            top = (h - ch) // 2
+            img = img.crop((left, top, left + cw, top + ch))
+            
+        # Progress callback setup
+        def progress_callback(percent, msg):
+            self.update_state(state="PROGRESS", meta={"percent": percent, "status": msg})
+            db = SessionLocal()
+            try:
+                db_t = db.query(Task).filter(Task.task_id == task_id).first()
+                if db_t:
+                    db_t.progress = percent
+                db.commit()
+            finally:
+                db.close()
+                
+            redis_client.publish("task_updates", json.dumps({
+                "task_id": task_id,
+                "status": "PROCESSING",
+                "progress": percent,
+                "error": None
+            }))
+            
+        # Resolve tile size
+        width, height = img.size
+        tile_size = calculate_tile_size(width, height, 16.0)
+        
+        # Execute upscaler engine with OOM protection
+        while True:
+            try:
+                upscaler = TileUpscaler(tile_size=tile_size, overlap=0.25)
+                # We scale by 2.0x default
+                upscaled_img = upscaler.upscale(
+                    img,
+                    upscale_factor=2.0,
+                    progress_callback=progress_callback,
+                    **params
+                )
+                break
+            except Exception as e:
+                is_oom = "out of memory" in str(e).lower() or "oom" in str(e).lower()
+                if is_oom and tile_size > 256:
+                    logger.warning(f"OOM error: reducing tile size from {tile_size} to {tile_size - 256} and retrying")
+                    tile_size = max(256, tile_size - 256)
+                else:
+                    raise e
+                    
+        # Save output image
+        upscaled_img.save(str(temp_out))
+        
+        # Upload scale result back
+        processed_name = f"processed/scaled_{int(time.time())}_{object_name.split('/')[-1]}"
         with open(str(temp_out), "rb") as f:
-            upload_success = upload_object(f.read(), processed_name, content_type="video/mp4")
+            upload_success = upload_object(f.read(), processed_name, content_type="image/png")
             
         # Final success update
         db = SessionLocal()
-        db_task = db.query(Task).filter(Task.task_id == task_id).first()
-        if db_task:
-            db_task.status = "COMPLETED"
-            db_task.progress = 100
+        try:
+            db_t = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_t:
+                db_t.status = "COMPLETED"
+                db_t.progress = 100
             db.commit()
-        db.close()
-        
+            
+            # Create MediaAsset record
+            asset = MediaAsset(
+                title=f"Upscaled: {object_name.split('/')[-1]}",
+                file_path=processed_name,
+                file_size=os.path.getsize(str(temp_out)),
+                content_type="image/png"
+            )
+            db.add(asset)
+            db.commit()
+        finally:
+            db.close()
+            
         redis_client.publish("task_updates", json.dumps({
             "task_id": task_id,
             "status": "COMPLETED",
@@ -424,19 +756,20 @@ def _original_process_media_heavy(self, object_name: str, task_type: str = "tran
             "status": "COMPLETED",
             "task_id": task_id,
             "original_object": object_name,
-            "processed_url": generate_url(processed_name) if upload_success else ""
+            "processed_url": generate_url(processed_name) if upload_success else None
         }
-        
     except Exception as e:
-        logger.error(f"Error executing heavy task {task_id}: {e}")
+        logger.error(f"Error executing upscale task {task_id}: {e}")
         db = SessionLocal()
-        db_task = db.query(Task).filter(Task.task_id == task_id).first()
-        if db_task:
-            db_task.status = "FAILED"
-            db_task.error = str(e)
+        try:
+            db_t = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_t:
+                db_t.status = "FAILED"
+                db_t.error = str(e)
             db.commit()
-        db.close()
-        
+        finally:
+            db.close()
+            
         redis_client.publish("task_updates", json.dumps({
             "task_id": task_id,
             "status": "FAILED",
@@ -445,15 +778,267 @@ def _original_process_media_heavy(self, object_name: str, task_type: str = "tran
         }))
         raise e
     finally:
-        # Clean scratchpad paths
         scratchpad.remove_path(temp_in)
         scratchpad.remove_path(temp_out)
 
+class CLIPEmbedder:
+    _model = None
+    _processor = None
+    
+    @classmethod
+    def get_model_and_processor(cls):
+        if cls._model is None or cls._processor is None:
+            import torch
+            from transformers import CLIPModel, CLIPProcessor
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"Loading CLIP model onto {device}...")
+            cls._model = CLIPModel.from_pretrained('openai/clip-vit-base-patch32').to(device)
+            cls._processor = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch32')
+        return cls._model, cls._processor
+
+    @classmethod
+    def embed_text(cls, text: str) -> list[float]:
+        import torch
+        model, processor = cls.get_model_and_processor()
+        device = next(model.parameters()).device
+        inputs = processor(text=[text], return_tensors='pt', padding=True, truncation=True)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model.get_text_features(**inputs)
+            feats = outputs.pooler_output
+            feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+            emb = feats[0].tolist()
+        return cls.pad_embedding(emb)
+
+    @classmethod
+    def embed_image(cls, image_bytes: bytes) -> list[float]:
+        import torch
+        from PIL import Image
+        import io
+        model, processor = cls.get_model_and_processor()
+        device = next(model.parameters()).device
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        inputs = processor(images=img, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model.get_image_features(**inputs)
+            feats = outputs.pooler_output
+            feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
+            emb = feats[0].tolist()
+        return cls.pad_embedding(emb)
+
+    @classmethod
+    def pad_embedding(cls, emb: list[float], target_dim: int = 1536) -> list[float]:
+        if len(emb) < target_dim:
+            emb = emb + [0.0] * (target_dim - len(emb))
+        return emb[:target_dim]
+
+
+@celery.task(bind=True, name="app.tasks.generate_media_embedding")
+def generate_media_embedding(self, asset_id: int):
+    logger.info(f"Generating embedding for MediaAsset id: {asset_id}")
+    db = SessionLocal()
+    try:
+        asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
+        if not asset:
+            logger.error(f"MediaAsset {asset_id} not found")
+            return
+        
+        is_image = False
+        if asset.content_type and asset.content_type.startswith("image/"):
+            is_image = True
+        
+        if is_image:
+            try:
+                from app.storage import s3_client
+                response = s3_client.get_object(Bucket=settings.MINIO_BUCKET_NAME, Key=asset.file_path)
+                file_bytes = response['Body'].read()
+                embedding = CLIPEmbedder.embed_image(file_bytes)
+            except Exception as e:
+                logger.error(f"Failed to generate image embedding for {asset.file_path}: {e}. Falling back to text embedding of title.")
+                is_image = False
+        
+        if not is_image:
+            clean_title = asset.title
+            if '.' in clean_title:
+                clean_title = clean_title.rsplit('.', 1)[0]
+            clean_title = clean_title.replace('_', ' ').replace('-', ' ').strip()
+            embedding = CLIPEmbedder.embed_text(clean_title)
+        
+        asset.embedding = embedding
+        db.commit()
+        logger.info(f"Successfully stored embedding for MediaAsset {asset_id}")
+    except Exception as e:
+        logger.error(f"Error generating embedding for asset {asset_id}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    print("Starting manual backfill of missing embeddings...")
+    db = SessionLocal()
+    try:
+        assets = db.query(MediaAsset).filter(MediaAsset.embedding == None).all()
+        print(f"Found {len(assets)} media assets with missing embeddings.")
+        for asset in assets:
+            print(f"Processing asset {asset.id}: {asset.title} ({asset.content_type})...")
+            try:
+                is_image = False
+                if asset.content_type and asset.content_type.startswith("image/"):
+                    is_image = True
+                
+                if is_image:
+                    try:
+                        from app.storage import s3_client
+                        response = s3_client.get_object(Bucket=settings.MINIO_BUCKET_NAME, Key=asset.file_path)
+                        file_bytes = response['Body'].read()
+                        embedding = CLIPEmbedder.embed_image(file_bytes)
+                    except Exception as e:
+                        print(f"failed image embedding for {asset.file_path}: {e}, falling back to title text")
+                        is_image = False
+                
+                if not is_image:
+                    clean_title = asset.title
+                    if '.' in clean_title:
+                        clean_title = clean_title.rsplit('.', 1)[0]
+                    clean_title = clean_title.replace('_', ' ').replace('-', ' ').strip()
+                    embedding = CLIPEmbedder.embed_text(clean_title)
+                
+                asset.embedding = embedding
+                db.commit()
+                print(f"Generated embedding for asset {asset.id}.")
+            except Exception as inner_e:
+                print(f"Error processing asset {asset.id}: {inner_e}")
+                db.rollback()
+        print("Backfill complete.")
+    finally:
+        db.close()
+
+
 # For backward compatibility
 @celery.task(bind=True)
-def process_multimedia_task(self, object_name: str, task_type: str = "transcode", **upscale_kwargs):
+def process_multimedia_task(self, object_name: str, task_type: str = "transcode"):
     # Forward to fast or heavy queue depending on task type
     if task_type in ["thumbnail", "waveform"]:
         return process_media_fast(object_name, task_type)
     else:
-        return process_media_heavy(object_name, task_type, **upscale_kwargs)
+        return process_media_heavy(object_name, task_type)
+
+
+
+@celery.task(bind=True, name="app.tasks.export_batch_zip")
+def export_batch_zip(self, paths, export_format="original"):
+    """Zip the requested storage objects into a single archive and return its URL.
+
+    Optional per-file format conversion is attempted (video -> mp4 via ffmpeg,
+    image -> webp via Pillow). Any conversion failure falls back to the original
+    bytes so the batch export always completes.
+    """
+    import io as _io
+    import zipfile
+
+    from app.storage import get_object_stream
+
+    task_id = self.request.id
+    total = len(paths)
+    logger.info(f"Batch export task {task_id} started for {total} object(s), format={export_format}")
+
+    def _update_progress(percent, status_text, db_status):
+        self.update_state(
+            state="PROGRESS",
+            meta={"percent": percent, "status": status_text},
+        )
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = db_status
+                db_task.progress = percent
+                db.commit()
+        finally:
+            db.close()
+        redis_client.publish(
+            "task_updates",
+            json.dumps({"task_id": task_id, "status": db_status, "progress": percent}),
+        )
+
+    def _fetch_bytes(object_name):
+        return b"".join(get_object_stream(object_name))
+
+    def _convert_bytes(raw, filename, target_format):
+        """Attempt in-memory conversion; returns (converted, arc_name) or raises."""
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if target_format == "video-mp4" and ext in ("mp4", "mov", "webm", "mkv", "avi", "ogg", "m4v"):
+            import subprocess
+            import tempfile
+            with tempfile.TemporaryDirectory() as tmp:
+                src = f"{tmp}/input.{ext}"
+                dst = f"{tmp}/output.mp4"
+                with open(src, "wb") as fh:
+                    fh.write(raw)
+                cmd = ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-preset", "fast", "-c:a", "aac", dst]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr[-500:])
+                with open(dst, "rb") as fh:
+                    converted = fh.read()
+                return converted, filename.rsplit(".", 1)[0] + ".mp4"
+        elif target_format == "image-webp" and ext in ("png", "jpg", "jpeg", "gif", "bmp", "webp"):
+            try:
+                from PIL import Image
+            except ImportError:
+                raise RuntimeError("Pillow not installed")
+            import io as _img_io
+            img = Image.open(_img_io.BytesIO(raw))
+            buf = _img_io.BytesIO()
+            img.save(buf, format="WEBP", quality=85)
+            return buf.getvalue(), filename.rsplit(".", 1)[0] + ".webp"
+        raise RuntimeError("unsupported conversion target")
+
+    zip_buffer = _io.BytesIO()
+    processed = 0
+    try:
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for idx, object_name in enumerate(paths, start=1):
+                percent = int((idx / total) * 100)
+                _update_progress(percent, f"Zipping {idx}/{total}: {object_name}", "PROCESSING")
+                arc_name = object_name.split("/")[-1] or "file.bin"
+                raw = _fetch_bytes(object_name)
+                if export_format and export_format != "original":
+                    try:
+                        raw, arc_name = _convert_bytes(raw, arc_name, export_format)
+                    except Exception as conv_err:
+                        logger.warning(f"Conversion failed for {object_name}: {conv_err}; using original")
+                if raw:
+                    zf.writestr(arc_name, raw)
+                    processed += 1
+
+        zip_bytes = zip_buffer.getvalue()
+        export_key = f"exports/batch_{task_id}.zip"
+        upload_object(zip_bytes, export_key, content_type="application/zip")
+        result = {
+            "url": generate_url(export_key),
+            "filename": f"batch_{task_id}.zip",
+            "count": processed,
+        }
+        self.update_state(state="SUCCESS", meta=result)
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = "COMPLETED"
+                db_task.progress = 100
+                db.commit()
+        finally:
+            db.close()
+        redis_client.publish(
+            "task_updates",
+            json.dumps({"task_id": task_id, "status": "COMPLETED", "progress": 100}),
+        )
+        logger.info(f"Batch export task {task_id} finished: {processed} file(s) -> {export_key}")
+        return result
+    except Exception as e:
+        logger.error(f"Batch export task {task_id} failed: {e}")
+        self.update_state(state="FAILURE", meta={"error": str(e)})
+        raise

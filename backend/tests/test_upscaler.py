@@ -112,3 +112,4 @@ class TestRunUpscaleTask:
     def test_missing_source_raises(self, stub_storage):
         with pytest.raises(RuntimeError, match="Failed to download"):
             run_upscale_task("nope.png", UpscaleParams(), task_id="t-2")
+

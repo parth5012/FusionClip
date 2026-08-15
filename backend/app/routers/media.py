@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["media"])
 
 
-def _serialize_asset(asset: MediaAsset, upscaled_children: list = None) -> dict:
+def _serialize_asset(asset: MediaAsset, upscaled_children: list = None, score: float = None) -> dict:
     return {
         "id": asset.id,
         "title": asset.title,
@@ -38,6 +38,9 @@ def _serialize_asset(asset: MediaAsset, upscaled_children: list = None) -> dict:
         ],
         "created_at": asset.created_at.isoformat() if asset.created_at else None,
     }
+    if score is not None:
+        res["score"] = score
+    return res
 
 
 def _serialize_catalog(db, assets) -> list:
@@ -64,25 +67,65 @@ def list_media(db: Session = Depends(get_db)):
 def search_media(
     query: str = Query(...),
     limit: int = Query(10),
+    threshold: float = Query(0.2, description="Minimum relevance score threshold"),
     db: Session = Depends(get_db),
 ):
     # Vector semantic search with fallback to standard text search
     try:
-        import hashlib
+        from app.tasks import CLIPEmbedder
+        query_embedding = CLIPEmbedder.embed_text(query)
 
-        hasher = hashlib.sha256(query.encode())
-        seed_val = int(hasher.hexdigest(), 16) % (10**8)
-        import random
-
-        random.seed(seed_val)
-        query_embedding = [random.uniform(-1, 1) for _ in range(1536)]
-
-        assets = (
-            db.query(MediaAsset)
-            .order_by(MediaAsset.embedding.l2_distance(query_embedding))
-            .limit(limit)
+        cosine_dist = MediaAsset.embedding.cosine_distance(query_embedding)
+        vector_results = (
+            db.query(MediaAsset, cosine_dist.label("dist"))
+            .filter(MediaAsset.embedding != None)
+            .order_by(cosine_dist)
+            .limit(limit * 2)
             .all()
         )
+
+        text_matches = (
+            db.query(MediaAsset)
+            .filter(MediaAsset.title.ilike(f"%{query}%"))
+            .limit(limit * 2)
+            .all()
+        )
+
+        candidates = {}
+        for asset, dist in vector_results:
+            sim = 1.0 - float(dist)
+            candidates[asset.id] = {
+                "asset": asset,
+                "semantic_score": sim,
+                "text_score": 0.0
+            }
+
+        for asset in text_matches:
+            if asset.id not in candidates:
+                sim = 0.0
+                if asset.embedding is not None:
+                    sim = 0.5
+                candidates[asset.id] = {
+                    "asset": asset,
+                    "semantic_score": sim,
+                    "text_score": 1.0
+                }
+            else:
+                candidates[asset.id]["text_score"] = 1.0
+
+        hybrid_results = []
+        for info in candidates.values():
+            score = 0.7 * info["semantic_score"] + 0.3 * info["text_score"]
+            hybrid_results.append((info["asset"], score))
+
+        filtered_results = [
+            (asset, score) for asset, score in hybrid_results
+            if score >= threshold
+        ]
+        filtered_results.sort(key=lambda x: x[1], reverse=True)
+        
+        return [_serialize_asset(asset, score=score) for asset, score in filtered_results[:limit]]
+
     except Exception as db_err:
         logger.warning(f"Vector search failed, falling back to text search: {db_err}")
         db.rollback()
@@ -94,3 +137,4 @@ def search_media(
         )
 
     return _serialize_catalog(db, assets)
+

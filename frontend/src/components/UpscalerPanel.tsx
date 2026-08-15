@@ -386,6 +386,7 @@ export default function UpscalerPanel() {
           onClose={() => setShowCompare(false)}
         />
       )}
+
     </div>
   );
 }

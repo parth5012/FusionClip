@@ -310,16 +310,24 @@ class TestGenerateRouter:
         # Verify non-empty output + correct status only.
         assert body["output"]
 
-    def test_generate_audio_no_longer_raises_nameerror(self, client, stub_storage, db_session):
+    def test_generate_audio_no_longer_raises_nameerror(self, client, stub_storage, db_session, monkeypatch):
         """Regression: `time` was never imported in the old main.py (NameError)."""
+        # Mock TTS pipeline to avoid downloading models in tests
+        class MockTTS:
+            def tts(self, **kwargs):
+                import numpy as np
+                return (22050, np.zeros(22050, dtype=np.float32))
+        monkeypatch.setattr("app.routers.generate.load_xtts_pipeline", lambda: MockTTS())
+        monkeypatch.setattr("app.routers.generate.load_chattts_pipeline", lambda: MockTTS())
+
         res = client.post("/api/generate/audio?prompt=Smoke+test+voice&type=tts")
         assert res.status_code == 200
         body = res.json()
-        assert set(body) == {"status", "type", "filename", "url"}
+        assert set(body) == {"status", "type", "filename", "url", "colab"}
         assert body["status"] == "COMPLETED"
         assert body["type"] == "tts"
         assert body["filename"].startswith("gen_audio_")
-        assert body["filename"].endswith(".mp3")
+        assert body["filename"].endswith(".wav")
         assert body["url"]
         assert body["filename"] in stub_storage["uploaded"]
 
@@ -328,15 +336,27 @@ class TestGenerateRouter:
             .filter(MediaAsset.file_path == body["filename"])
             .one()
         )
-        assert asset.content_type == "audio/mpeg"
+        assert asset.content_type == "audio/wav"
 
-    def test_generate_image_no_longer_raises_nameerror(self, client, stub_storage, db_session):
+    def test_generate_image_no_longer_raises_nameerror(self, client, stub_storage, db_session, monkeypatch):
+        # Mock pipeline to avoid downloading models in tests
+        class MockPipeline:
+            def __call__(self, **kwargs):
+                from PIL import Image
+                img = Image.new("RGB", (64, 64), color="red")
+                class Result:
+                    images = [img]
+                return Result()
+        monkeypatch.setattr("app.routers.generate.load_flux_pipeline", lambda: MockPipeline())
+        monkeypatch.setattr("app.routers.generate.load_sdxl_pipeline", lambda: MockPipeline())
+
         res = client.post("/api/generate/image?prompt=Smoke+test+art&steps=10&scale=7.0")
         assert res.status_code == 200
         body = res.json()
-        assert set(body) == {"status", "parameters", "filename", "url"}
+        assert set(body) == {"status", "parameters", "filename", "url", "colab"}
         assert body["status"] == "COMPLETED"
-        assert body["parameters"] == {"steps": 10, "scale": 7.0}
+        assert body["parameters"]["steps"] == 10
+        assert body["parameters"]["scale"] == 7.0
         assert body["filename"].startswith("gen_image_")
         assert body["filename"].endswith(".png")
         assert body["filename"] in stub_storage["uploaded"]
@@ -348,9 +368,20 @@ class TestGenerateRouter:
         )
         assert asset.content_type == "image/png"
 
-    def test_generate_image_defaults(self, client, stub_storage):
+    def test_generate_image_defaults(self, client, stub_storage, monkeypatch):
+        class MockPipeline:
+            def __call__(self, **kwargs):
+                from PIL import Image
+                img = Image.new("RGB", (64, 64), color="red")
+                class Result:
+                    images = [img]
+                return Result()
+        monkeypatch.setattr("app.routers.generate.load_flux_pipeline", lambda: MockPipeline())
+        monkeypatch.setattr("app.routers.generate.load_sdxl_pipeline", lambda: MockPipeline())
+
         body = client.post("/api/generate/image?prompt=Defaults").json()
-        assert body["parameters"] == {"steps": 28, "scale": 7.5}
+        assert body["parameters"]["steps"] == 28
+        assert body["parameters"]["scale"] == 7.5
 
 
 class TestMediaRouter:
@@ -408,7 +439,7 @@ class TestMediaRouter:
         assert res.status_code == 200
         body = res.json()
         assert len(body) == 1
-        assert set(body[0]) == self.ASSET_KEYS
+        assert self.ASSET_KEYS.issubset(set(body[0]))
         assert body[0]["title"] == "Sunset timelapse"
 
     def test_search_falls_back_when_vector_search_unavailable(
@@ -462,6 +493,48 @@ class TestMediaRouter:
         assert upscaled_item is not None
         assert upscaled_item["source_path"] == "originals/portrait.png"
         assert upscaled_item["source_url"].startswith("http://test-minio/")
+
+    def test_clip_embedding_generation_and_task(self, db_session, monkeypatch):
+        from app.tasks import CLIPEmbedder, generate_media_embedding
+        asset = MediaAsset(
+            title="A photo of a dog in a park.jpg",
+            file_path="photos/dog.jpg",
+            file_size=1024,
+            content_type="image/jpeg",
+            duration=0.0
+        )
+        db_session.add(asset)
+        db_session.commit()
+        asset_id = asset.id
+
+        mock_embedding = [0.1] * 512
+        monkeypatch.setattr(CLIPEmbedder, "embed_image", lambda x: CLIPEmbedder.pad_embedding(mock_embedding))
+        monkeypatch.setattr(CLIPEmbedder, "embed_text", lambda x: CLIPEmbedder.pad_embedding(mock_embedding))
+
+        generate_media_embedding(asset_id)
+        
+        db_asset = db_session.query(MediaAsset).filter(MediaAsset.id == asset_id).one()
+        assert db_asset.embedding is not None
+        assert len(db_asset.embedding) == 1536
+        assert db_asset.embedding[0] == 0.1
+        assert db_asset.embedding[512] == 0.0
+
+    def test_search_score_and_threshold(self, client, db_session):
+        self._seed(db_session)
+        
+        # Test default search has score 1.0 in fallback
+        res = client.get("/api/media/search?query=Sunset&threshold=0.5")
+        assert res.status_code == 200
+        body = res.json()
+        assert len(body) == 1
+        assert body[0]["title"] == "Sunset timelapse"
+        assert body[0]["score"] == 1.0
+        
+        # Test search with query of sunset and a high threshold (e.g. 1.5) filters out the item
+        res_filtered = client.get("/api/media/search?query=Sunset&threshold=1.5")
+        assert res_filtered.status_code == 200
+        assert len(res_filtered.json()) == 0
+
 
 
 class TestDependencyOverride:
