@@ -120,6 +120,7 @@ export interface UpscaleParams {
   hdr?: number; // HDR post-pass strength
   fractality?: number; // Fractality noise + guidance bump
   prompt?: string; // optional img2img positive prompt
+  temporal_strength?: number; // video_upscale: motion-aware temporal blend 0..1 (0 = off)
 }
 
 export async function startTask(
@@ -134,6 +135,7 @@ export async function startTask(
     if (upscaleParams.hdr !== undefined) url += `&hdr=${encodeURIComponent(upscaleParams.hdr)}`;
     if (upscaleParams.fractality !== undefined) url += `&fractality=${encodeURIComponent(upscaleParams.fractality)}`;
     if (upscaleParams.prompt) url += `&prompt=${encodeURIComponent(upscaleParams.prompt)}`;
+    if (upscaleParams.temporal_strength !== undefined) url += `&temporal_strength=${encodeURIComponent(upscaleParams.temporal_strength)}`;
   }
   const res = await fetch(url, {
     method: 'POST',

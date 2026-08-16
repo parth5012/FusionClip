@@ -455,7 +455,14 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
                 raise
         if task_type == "video_upscale":
             try:
-                result = run_video_upscale_task(object_name, params, task_id=task_id, celery_task=self)
+                # Temporal blend is nearly free (one weighted average per
+                # frame) so it is the default; pass temporal_strength=0 to
+                # disable it (#65).
+                temporal_strength = float(upscale_kwargs.get("temporal_strength", 0.25))
+                result = run_video_upscale_task(
+                    object_name, params, task_id=task_id, celery_task=self,
+                    temporal_strength=temporal_strength,
+                )
                 with SessionLocal() as db:
                     db_task = db.query(Task).filter(Task.task_id == task_id).first()
                     if db_task:
@@ -523,6 +530,7 @@ def run_video_upscale_task(
     params,
     task_id: str,
     scale: float = 4.0,
+    temporal_strength: float = 0.0,
     celery_task=None,
 ) -> dict:
     """Run the local CPU frame-by-frame video upscale fallback (map #62 MVV).
@@ -533,6 +541,9 @@ def run_video_upscale_task(
     audio pass-through when the source codec is MP4-safe), uploads the result
     to ``processed/video_upscaled_<stem>.mp4`` and returns the result dict.
     Used when no Colab worker is connected.
+
+    When ``temporal_strength`` > 0 a motion-aware temporal blend pass (#65) is
+    applied per frame to reduce upscale flicker between frames.
     """
     from app.storage import s3_client
     from app.upscaler import upscale_image_bytes
@@ -570,10 +581,29 @@ def run_video_upscale_task(
         if total_frames == 0:
             raise RuntimeError(f"No frames extracted from {object_name}")
 
-        # 2. Upscale every frame through the still-image tile pipeline.
+        # 2. Upscale every frame through the still-image tile pipeline, with an
+        #    optional motion-aware temporal blend against the previous frame
+        #    to suppress per-frame flicker (#65).
+        prev_source = None
+        prev_upscaled = None
         for idx, frame_path in enumerate(frame_paths, start=1):
             frame_bytes = frame_path.read_bytes()
             upscaled_bytes = upscale_image_bytes(frame_bytes, params, scale=scale)
+            if temporal_strength > 0.0:
+                from io import BytesIO
+                from PIL import Image as _PILImage
+                from app.upscaler import apply_temporal_blend
+                source_img = _PILImage.open(BytesIO(frame_bytes)).convert("RGB")
+                upscaled_img = _PILImage.open(BytesIO(upscaled_bytes)).convert("RGB")
+                upscaled_img = apply_temporal_blend(
+                    upscaled_img, prev_upscaled, strength=temporal_strength,
+                    source_current=source_img, source_previous=prev_source,
+                )
+                buf = BytesIO()
+                upscaled_img.save(buf, format="PNG")
+                upscaled_bytes = buf.getvalue()
+                prev_source = source_img
+                prev_upscaled = upscaled_img
             (upscaled_dir / frame_path.name).write_bytes(upscaled_bytes)
             percent = min(int((idx / total_frames) * 100), 99)
             _publish_task_progress(task_id, percent, f"Upscaling frame {idx}/{total_frames}", celery_task)

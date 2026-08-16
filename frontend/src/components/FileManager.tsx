@@ -8,7 +8,8 @@ import {
 } from 'lucide-react';
 import { 
   fetchFiles, uploadFile, deleteFile, createFolder,
-  startTask, startUpscale, getTaskStatus, StorageItem, TaskStatusResponse, startBatchExport, triggerDownload
+  startTask, startUpscale, getTaskStatus, StorageItem, TaskStatusResponse, UpscaleParams,
+  startBatchExport, triggerDownload
 } from '../utils/api';
 import { useStore } from '../store/useStore';
 
@@ -376,9 +377,9 @@ export default function FileManager() {
   };
 
   // Trigger Celery Task
-  const handleTriggerTask = async (filePath: string, taskType: string) => {
+  const handleTriggerTask = async (filePath: string, taskType: string, params?: UpscaleParams) => {
     try {
-      const taskRes = await startTask(filePath, taskType);
+      const taskRes = await startTask(filePath, taskType, params);
       setActiveTasks(prev => ({
         ...prev,
         [taskRes.task_id]: {
@@ -731,9 +732,9 @@ export default function FileManager() {
                       <>
                         <div className="w-[1px] h-3.5 bg-slate-850" />
                         <button
-                          onClick={() => handleTriggerTask(file.path, 'video_upscale')}
+                          onClick={() => handleTriggerTask(file.path, 'video_upscale', { temporal_strength: 0.25 })}
                           className="text-xs hover:bg-slate-800 text-slate-300 hover:text-emerald-400 p-1 px-1.5 rounded transition flex items-center gap-1"
-                          title="Frame-by-frame video upscale (tile pipeline per frame + re-encode)"
+                          title="Frame-by-frame video upscale with motion-aware temporal blending (flicker reduction)"
                         >
                           <Cpu className="w-3 h-3 text-emerald-500" /> Video Upscale
                         </button>

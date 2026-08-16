@@ -12,7 +12,7 @@ import pytest
 from PIL import Image
 
 from app.models import MediaAsset
-from app.upscaler import UpscaleParams
+from app.upscaler import UpscaleParams, apply_temporal_blend
 
 from app.tasks import (
     parse_duration,
@@ -84,6 +84,54 @@ class TestFfprobeHelpers:
 
         monkeypatch.setattr("app.tasks.subprocess.run", boom)
         assert probe_audio_codec("clip.mp4") == ""
+
+
+class TestTemporalBlend:
+    def test_zero_strength_returns_current(self):
+        cur = Image.new("RGB", (32, 32), (100, 150, 200))
+        prev = Image.new("RGB", (32, 32), (10, 20, 30))
+        assert apply_temporal_blend(cur, prev, strength=0.0).tobytes() == cur.tobytes()
+
+    def test_no_previous_returns_current(self):
+        cur = Image.new("RGB", (32, 32), (100, 150, 200))
+        assert apply_temporal_blend(cur, None, strength=0.5).tobytes() == cur.tobytes()
+
+    def test_static_frames_are_stabilized(self):
+        # Same scene, only per-frame upscale noise differs -> blend pulls
+        # the current frame toward the previous one (flicker reduction).
+        cur = Image.new("RGB", (32, 32), (120, 130, 140))
+        prev = Image.new("RGB", (32, 32), (100, 110, 120))
+        out = apply_temporal_blend(cur, prev, strength=0.5)
+        # Blended pixel lies strictly between the two frame values.
+        px = out.getpixel((16, 16))
+        assert prev.getpixel((16, 16))[0] < px[0] < cur.getpixel((16, 16))[0]
+        assert prev.getpixel((16, 16))[1] < px[1] < cur.getpixel((16, 16))[1]
+        assert prev.getpixel((16, 16))[2] < px[2] < cur.getpixel((16, 16))[2]
+
+    def test_motion_region_keeps_current_frame(self):
+        # A moving bright block in the current frame must not ghost back
+        # toward the previous frame.
+        cur = Image.new("RGB", (64, 64), (10, 10, 10))
+        prev = Image.new("RGB", (64, 64), (10, 10, 10))
+        for x in range(8, 16):
+            for y in range(8, 16):
+                cur.putpixel((x, y), (255, 255, 255))
+        out = apply_temporal_blend(cur, prev, strength=0.5)
+        # The bright block should be preserved (motion weight suppresses blend).
+        assert out.getpixel((12, 12))[0] > 200
+
+    def test_source_motion_guides_blend(self):
+        # Even when upscaled frames are nearly identical, a large source
+        # motion should suppress the blend toward the previous frame.
+        cur = Image.new("RGB", (32, 32), (100, 100, 100))
+        prev = Image.new("RGB", (32, 32), (100, 100, 100))
+        src_cur = Image.new("RGB", (32, 32), (255, 255, 255))
+        src_prev = Image.new("RGB", (32, 32), (0, 0, 0))
+        out = apply_temporal_blend(
+            cur, prev, strength=0.8, source_current=src_cur, source_previous=src_prev
+        )
+        # High motion everywhere -> weight ~0 -> output stays current.
+        assert out.getpixel((16, 16)) == (100, 100, 100)
 
 
 class TestRecordUpscaledAssetVideo:
@@ -185,9 +233,10 @@ class TestProcessMediaHeavyVideoRouting:
     ):
         captured = {}
 
-        def _fake_run_video(object_name, params, task_id=None, celery_task=None):
+        def _fake_run_video(object_name, params, task_id=None, celery_task=None, temporal_strength=0.0):
             captured["object_name"] = object_name
             captured["params"] = params
+            captured["temporal_strength"] = temporal_strength
             return {
                 "status": "COMPLETED",
                 "task_id": task_id,
@@ -211,12 +260,14 @@ class TestProcessMediaHeavyVideoRouting:
             hdr=0.3,
             fractality=0.1,
             prompt="smooth motion",
+            temporal_strength=0.4,
         )
 
         assert captured["object_name"] == "clips/short.mp4"
         assert captured["params"].denoise == 0.5
         assert captured["params"].hdr == 0.3
         assert captured["params"].prompt == "smooth motion"
+        assert captured["temporal_strength"] == 0.4
         assert result["status"] == "COMPLETED"
 
         asset = (

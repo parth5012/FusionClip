@@ -272,8 +272,56 @@ def generate_feather_mask(
     if bottom_overlap:
         y_weight = np.minimum(y_weight, (height - 1 - y_ramp) / feather_px)
     y_weight = np.clip(y_weight, 0.0, 1.0)
-    
+
     return np.outer(y_weight, x_weight)
+
+
+def apply_temporal_blend(
+    current: Image.Image,
+    previous: Optional[Image.Image],
+    strength: float = 0.25,
+    source_current: Optional[Image.Image] = None,
+    source_previous: Optional[Image.Image] = None,
+) -> Image.Image:
+    """Motion-aware temporal blending to reduce per-frame upscale flicker (#65).
+
+    Frame-by-frame upscaling injects independent high-frequency detail per
+    frame, which reads as flicker. This pass blends each frame toward the
+    previous one weighted by local motion: static regions (low source-frame
+    difference) blend strongly to suppress shimmer, while moving regions keep
+    the fresh frame so motion does not ghost. Motion is estimated from the
+    source frames when provided — they are cleaner than the upscaled frames,
+    which carry independent per-frame noise.
+
+    ``strength`` is 0..1 (0 disables the pass).
+    """
+    if previous is None or strength <= 0.0:
+        return current
+
+    cur = np.asarray(current.convert("RGB"), dtype=np.float32)
+    prev = np.asarray(previous.convert("RGB"), dtype=np.float32)
+
+    if source_current is not None and source_previous is not None:
+        src_cur = np.asarray(source_current.convert("RGB"), dtype=np.float32)
+        src_prev = np.asarray(source_previous.convert("RGB"), dtype=np.float32)
+        motion = np.abs(src_cur - src_prev).mean(axis=2)
+        # Upscale the low-res motion map to the output resolution.
+        motion_u8 = np.clip(motion, 0, 255).astype(np.uint8)
+        motion_img = Image.fromarray(motion_u8, mode="L").resize(
+            current.size, Image.BILINEAR
+        )
+        motion = np.asarray(motion_img, dtype=np.float32) / 255.0
+    else:
+        motion = np.abs(cur - prev).mean(axis=2)
+
+    # Normalize motion on an absolute 0..255 scale so a uniform per-frame
+    # detail difference (static scene, flicker noise) still blends instead of
+    # being mistaken for full-speed motion.
+    normalized = np.clip(motion / 255.0, 0.0, 1.0)
+    weight = (strength * (1.0 - normalized))[..., None]
+    blended = cur * (1.0 - weight) + prev * weight
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), "RGB")
+
 
 def default_mock_process_tile(tile: Image.Image, upscale_factor: float, **kwargs) -> Image.Image:
     """
