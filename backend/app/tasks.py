@@ -16,6 +16,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Cache redis client (re-added: lost in the #66 merge, tasks break without it)
+redis_client = redis.from_url(settings.REDIS_URL)
+
 TRANSIENT_ERRORS = ('out of memory', 'oom', 'timeout', 'timeouterror',
                      'connectionerror', 'connection', '429', '503', 'temporarily')
 PERMANENT_ERRORS = ('invalid', 'validation', 'bad parameter', 'not found',
@@ -49,48 +52,6 @@ def categorize_error(error_msg: str) -> str:
     return 'runtime'
 
 
-def _handle_task_failure(task_id: str, error: Exception, retry_count: int, max_retries: int):
-    error_msg = str(error)
-    tb_str = traceback.format_exc()
-    error_type = categorize_error(error_msg)
-    transient = is_transient_error(error_msg)
-
-    db = SessionLocal()
-    try:
-        db_task = db.query(Task).filter(Task.task_id == task_id).first()
-        if db_task:
-            db_task.error = error_msg
-            db_task.error_type = error_type
-            db_task.traceback = tb_str
-            db_task.retry_count = retry_count
-            db_task.max_retries = max_retries
-            if transient and retry_count < max_retries:
-                db_task.status = 'PENDING_RETRY'
-            else:
-                db_task.status = 'FAILED'
-            db.commit()
-    finally:
-        db.close()
-
-    redis_client.publish("task_updates", json.dumps({
-        "task_id": task_id,
-        "status": 'PENDING_RETRY' if (transient and retry_count < max_retries) else 'FAILED',
-        "progress": 0,
-        "error": error_msg,
-        "error_type": error_type,
-        "retry_count": retry_count,
-        "max_retries": max_retries,
-        "traceback": tb_str
-    }))
-
-    if transient and retry_count < max_retries:
-        logger.info(f"Task {task_id} transient error ({error_type}), retry {retry_count}/{max_retries}")
-    else:
-        logger.error(f"Task {task_id} permanent failure ({error_type}): {error_msg}")
-
-    return transient and retry_count < max_retries
-
-
 def update_task_retry(db_task: Task, retry_count: int, db) -> None:
     """Update retry tracking fields on task."""
     db_task.retry_count = retry_count
@@ -110,6 +71,40 @@ def parse_duration(file_path: str) -> float:
     except Exception as e:
         logger.error(f"Failed to parse duration {file_path}: {e}")
         return 0.0
+
+
+def parse_frame_rate(file_path: str) -> float:
+    """Get the video frame rate in fps using ffprobe (handles rationals like 30000/1001)."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1", file_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        raw = result.stdout.strip()
+        if "/" in raw:
+            num, _, den = raw.partition("/")
+            return float(num) / float(den) if den else 0.0
+        return float(raw) if raw else 0.0
+    except Exception as e:
+        logger.error(f"Failed to parse frame rate for {file_path}: {e}")
+        return 0.0
+
+
+def probe_audio_codec(file_path: str) -> str:
+    """Return the first audio stream's codec name, or '' when the clip has no audio."""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1", file_path
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        return result.stdout.strip()
+    except Exception as e:
+        logger.error(f"Failed to probe audio codec for {file_path}: {e}")
+        return ""
 
 
 def run_ffmpeg_with_progress(cmd, duration: float, task_id: str, celery_task=None) -> None:
@@ -283,11 +278,13 @@ def process_media_fast(self, object_name: str, task_type: str = "thumbnail"):
         raise
 
 # Heavy task queue endpoint
-def record_upscaled_asset(db, object_name: str, processed_name: str, processed_url: str, params=None):
+def record_upscaled_asset(db, object_name: str, processed_name: str, processed_url: str, params=None,
+                          content_type: str = "image/png", duration: float = 0.0):
     """Create (or update) a MediaAsset for an upscaled output.
 
     The upscaled asset records ``source_path`` pointing back at the original
-    so the before/after comparison UI can pair them (map #58).
+    so the before/after comparison UI can pair them (map #58). Video upscale
+    outputs pass ``content_type="video/mp4"`` and the probed clip duration.
     """
     if not processed_name:
         return None
@@ -300,14 +297,16 @@ def record_upscaled_asset(db, object_name: str, processed_name: str, processed_u
     if asset:
         asset.title = title
         asset.source_path = object_name
+        asset.content_type = content_type
+        asset.duration = duration
         db.commit()
         return asset
     asset = MediaAsset(
         title=title,
         file_path=processed_name,
         file_size=0,
-        content_type="image/png",
-        duration=0.0,
+        content_type=content_type,
+        duration=duration,
         source_path=object_name,
     )
     db.add(asset)
@@ -324,7 +323,7 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
         # Parse optional upscale controls (forwarded to the Colab diffusion
         # worker when connected, or applied locally via the CPU fallback).
         params = None
-        if task_type == "upscale":
+        if task_type in ("upscale", "video_upscale"):
             from app.upscaler import UpscaleParams
             params = UpscaleParams(
                 denoise=float(upscale_kwargs.get("denoise", 0.35)),
@@ -454,13 +453,174 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
                     "error": str(e),
                 }))
                 raise
+        if task_type == "video_upscale":
+            try:
+                result = run_video_upscale_task(object_name, params, task_id=task_id, celery_task=self)
+                with SessionLocal() as db:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task:
+                        db_task.status = "COMPLETED"
+                        db_task.progress = 100
+                        db.commit()
+                    record_upscaled_asset(
+                        db, object_name,
+                        result.get("processed_name"), result.get("processed_url"), params,
+                        content_type="video/mp4", duration=result.get("duration", 0.0),
+                    )
+                redis_client.publish("task_updates", json.dumps({
+                    "task_id": task_id,
+                    "status": "COMPLETED",
+                    "progress": 100,
+                    "error": None,
+                }))
+                return result
+            except Exception as e:
+                logger.error(f"Error executing local video upscale task {task_id}: {e}")
+                with SessionLocal() as db:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task:
+                        db_task.status = "FAILED"
+                        db_task.error = str(e)
+                        db.commit()
+                redis_client.publish("task_updates", json.dumps({
+                    "task_id": task_id,
+                    "status": "FAILED",
+                    "progress": 0,
+                    "error": str(e),
+                }))
+                raise
         return _original_process_media_heavy(self, object_name, task_type, params)
     except Exception as e:
-        should_retry = _handle_task_failure(task_id, e, retry_count, 3)
+        should_retry = _handle_task_failure(task_id, e, max_retries=3)
         if should_retry:
             countdown = exponential_backoff(retry_count)
             raise self.retry(countdown=countdown, exc=e)
         raise
+
+
+def _publish_task_progress(task_id: str, percent: int, status_text: str, celery_task=None):
+    """Update Celery state, the Redis pub/sub feed, and the Task row with progress."""
+    if celery_task is not None:
+        celery_task.update_state(state="PROGRESS", meta={"percent": percent, "status": status_text})
+    redis_client.publish("task_updates", json.dumps({
+        "task_id": task_id, "status": "PROCESSING", "progress": percent, "error": None
+    }))
+    db = SessionLocal()
+    try:
+        db_task = db.query(Task).filter(Task.task_id == task_id).first()
+        if db_task:
+            db_task.status = "PROCESSING"
+            db_task.progress = percent
+            db.commit()
+    except Exception as e:
+        logger.error(f"Failed to update progress for task {task_id}: {e}")
+    finally:
+        db.close()
+
+
+def run_video_upscale_task(
+    object_name: str,
+    params,
+    task_id: str,
+    scale: float = 4.0,
+    celery_task=None,
+) -> dict:
+    """Run the local CPU frame-by-frame video upscale fallback (map #62 MVV).
+
+    Downloads the clip, extracts a PNG frame sequence onto the scratchpad,
+    upscales every frame through the still-image tile pipeline
+    (``upscale_image_bytes``), re-encodes with ffmpeg (libx264 + yuv420p +
+    audio pass-through when the source codec is MP4-safe), uploads the result
+    to ``processed/video_upscaled_<stem>.mp4`` and returns the result dict.
+    Used when no Colab worker is connected.
+    """
+    from app.storage import s3_client
+    from app.upscaler import upscale_image_bytes
+
+    logger.info("Running local CPU video upscale for %s", object_name)
+
+    temp_in = scratchpad.get_temp_path(suffix="_in.mp4")
+    temp_out = scratchpad.get_temp_path(suffix="_out.mp4")
+    frames_dir = scratchpad.base_dir / f"video_upscale_{task_id}_frames"
+    upscaled_dir = scratchpad.base_dir / f"video_upscale_{task_id}_upscaled"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    upscaled_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        s3_client.download_file(settings.MINIO_BUCKET_NAME, object_name, str(temp_in))
+
+        duration = parse_duration(str(temp_in))
+        if duration == 0.0:
+            duration = 10.0
+        fps = parse_frame_rate(str(temp_in))
+        if fps <= 0.0:
+            fps = 30.0
+        audio_codec = probe_audio_codec(str(temp_in))
+
+        # 1. Extract frames as a PNG sequence (exact source frame count).
+        extract_cmd = [
+            "ffmpeg", "-y", "-i", str(temp_in),
+            "-map", "0:v:0", "-vsync", "0",
+            "-c:v", "png", str(frames_dir / "frame_%06d.png"),
+        ]
+        run_ffmpeg_with_progress(extract_cmd, duration, task_id, celery_task=celery_task)
+
+        frame_paths = sorted(frames_dir.glob("frame_*.png"))
+        total_frames = len(frame_paths)
+        if total_frames == 0:
+            raise RuntimeError(f"No frames extracted from {object_name}")
+
+        # 2. Upscale every frame through the still-image tile pipeline.
+        for idx, frame_path in enumerate(frame_paths, start=1):
+            frame_bytes = frame_path.read_bytes()
+            upscaled_bytes = upscale_image_bytes(frame_bytes, params, scale=scale)
+            (upscaled_dir / frame_path.name).write_bytes(upscaled_bytes)
+            percent = min(int((idx / total_frames) * 100), 99)
+            _publish_task_progress(task_id, percent, f"Upscaling frame {idx}/{total_frames}", celery_task)
+
+        # 3. Re-encode: libx264, yuv420p, CRF 18, faststart; audio pass-through
+        #    when the source codec is MP4-safe (aac/mp3), else re-encode to AAC.
+        encode_cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-i", str(upscaled_dir / "frame_%06d.png"),
+            "-i", str(temp_in),
+            "-map", "0:v:0", "-map", "1:a:0?",
+            "-c:v", "libx264", "-preset", "slow", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.0",
+        ]
+        if audio_codec in ("aac", "mp3"):
+            encode_cmd += ["-c:a", "copy"]
+        elif audio_codec:
+            encode_cmd += ["-c:a", "aac", "-b:a", "192k"]
+        encode_cmd += ["-movflags", "+faststart", str(temp_out)]
+        run_ffmpeg_with_progress(encode_cmd, duration, task_id, celery_task=celery_task)
+
+        # 4. Upload the upscaled clip.
+        base_name = object_name.split("/")[-1]
+        stem, _, _ = base_name.rpartition(".")
+        processed_name = f"processed/video_upscaled_{stem}.mp4"
+        with open(str(temp_out), "rb") as f:
+            upload_success = upload_object(f.read(), processed_name, content_type="video/mp4")
+        if not upload_success:
+            raise RuntimeError(f"Failed to upload upscaled video {processed_name}")
+
+        return {
+            "status": "COMPLETED",
+            "task_id": task_id,
+            "original_object": object_name,
+            "processed_url": generate_url(processed_name),
+            "processed_name": processed_name,
+            "duration": duration,
+            "frames": total_frames,
+            "params": params.as_colab_parameters(),
+            "colab": False,
+        }
+    finally:
+        scratchpad.remove_path(temp_in)
+        scratchpad.remove_path(temp_out)
+        scratchpad.remove_path(frames_dir)
+        scratchpad.remove_path(upscaled_dir)
 
 
 def _original_process_media_heavy(self, object_name: str, task_type: str = "transcode", params=None):
@@ -914,16 +1074,6 @@ if __name__ == "__main__":
         print("Backfill complete.")
     finally:
         db.close()
-
-
-# For backward compatibility
-@celery.task(bind=True)
-def process_multimedia_task(self, object_name: str, task_type: str = "transcode"):
-    # Forward to fast or heavy queue depending on task type
-    if task_type in ["thumbnail", "waveform"]:
-        return process_media_fast(object_name, task_type)
-    else:
-        return process_media_heavy(object_name, task_type)
 
 
 

@@ -30,7 +30,7 @@ router = APIRouter(tags=["tasks"])
 def run_processing_pipeline(
     path: str = Query(..., description="Key of the object to process"),
     task_type: str = Query(
-        "transcode", description="Generation pipeline: transcode, audio_extract, upscale"
+        "transcode", description="Generation pipeline: transcode, audio_extract, upscale, video_upscale"
     ),
     denoise: Optional[float] = Query(
         None, description="Upscale: Denoising Strength (Creativity)"

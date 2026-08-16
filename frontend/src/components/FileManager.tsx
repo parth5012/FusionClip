@@ -417,6 +417,12 @@ export default function FileManager() {
     return <File className="w-5 h-5 text-slate-400" />;
   };
 
+  // Detect video files so we can offer the frame-by-frame video upscale action
+  const isVideoFile = (fileName: string) => {
+    const ext = fileName.split('.').pop()?.toLowerCase();
+    return ['mp4', 'mov', 'webm', 'ogg', 'mkv'].includes(ext || '');
+  };
+
   return (
     <div
       className="space-y-6"
@@ -721,6 +727,18 @@ export default function FileManager() {
                     >
                       <Cpu className="w-3 h-3 text-emerald-500" /> Upscale
                     </button>
+                    {isVideoFile(file.name) && (
+                      <>
+                        <div className="w-[1px] h-3.5 bg-slate-850" />
+                        <button
+                          onClick={() => handleTriggerTask(file.path, 'video_upscale')}
+                          className="text-xs hover:bg-slate-800 text-slate-300 hover:text-emerald-400 p-1 px-1.5 rounded transition flex items-center gap-1"
+                          title="Frame-by-frame video upscale (tile pipeline per frame + re-encode)"
+                        >
+                          <Cpu className="w-3 h-3 text-emerald-500" /> Video Upscale
+                        </button>
+                      </>
+                    )}
                   </div>
 
                   {/* Playback / Pre-signed direct link */}
