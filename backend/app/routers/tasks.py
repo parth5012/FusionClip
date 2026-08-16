@@ -30,7 +30,7 @@ router = APIRouter(tags=["tasks"])
 def run_processing_pipeline(
     path: str = Query(..., description="Key of the object to process"),
     task_type: str = Query(
-        "transcode", description="Generation pipeline: transcode, audio_extract, upscale"
+        "transcode", description="Generation pipeline: transcode, audio_extract, upscale, video_upscale"
     ),
     denoise: Optional[float] = Query(
         None, description="Upscale: Denoising Strength (Creativity)"
@@ -45,6 +45,9 @@ def run_processing_pipeline(
     prompt: Optional[str] = Query(
         None, description="Upscale: optional img2img positive prompt"
     ),
+    temporal_strength: Optional[float] = Query(
+        None, description="video_upscale: motion-aware temporal blend strength 0..1 (0 = off)"
+    ),
 ):
     """Dispatch long-running celery worker multimedia task processing pipeline."""
     kwargs = {}
@@ -58,6 +61,8 @@ def run_processing_pipeline(
         kwargs["fractality"] = fractality
     if prompt is not None:
         kwargs["prompt"] = prompt
+    if temporal_strength is not None:
+        kwargs["temporal_strength"] = temporal_strength
     task = process_multimedia_task.delay(path, task_type, **kwargs)
     return {
         "message": "Processing pipeline initiated successfully",
