@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.deps import get_db
 from app.models import MediaAsset, Task
+from app.services.embedding import get_embedding
 from app.storage import generate_url, upload_object
 from app.config import settings
 
@@ -61,12 +62,14 @@ def dispatch_gen_to_colab(task_type: str, parameters: dict, db: Session, timeout
                 db.commit()
                 
                 # Save as MediaAsset
+                title = f"Colab Generated {task_type}: {parameters.get('prompt', '')[:30]}..."
                 asset = MediaAsset(
-                    title=f"Colab Generated {task_type}: {parameters.get('prompt', '')[:30]}...",
+                    title=title,
                     file_path=filename,
                     file_size=1024, # Mock/approx size if not reported
                     content_type=content_type,
-                    duration=0.0
+                    duration=0.0,
+                    embedding=get_embedding(parameters.get("prompt", "") or title),
                 )
                 db.add(asset)
                 db.commit()
@@ -131,12 +134,14 @@ def generate_audio(
     
     # Save media assets
     try:
+        title = f"ElevenLabs Synthesized: {prompt[:30]}..."
         asset = MediaAsset(
-            title=f"ElevenLabs Synthesized: {prompt[:30]}...",
+            title=title,
             file_path=filename,
             file_size=len(content),
             content_type="audio/mpeg",
-            duration=3.0
+            duration=3.0,
+            embedding=get_embedding(prompt or title),
         )
         db.add(asset)
         db.commit()
@@ -174,12 +179,14 @@ def generate_image(
     
     # Save media assets
     try:
+        title = f"Flux Generated: {prompt[:30]}..."
         asset = MediaAsset(
-            title=f"Flux Generated: {prompt[:30]}...",
+            title=title,
             file_path=filename,
             file_size=len(content),
             content_type="image/png",
-            duration=0.0
+            duration=0.0,
+            embedding=get_embedding(prompt or title),
         )
         db.add(asset)
         db.commit()

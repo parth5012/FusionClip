@@ -12,7 +12,7 @@ except ImportError:
         impl = JSON
         cache_ok = True
 
-        def __init__(self, dim=1536):
+        def __init__(self, dim=384):
             super().__init__()
             self.dim = dim
 
@@ -31,7 +31,7 @@ class MediaAsset(Base):
     file_size = Column(Integer, nullable=False)
     content_type = Column(String, nullable=False)
     duration = Column(Float, nullable=True)
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(384), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 

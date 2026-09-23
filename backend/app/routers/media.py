@@ -7,6 +7,11 @@ from sqlalchemy.orm import Session
 
 from app.deps import get_db
 from app.models import MediaAsset
+from app.services.embedding import (
+    backfill_media_embeddings,
+    compute_cosine_distance,
+    get_embedding,
+)
 from app.storage import generate_url
 
 logger = logging.getLogger(__name__)
@@ -39,23 +44,47 @@ def search_media(
     limit: int = Query(10),
     db: Session = Depends(get_db),
 ):
-    # Vector semantic search with fallback to standard text search
+    """Semantic vector search across media assets with ILIKE text search fallback.
+
+    Uses real 384-dimensional sentence-transformers embeddings (all-MiniLM-L6-v2).
+    On PostgreSQL + pgvector, uses native vector distance ordering.
+    On non-pgvector environments (e.g. SQLite tests), calculates semantic distance in Python.
+    Falls back to case-insensitive title pattern matching (ILIKE) if no embeddings match or vector search fails.
+    """
     try:
-        import hashlib
+        query_embedding = get_embedding(query)
 
-        hasher = hashlib.sha256(query.encode())
-        seed_val = int(hasher.hexdigest(), 16) % (10**8)
-        import random
+        dialect_name = db.bind.dialect.name if db.bind else ""
+        if dialect_name == "postgresql":
+            assets = (
+                db.query(MediaAsset)
+                .filter(MediaAsset.embedding.isnot(None))
+                .order_by(MediaAsset.embedding.cosine_distance(query_embedding))
+                .limit(limit)
+                .all()
+            )
+        else:
+            # SQLite / test fallback: calculate distance over assets with embeddings
+            candidates = (
+                db.query(MediaAsset).filter(MediaAsset.embedding.isnot(None)).all()
+            )
+            if candidates:
+                candidates_ranked = sorted(
+                    candidates,
+                    key=lambda a: compute_cosine_distance(a.embedding, query_embedding),
+                )
+                assets = candidates_ranked[:limit]
+            else:
+                assets = []
 
-        random.seed(seed_val)
-        query_embedding = [random.uniform(-1, 1) for _ in range(1536)]
-
-        assets = (
-            db.query(MediaAsset)
-            .order_by(MediaAsset.embedding.l2_distance(query_embedding))
-            .limit(limit)
-            .all()
-        )
+        # If vector search yielded no results (e.g. rows without embeddings), fallback to ILIKE
+        if not assets:
+            assets = (
+                db.query(MediaAsset)
+                .filter(MediaAsset.title.ilike(f"%{query}%"))
+                .limit(limit)
+                .all()
+            )
     except Exception as db_err:
         logger.warning(f"Vector search failed, falling back to text search: {db_err}")
         db.rollback()
@@ -67,3 +96,10 @@ def search_media(
         )
 
     return [_serialize_asset(asset) for asset in assets]
+
+
+@router.post("/api/media/backfill-embeddings")
+def backfill_embeddings_endpoint(db: Session = Depends(get_db)):
+    """Backfill missing 384-dimensional embeddings for MediaAsset rows."""
+    count = backfill_media_embeddings(db)
+    return {"status": "ok", "backfilled": count}

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.deps import get_db
 from app.models import MediaAsset
+from app.services.embedding import get_embedding
 from app.storage import (
     delete_object,
     generate_url,
@@ -51,6 +52,7 @@ async def upload_file(
             file_size=len(file_bytes),
             content_type=file.content_type,
             duration=0.0,
+            embedding=get_embedding(file.filename),
         )
         db.add(asset)
         db.commit()
