@@ -135,6 +135,17 @@ def test_make_fake_png_artifact_sanitizes_path():
             os.remove(path)
 
 
+def test_make_fake_png_artifact_with_none_prompt():
+    """Verify prompt=None does not cause TypeError in make_fake_png_artifact."""
+    from colab_client import make_fake_png_artifact
+    path = make_fake_png_artifact("task_none_prompt", prompt=None)
+    try:
+        assert os.path.exists(path)
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def test_worker_reports_failure_on_unsupported_task():
     """Verify unknown task type reports failure cleanly."""
     worker = ColabComputeWorker(
