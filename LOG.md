@@ -67,3 +67,32 @@
 - Backend: 194 pytest unit & integration tests passing (`pytest backend/tests/` 194 passed in 47.94s).
 - OCR Review: Zero findings across backend and frontend code changes.
 
+## 2026-09-23: Wayfinder Map #69 - Colab Real Inference & Notebook
+
+### Iteration Status: Done
+
+- **Phase 1 (HITL): #88 - Decide which workloads run on Colab v1 and the Colab-vs-local split**
+  - Confirmed workload roster with user: SDXL (image generation) and Real-ESRGAN/tile upscaling in remote burst mode when Colab worker is connected.
+  - Closed #88 with resolution recorded.
+- **Phase 1 (HITL): #90 - Prototype the runnable inference notebook for human Colab test**
+  - Created runnable notebook `notebooks/fusionclip_colab.ipynb` covering GPU check, SDXL Turbo model loading with fp16 on CUDA, standalone smoke-test cell, and real worker upload loop to `/api/storage/upload`.
+  - User approved prototype structure. Closed #90 with resolution recorded.
+- **Phase 2 (AFK): #89 - Replace mock execute_task with handler registry + real artifact upload**
+  - Refactored `colab_client.py` replacing the sleep loop and `mock_colab_output_*.png` with pluggable `TaskHandlerRegistry`.
+  - Added built-in SDXL diffusion handler with pipeline caching and step progress updates.
+  - Added `--fake` mode producing real on-disk PNG files uploaded via multipart `/api/storage/upload`.
+  - Added temporary file cleanup, path traversal sanitization, and thread synchronization (`_gpu_lock`, `_ws_lock`).
+  - Added unit test suite in `backend/tests/test_colab_client.py` (7 tests). Closed #89 with resolution recorded.
+- **Phase 2 (AFK): #91 - Real per-step progress reporting + local fake-GPU e2e harness**
+  - Replaced fake sleep progress with per-step callbacks from handlers over WS/HTTP paths.
+  - Fixed Pydantic v2 `Optional[dict]` and `Optional[str]` validation on `ColabTaskUpdate` and `ColabMetrics`.
+  - Added constant-time secret comparison with `secrets.compare_digest` and Bearer token header support.
+  - Added TTL (`ex=3600`) to Redis task result keys to avoid memory leaks.
+  - Built comprehensive end-to-end integration test suite in `backend/tests/test_colab_e2e_harness.py` covering dispatch, per-step progress, artifact landing in MinIO/DB, failure lifecycles, and auth rejection.
+  - Verified backend: all 205 pytest tests passing. Closed #91 with resolution recorded.
+
+### Overall Verification:
+- Backend: 205 pytest unit & integration tests passing (`pytest backend/tests/` 205 passed in 45.19s).
+- Python compile check: clean.
+
+

@@ -87,6 +87,7 @@ def register_handler(task_type: str, registry: Optional[TaskHandlerRegistry] = N
 
 def make_fake_png_artifact(task_id: str, prompt: str = "") -> str:
     """Create a real on-disk PNG file for fake/offline test execution."""
+    prompt = prompt or ""
     safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(task_id))
     fd, path = tempfile.mkstemp(prefix=f"colab_fake_{safe_id}_", suffix=".png")
     os.close(fd)
@@ -239,6 +240,7 @@ class ColabComputeWorker:
                 try:
                     res = requests.post(
                         f"{self.server_url}/api/colab/metrics?token={self.token}",
+                        headers={"Authorization": f"Bearer {self.token}"},
                         json=metrics,
                         timeout=5.0
                     )
@@ -284,16 +286,16 @@ class ColabComputeWorker:
     def execute_task(self, task_id, task_type, parameters):
         """Execute task via handler registry or fake mode with real artifact upload."""
         logger.info(f"Starting task {task_id} of type: {task_type}")
-        self.active_task = f"{task_type} (ID: {task_id})"
         
         with self._gpu_lock:
+            self.active_task = f"{task_type} (ID: {task_id})"
             try:
                 def on_progress(percent):
                     self.report_progress(task_id, percent)
 
                 if self.fake_mode:
                     on_progress(25)
-                    prompt = parameters.get("prompt", "") if isinstance(parameters, dict) else ""
+                    prompt = (parameters.get("prompt") or "") if isinstance(parameters, dict) else ""
                     artifact_path = make_fake_png_artifact(task_id, prompt)
                     try:
                         on_progress(75)
@@ -380,12 +382,14 @@ class ColabComputeWorker:
         
         # HTTP fallback
         try:
+            progress_val = payload.get("percent", 100 if payload["type"] == "task_complete" else 0)
             requests.post(
                 f"{self.server_url}/api/colab/tasks/update?token={self.token}",
+                headers={"Authorization": f"Bearer {self.token}"},
                 json={
                     "task_id": payload["task_id"],
                     "status": "COMPLETED" if payload["type"] == "task_complete" else ("FAILED" if payload["type"] == "task_failed" else "PROCESSING"),
-                    "progress": payload.get("percent", 100),
+                    "progress": progress_val,
                     "output": payload.get("output"),
                     "error": payload.get("error")
                 },
@@ -458,12 +462,13 @@ class ColabComputeWorker:
                 try:
                     res = requests.get(
                         f"{self.server_url}/api/colab/tasks/pending?token={self.token}",
+                        headers={"Authorization": f"Bearer {self.token}"},
                         timeout=5.0
                     )
                     if res.status_code == 200:
                         data = res.json()
-                        task = data.get("task")
-                        if task:
+                        task = data.get("task") if "task" in data else data
+                        if task and task.get("task_id"):
                             task_id = task.get("task_id")
                             task_type = task.get("task_type")
                             parameters = task.get("parameters", {})
