@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any, Dict, NoReturn, Optional
@@ -24,6 +25,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["generate"])
 
 redis_client = redis.from_url(settings.REDIS_URL)
+
+SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_safe_identifier(val: Optional[str], param_name: str) -> None:
+    if val is not None:
+        if len(val) > 64 or not SAFE_IDENTIFIER_PATTERN.match(val):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {param_name}: must contain only alphanumeric, dot, underscore, or dash characters and be <= 64 chars",
+            )
+
 
 
 def is_colab_connected():
@@ -280,6 +293,7 @@ def generate_text(
     db: Session = Depends(get_db),
 ):
     """Generate text via Gemini API, Colab worker, or mock fallback."""
+    _validate_safe_identifier(model, "model")
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="text_generation",
@@ -323,6 +337,7 @@ def generate_audio(
     db: Session = Depends(get_db),
 ):
     """Generate audio via ElevenLabs API, Colab worker, or mock fallback."""
+    _validate_safe_identifier(voice_id, "voice_id")
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="audio_generation",
@@ -410,71 +425,81 @@ def generate_image(
     steps: int = Query(28),
     scale: float = Query(7.5),
     aspect_ratio: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     """Generate image via Gemini Nano Banana, Colab worker, or mock fallback."""
+    _validate_safe_identifier(aspect_ratio, "aspect_ratio")
+    _validate_safe_identifier(provider, "provider")
+
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="image_generation",
-            parameters={"prompt": prompt, "steps": steps, "scale": scale, "aspect_ratio": aspect_ratio},
+            parameters={"prompt": prompt, "steps": steps, "scale": scale, "aspect_ratio": aspect_ratio, "provider": provider},
             db=db,
             file_extension="png",
             content_type="image/png",
         )
 
-    gemini_key = get_secret("gemini", db)
-    if gemini_key:
-        data = call_gemini_generate_content(
-            api_key=gemini_key,
-            model="gemini-3.1-flash-image",
-            contents=[{"role": "user", "parts": [{"text": prompt}]}],
-        )
-        candidates = data.get("candidates", [])
-        if not candidates or not candidates[0].get("content"):
-            raise HTTPException(
-                status_code=502, detail="Gemini returned an empty candidate list"
+    # When provider is explicitly set to local, never fall through to Gemini cloud API
+    if provider != "local":
+        gemini_key = get_secret("gemini", db)
+        if gemini_key:
+            data = call_gemini_generate_content(
+                api_key=gemini_key,
+                model="gemini-3.1-flash-image",
+                contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                generation_config={
+                    "responseModalities": ["IMAGE"],
+                    **({"imageConfig": {"aspectRatio": aspect_ratio}} if aspect_ratio else {}),
+                },
             )
-        parts = candidates[0]["content"].get("parts", [])
-
-        img_bytes = None
-        for part in parts:
-            inline_data = part.get("inlineData") or part.get("inline_data")
-            if inline_data and "data" in inline_data:
-                img_bytes = base64.b64decode(inline_data["data"])
-                break
-
-        if not img_bytes:
-            raise HTTPException(
-                status_code=502,
-                detail="Gemini did not return image data in candidate parts",
-            )
-
-        filename = f"gemini_img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
-        upload_success = upload_object(img_bytes, filename, content_type="image/png")
-
-        if upload_success:
-            try:
-                title = f"Gemini Image: {prompt[:30]}..."
-                asset = MediaAsset(
-                    title=title,
-                    file_path=filename,
-                    file_size=len(img_bytes),
-                    content_type="image/png",
-                    duration=0.0,
-                    embedding=get_embedding(prompt or title),
+            candidates = data.get("candidates", [])
+            if not candidates or not candidates[0].get("content"):
+                raise HTTPException(
+                    status_code=502, detail="Gemini returned an empty candidate list"
                 )
-                db.add(asset)
-                db.commit()
-            except Exception as e:
-                logger.error(f"Failed to save generated image asset: {e}")
-                db.rollback()
+            parts = candidates[0]["content"].get("parts", [])
 
-        return {
-            "status": "COMPLETED",
-            "parameters": {"steps": steps, "scale": scale},
-            "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
-        }
+            img_bytes = None
+            for part in parts:
+                inline_data = part.get("inlineData") or part.get("inline_data")
+                if inline_data and "data" in inline_data:
+                    img_bytes = base64.b64decode(inline_data["data"])
+                    break
+
+            if not img_bytes:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Gemini did not return image data in candidate parts",
+                )
+
+            filename = f"gemini_img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+            upload_success = upload_object(img_bytes, filename, content_type="image/png")
+
+            if upload_success:
+                try:
+                    title = f"Gemini Image: {prompt[:30]}..."
+                    asset = MediaAsset(
+                        title=title,
+                        file_path=filename,
+                        file_size=len(img_bytes),
+                        content_type="image/png",
+                        duration=0.0,
+                        embedding=get_embedding(prompt or title),
+                    )
+                    db.add(asset)
+                    db.commit()
+                except Exception as e:
+                    logger.error(f"Failed to save generated image asset: {e}")
+                    db.rollback()
+
+            return {
+                "status": "COMPLETED",
+                "parameters": {"steps": steps, "scale": scale},
+                "filename": filename,
+                "url": generate_url(filename) if upload_success else "",
+            }
 
     filename = f"gen_image_{int(time.time())}.png"
     content = b"Mock local flux generated image bytes."

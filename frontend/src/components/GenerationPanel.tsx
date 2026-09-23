@@ -76,7 +76,13 @@ export default function GenerationPanel() {
         const res = await generateAudio(prompt, 'sfx', undefined, duration);
         setAudioResult(res);
       } else if (activeModality === 'image' || activeModality === 'local') {
-        const res = await generateImage(prompt, steps, scale, aspectRatio);
+        const res = await generateImage(
+          prompt,
+          steps,
+          scale,
+          aspectRatio,
+          activeModality === 'local' ? 'local' : 'gemini',
+        );
         setImageResult(res);
       } else if (activeModality === 'voice') {
         // Voice design preview uses ElevenLabs TTS endpoint with designated preview voice
@@ -132,7 +138,7 @@ export default function GenerationPanel() {
           { id: 'image', label: 'Google Gemini Image', icon: ImageIcon, badge: 'Nano Banana' },
           { id: 'tts', label: 'ElevenLabs Speech (TTS)', icon: Mic, badge: 'ElevenLabs' },
           { id: 'sfx', label: 'ElevenLabs Sound Effects', icon: Volume2, badge: 'ElevenLabs' },
-          { id: 'voice', label: 'ElevenLabs Voice Design', icon: Wand2, badge: 'Voice Lab' },
+          { id: 'voice', label: 'ElevenLabs Voice Lab', icon: Wand2, badge: 'Voice Preview' },
           { id: 'local', label: 'Flux / SDXL Sandbox', icon: Cpu, badge: 'Colab / Local' },
         ].map((tab) => {
           const Icon = tab.icon;
@@ -193,7 +199,10 @@ export default function GenerationPanel() {
 
       {/* Inline Generation Error */}
       {error && (
-        <div className="bg-red-950/40 border border-red-800/60 rounded-lg p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-red-200 animate-fadeIn">
+        <div
+          role="alert"
+          className="bg-red-950/40 border border-red-800/60 rounded-lg p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-red-200 animate-fadeIn"
+        >
           <div className="flex items-center gap-2.5">
             <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
             <div className="text-xs">
@@ -381,7 +390,7 @@ export default function GenerationPanel() {
               <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">
                 Output Stage & Preview
               </span>
-              <span className="text-[10px] font-mono text-slate-500">
+              <span aria-live="polite" className="text-[10px] font-mono text-slate-500">
                 {getStageStatus()}
               </span>
             </div>
@@ -413,7 +422,11 @@ export default function GenerationPanel() {
                 <div className="w-full space-y-4 animate-fadeIn">
                   <div className="flex items-center gap-2 text-xs text-emerald-400 bg-emerald-950/30 border border-emerald-800/50 px-3 py-2 rounded-lg">
                     <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
-                    <span>Generation completed successfully. Asset stored in S3.</span>
+                    <span>
+                      {activeModality !== 'text' && (imageResult?.url || audioResult?.url)
+                        ? 'Generation completed successfully. Asset stored in S3.'
+                        : 'Generation completed successfully.'}
+                    </span>
                   </div>
 
                   {/* Text Result */}
@@ -469,17 +482,20 @@ export default function GenerationPanel() {
           </div>
 
           {/* Action Footer */}
-          {!isGenerating && hasResult && (
-            <div className="border-t border-slate-800 pt-4 flex items-center justify-end gap-3 mt-4">
-              <button
-                onClick={() => setActiveTab('library')}
-                className="px-4 py-2 bg-sky-500 hover:bg-sky-400 text-slate-950 text-xs font-bold rounded-lg flex items-center gap-1.5 shadow-md shadow-sky-500/20 transition"
-              >
-                <FolderPlus className="w-3.5 h-3.5" />
-                <span>View in S3 Library</span>
-              </button>
-            </div>
-          )}
+          {!isGenerating &&
+            hasResult &&
+            activeModality !== 'text' &&
+            Boolean(imageResult?.url || audioResult?.url) && (
+              <div className="border-t border-slate-800 pt-4 flex items-center justify-end gap-3 mt-4">
+                <button
+                  onClick={() => setActiveTab('library')}
+                  className="px-4 py-2 bg-sky-500 hover:bg-sky-400 text-slate-950 text-xs font-bold rounded-lg flex items-center gap-1.5 shadow-md shadow-sky-500/20 transition"
+                >
+                  <FolderPlus className="w-3.5 h-3.5" />
+                  <span>View in S3 Library</span>
+                </button>
+              </div>
+            )}
         </div>
       </div>
 
