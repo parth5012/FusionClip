@@ -292,3 +292,80 @@ export async function fetchColabTunnelState(): Promise<ColabTunnelState> {
     metricsConnected,
   };
 }
+
+/* ── Generation API Endpoints ─────────────────────────────────────────── */
+
+export interface GenerateTextResponse {
+  status: string;
+  output: string;
+  colab?: boolean;
+}
+
+export interface GenerateAudioResponse {
+  status: string;
+  type: string;
+  filename: string;
+  url: string;
+  colab?: boolean;
+}
+
+export interface GenerateImageResponse {
+  status: string;
+  parameters: { steps: number; scale: number };
+  filename: string;
+  url: string;
+  colab?: boolean;
+}
+
+async function postGenerate<T>(url: string, fallbackMessage: string): Promise<T> {
+  const res = await fetch(url, { method: 'POST' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = err?.detail;
+    let message = fallbackMessage;
+    if (typeof detail === 'string') {
+      message = detail;
+    } else if (detail) {
+      message = JSON.stringify(detail);
+    }
+    throw new Error(message);
+  }
+  return res.json();
+}
+
+export async function generateText(prompt: string, model?: string): Promise<GenerateTextResponse> {
+  const params = new URLSearchParams({ prompt });
+  if (model) params.set('model', model);
+  const url = `${API_BASE_URL}/api/generate/text?${params.toString()}`;
+  return postGenerate<GenerateTextResponse>(url, 'Text generation failed');
+}
+
+export async function generateAudio(
+  prompt: string,
+  type: 'tts' | 'sfx' = 'tts',
+  voiceId?: string,
+  duration?: number,
+): Promise<GenerateAudioResponse> {
+  const params = new URLSearchParams({ prompt, type });
+  if (voiceId) params.set('voice_id', voiceId);
+  if (duration !== undefined) params.set('duration', duration.toString());
+  const url = `${API_BASE_URL}/api/generate/audio?${params.toString()}`;
+  return postGenerate<GenerateAudioResponse>(url, 'Audio generation failed');
+}
+
+export async function generateImage(
+  prompt: string,
+  steps = 28,
+  scale = 7.5,
+  aspectRatio?: string,
+): Promise<GenerateImageResponse> {
+  const params = new URLSearchParams({
+    prompt,
+    steps: steps.toString(),
+    scale: scale.toString(),
+  });
+  if (aspectRatio) params.set('aspect_ratio', aspectRatio);
+  const url = `${API_BASE_URL}/api/generate/image?${params.toString()}`;
+  return postGenerate<GenerateImageResponse>(url, 'Image generation failed');
+}
+

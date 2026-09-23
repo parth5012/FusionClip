@@ -274,12 +274,16 @@ def _handle_elevenlabs_error(resp: httpx.Response) -> NoReturn:
 
 
 @router.post("/api/generate/text")
-def generate_text(prompt: str = Query(...), db: Session = Depends(get_db)):
+def generate_text(
+    prompt: str = Query(...),
+    model: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
     """Generate text via Gemini API, Colab worker, or mock fallback."""
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="text_generation",
-            parameters={"prompt": prompt},
+            parameters={"prompt": prompt, "model": model},
             db=db,
             file_extension="txt",
             content_type="text/plain",
@@ -289,7 +293,7 @@ def generate_text(prompt: str = Query(...), db: Session = Depends(get_db)):
     if gemini_key:
         data = call_gemini_generate_content(
             api_key=gemini_key,
-            model="gemini-3.8-flash",
+            model=model or "gemini-3.8-flash",
             contents=[{"role": "user", "parts": [{"text": prompt}]}],
         )
         candidates = data.get("candidates", [])
@@ -314,13 +318,15 @@ def generate_text(prompt: str = Query(...), db: Session = Depends(get_db)):
 def generate_audio(
     prompt: str = Query(...),
     type: str = Query("tts"),
+    voice_id: Optional[str] = Query(None),
+    duration: Optional[float] = Query(None),
     db: Session = Depends(get_db),
 ):
     """Generate audio via ElevenLabs API, Colab worker, or mock fallback."""
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="audio_generation",
-            parameters={"prompt": prompt, "type": type},
+            parameters={"prompt": prompt, "type": type, "voice_id": voice_id, "duration": duration},
             db=db,
             file_extension="mp3",
             content_type="audio/mpeg",
@@ -329,10 +335,18 @@ def generate_audio(
     eleven_key = get_secret("elevenlabs", db)
     if eleven_key:
         if type == "sfx":
-            content = call_elevenlabs_sfx(api_key=eleven_key, text=prompt)
+            content = call_elevenlabs_sfx(
+                api_key=eleven_key,
+                text=prompt,
+                duration_seconds=duration if duration is not None else 5.0,
+            )
             filename = f"eleven_sfx_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
         else:
-            content = call_elevenlabs_tts(api_key=eleven_key, text=prompt)
+            content = call_elevenlabs_tts(
+                api_key=eleven_key,
+                text=prompt,
+                voice_id=voice_id or "21m00Tcm4TlvDq8ikWAM",
+            )
             filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
 
         upload_success = upload_object(content, filename, content_type="audio/mpeg")
@@ -395,13 +409,14 @@ def generate_image(
     prompt: str = Query(...),
     steps: int = Query(28),
     scale: float = Query(7.5),
+    aspect_ratio: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
     """Generate image via Gemini Nano Banana, Colab worker, or mock fallback."""
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="image_generation",
-            parameters={"prompt": prompt, "steps": steps, "scale": scale},
+            parameters={"prompt": prompt, "steps": steps, "scale": scale, "aspect_ratio": aspect_ratio},
             db=db,
             file_extension="png",
             content_type="image/png",
