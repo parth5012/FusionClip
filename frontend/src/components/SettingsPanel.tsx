@@ -114,6 +114,7 @@ export default function SettingsPanel() {
       // Persist the endpoint URL, keeping the current connection intent.
       const saved = await configureColabTunnel(tunnelUrlInput.trim(), colabTunnel.status);
       setColabTunnel({ endpointUrl: saved.url, status: saved.status });
+      tunnelTouched.current = false;
       setTunnelUrlInput(saved.url);
       setSavedTunnel(true);
       setTimeout(() => setSavedTunnel(false), 3000);

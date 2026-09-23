@@ -50,8 +50,11 @@ def upgrade() -> None:
                     existing_type=Vector(1536),
                     existing_nullable=True,
                 )
-        except Exception:
-            pass
+        except Exception as err:
+            import logging
+            logging.getLogger("alembic.runtime.migration").warning(
+                f"Non-PostgreSQL embedding column alter skipped or failed: {err}"
+            )
 
 
 def downgrade() -> None:
@@ -72,5 +75,8 @@ def downgrade() -> None:
                     existing_type=Vector(384),
                     existing_nullable=True,
                 )
-        except Exception:
-            pass
+        except Exception as err:
+            import logging
+            logging.getLogger("alembic.runtime.migration").warning(
+                f"Non-PostgreSQL embedding column revert skipped or failed: {err}"
+            )
