@@ -62,14 +62,15 @@ def dispatch_gen_to_colab(task_type: str, parameters: dict, db: Session, timeout
                 db.commit()
                 
                 # Save as MediaAsset
-                title = f"Colab Generated {task_type}: {parameters.get('prompt', '')[:30]}..."
+                prompt_text = parameters.get("prompt") or ""
+                title = f"Colab Generated {task_type}: {prompt_text[:30]}..."
                 asset = MediaAsset(
                     title=title,
                     file_path=filename,
                     file_size=1024, # Mock/approx size if not reported
                     content_type=content_type,
                     duration=0.0,
-                    embedding=get_embedding(parameters.get("prompt", "") or title),
+                    embedding=get_embedding(prompt_text or title),
                 )
                 db.add(asset)
                 db.commit()
