@@ -131,6 +131,16 @@ def test_colab_http_fallback_e2e_harness(client, db_session):
         assert asset.file_size > 0
 
 
+def _wait_for(db, task, predicate, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        db.refresh(task)
+        if predicate(task):
+            return
+        time.sleep(0.05)
+    db.refresh(task)
+
+
 def test_colab_websocket_e2e_harness(client, db_session):
     """E2E Test: Exercises dispatch, per-step progress, and completion over WebSocket bridge."""
     db = db_session
@@ -148,9 +158,8 @@ def test_colab_websocket_e2e_harness(client, db_session):
             "task_id": task_id,
             "percent": 45
         })
-        time.sleep(0.1)
+        _wait_for(db, task, lambda t: t.progress == 45)
 
-        db.refresh(task)
         assert task.status == "PROCESSING"
         assert task.progress == 45
 
@@ -172,9 +181,8 @@ def test_colab_websocket_e2e_harness(client, db_session):
                 "path": upload_data["path"]
             }
         })
-        time.sleep(0.1)
+        _wait_for(db, task, lambda t: t.status == "COMPLETED")
 
-        db.refresh(task)
         assert task.status == "COMPLETED"
         assert task.progress == 100
 
@@ -214,8 +222,12 @@ def test_colab_failure_lifecycle_http(client, db_session):
 
 
 def test_colab_auth_rejection(client):
-    """Verify unauthorized requests are rejected cleanly."""
+    """Verify unauthorized requests are rejected cleanly, including non-ASCII tokens."""
     res = client.get("/api/colab/tasks/pending?token=wrong-secret")
+    assert res.status_code == 401
+
+    # Non-ASCII token should return 401, not crash with 500
+    res = client.get("/api/colab/tasks/pending?token=é_invalid")
     assert res.status_code == 401
 
     res = client.post(
