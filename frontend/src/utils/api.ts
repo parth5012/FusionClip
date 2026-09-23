@@ -358,6 +358,7 @@ export async function generateImage(
   steps = 28,
   scale = 7.5,
   aspectRatio?: string,
+  provider?: string,
 ): Promise<GenerateImageResponse> {
   const params = new URLSearchParams({
     prompt,
@@ -365,6 +366,7 @@ export async function generateImage(
     scale: scale.toString(),
   });
   if (aspectRatio) params.set('aspect_ratio', aspectRatio);
+  if (provider) params.set('provider', provider);
   const url = `${API_BASE_URL}/api/generate/image?${params.toString()}`;
   return postGenerate<GenerateImageResponse>(url, 'Image generation failed');
 }
