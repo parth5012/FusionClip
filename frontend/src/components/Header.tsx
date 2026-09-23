@@ -38,7 +38,10 @@ export default function Header() {
           setColabTunnel({ endpointUrl: state.url, status: state.status });
         }
       } catch {
-        /* backend unreachable — keep the default disconnected state */
+        /* backend unreachable — set status disconnected while preserving endpoint url */
+        if (!cancelled) {
+          setColabTunnel({ status: 'disconnected' });
+        }
       }
     };
     syncTunnel();

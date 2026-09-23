@@ -280,7 +280,10 @@ export async function configureColabTunnel(
 export async function fetchColabTunnelState(): Promise<ColabTunnelState> {
   const [settings, metrics] = await Promise.all([
     fetchTunnelSettings(),
-    fetchColabMetrics(),
+    fetchColabMetrics().catch(() => ({
+      status: 'disconnected' as const,
+      metrics: null,
+    })),
   ]);
   const metricsConnected = metrics.status === 'connected';
   return {

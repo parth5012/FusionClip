@@ -77,14 +77,15 @@ def search_media(
             else:
                 assets = []
 
-        # If vector search yielded no results (e.g. rows without embeddings), fallback to ILIKE
-        if not assets:
-            assets = (
-                db.query(MediaAsset)
-                .filter(MediaAsset.title.ilike(f"%{query}%"))
-                .limit(limit)
-                .all()
-            )
+        # Always include literal title matches (covers rows not yet backfilled).
+        text_matches = (
+            db.query(MediaAsset)
+            .filter(MediaAsset.title.ilike(f"%{query}%"))
+            .limit(limit)
+            .all()
+        )
+        seen = {a.id for a in text_matches}
+        assets = (text_matches + [a for a in assets if a.id not in seen])[:limit]
     except Exception as db_err:
         logger.warning(f"Vector search failed, falling back to text search: {db_err}")
         db.rollback()

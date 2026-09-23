@@ -333,7 +333,7 @@ export default function SettingsPanel() {
                 <button
                   type="button"
                   onClick={toggleTunnelState}
-                  disabled={togglingTunnel}
+                  disabled={savingTunnel || togglingTunnel}
                   className={`px-3 py-1.5 text-xs font-semibold rounded-md border shadow-sm transition active:scale-[98%] disabled:opacity-50 disabled:cursor-not-allowed ${
                     colabTunnel.status === 'running'
                       ? 'bg-rose-950/45 border-rose-800 text-rose-300 hover:bg-rose-900/60'
@@ -374,7 +374,7 @@ export default function SettingsPanel() {
                 <div className="pt-2 flex items-center justify-between">
                   <button
                     type="submit"
-                    disabled={savingTunnel}
+                    disabled={savingTunnel || togglingTunnel}
                     className="bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm px-4 py-2 rounded-md shadow-sm transition active:scale-[98%]"
                   >
                     {savingTunnel ? 'Saving…' : 'Save Endpoint'}
