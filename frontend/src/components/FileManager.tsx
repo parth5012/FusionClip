@@ -424,11 +424,12 @@ export default function FileManager() {
                     </button>
                     <div className="w-[1px] h-3.5 bg-slate-850" />
                     <button
-                      onClick={() => handleTriggerTask(file.path, 'upscale')}
-                      className="text-xs hover:bg-slate-800 text-slate-300 hover:text-emerald-400 p-1 px-1.5 rounded transition flex items-center gap-1"
-                      title="Upscale file resolution"
+                      disabled
+                      aria-disabled="true"
+                      className="text-xs opacity-50 cursor-not-allowed text-slate-500 p-1 px-1.5 rounded flex items-center gap-1"
+                      title="Upscale pipeline coming soon (pending Magnific Core map)"
                     >
-                      <Cpu className="w-3 h-3 text-emerald-500" /> Upscale
+                      <Cpu className="w-3 h-3 text-slate-600" /> Upscale
                     </button>
                   </div>
 
