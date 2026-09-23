@@ -146,6 +146,16 @@ def test_make_fake_png_artifact_with_none_prompt():
             os.remove(path)
 
 
+def test_minimal_png_bytes_valid():
+    """Verify fallback PNG bytes are valid and decode without error."""
+    import io
+    from PIL import Image
+    from colab_client import MINIMAL_PNG_BYTES
+    img = Image.open(io.BytesIO(MINIMAL_PNG_BYTES))
+    assert img.size == (1, 1)
+    assert img.format == "PNG"
+
+
 def test_worker_reports_failure_on_unsupported_task():
     """Verify unknown task type reports failure cleanly."""
     worker = ColabComputeWorker(

@@ -12,8 +12,10 @@ import json
 import logging
 import argparse
 import re
+import struct
 import tempfile
 import threading
+import zlib
 import requests
 
 from typing import Optional, Any, Callable
@@ -42,11 +44,17 @@ except ImportError:
     ImageDraw = None  # type: ignore
     has_pil = False
 
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+
 # Minimal 1x1 transparent PNG fallback if PIL is missing
 MINIMAL_PNG_BYTES = (
-    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\rIDATx\x9cc`\x00\x00\x00"
-    b"\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+    b"\x89PNG\r\n\x1a\n"
+    + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+    + _png_chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\x00"))
+    + _png_chunk(b"IEND", b"")
 )
 
 

@@ -168,7 +168,7 @@ def verify_colab_token(token: Optional[str] = None, authorization: Optional[str]
     expected = settings.FUSIONCLIP_SECRET_KEY
     if not candidate or not expected:
         return False
-    return secrets.compare_digest(candidate, expected)
+    return secrets.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
 
 
 @router.websocket("/api/ws/colab")
