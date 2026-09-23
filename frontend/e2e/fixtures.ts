@@ -147,6 +147,20 @@ export async function apiResetSecrets(): Promise<void> {
   }
 }
 
+/** Configure the Colab tunnel intent via the backend API (setup/teardown).
+ *  Writes colab_tunnel_url / colab_tunnel_status through POST /api/colab/tunnel. */
+export async function apiConfigureTunnel(
+  url: string,
+  status = 'running',
+): Promise<{ status: string; colab_url: string; colab_status: string }> {
+  const res = await fetch(
+    `${API_BASE}/api/colab/tunnel?url=${encodeURIComponent(url)}&status=${encodeURIComponent(status)}`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`API configure tunnel failed: ${res.status}`);
+  return res.json();
+}
+
 /** Fetch media catalog */
 export async function apiFetchMediaCatalog(
   query = '',

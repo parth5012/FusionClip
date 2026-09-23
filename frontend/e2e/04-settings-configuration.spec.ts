@@ -1,4 +1,4 @@
-import { test, expect, API_BASE, apiGetSettings, apiSaveSettings, apiResetSecrets, navigateToTab } from './fixtures';
+import { test, expect, API_BASE, apiConfigureTunnel, apiGetSettings, apiSaveSettings, apiResetSecrets, navigateToTab } from './fixtures';
 
 /**
  * Suite 4 — Settings & Configuration Console
@@ -185,6 +185,76 @@ test.describe('Settings Configuration', () => {
     const settings = await apiGetSettings();
     expect(settings.colab_tunnel_url).toBe(testTunnelUrl);
     expect(settings.colab_tunnel_status).toBe('running');
+  });
+
+  test('tunnel endpoint save writes through to backend and survives reload (#79)', async ({
+    page,
+  }) => {
+    // Start from a known backend state: no endpoint, disconnected intent.
+    await apiConfigureTunnel('', 'disconnected');
+
+    await page.goto('/');
+    await navigateToTab(page, 'Configuration');
+    await expect(page.getByText('System Integration Configuration')).toBeVisible({ timeout: 10000 });
+
+    const tunnelInput = page.locator('input[placeholder*="cloudflare" i]');
+    await expect(tunnelInput).toBeVisible();
+    // Backend holds no URL, so the input must start empty even if an old
+    // localStorage cache claimed otherwise.
+    await expect(tunnelInput).toHaveValue('');
+
+    // Save a new endpoint through the UI.
+    await tunnelInput.fill(testTunnelUrl);
+    await page.locator('button').filter({ hasText: /^save endpoint$/i }).click();
+    await expect(page.getByText('Saved!', { exact: false })).toBeVisible({ timeout: 5000 });
+
+    // The UI save must have reached the backend (localStorage-only fails here).
+    await expect
+      .poll(() => apiGetSettings().then((s) => s.colab_tunnel_url), { timeout: 5000 })
+      .toBe(testTunnelUrl);
+
+    // Wipe browser storage entirely: after a reload the UI must rehydrate
+    // from the backend, proving the backend is the source of truth.
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    await navigateToTab(page, 'Configuration');
+    await expect(page.getByText('System Integration Configuration')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('input[placeholder*="cloudflare" i]')).toHaveValue(testTunnelUrl, {
+      timeout: 10000,
+    });
+  });
+
+  test('tunnel Connect toggle persists intent to backend (#79)', async ({ page }) => {
+    await apiConfigureTunnel(testTunnelUrl, 'disconnected');
+
+    await page.goto('/');
+    await navigateToTab(page, 'Configuration');
+    await expect(page.getByText('System Integration Configuration')).toBeVisible({ timeout: 10000 });
+
+    // Without live notebook metrics the effective state is Disconnected,
+    // so the button offers to Connect.
+    const connectBtn = page.locator('button').filter({ hasText: /^connect$/i });
+    await expect(connectBtn).toBeVisible({ timeout: 5000 });
+    await connectBtn.click();
+
+    // The intent must land in the backend store (localStorage-only fails here).
+    await expect
+      .poll(() => apiGetSettings().then((s) => s.colab_tunnel_status), { timeout: 5000 })
+      .toBe('running');
+  });
+
+  test('header badge stays honestly offline when metrics are stale (#79)', async ({ page }) => {
+    // Intent "running" but no live notebook in CI: no metrics have arrived
+    // within 10s, so GET /api/colab/metrics reports disconnected and the UI
+    // must NOT claim Connected.
+    await apiConfigureTunnel(testTunnelUrl, 'running');
+
+    await page.goto('/');
+    const header = page.locator('header');
+    await expect(header).toBeVisible({ timeout: 10000 });
+
+    const badge = header.locator('div[title*="Colab" i]').last();
+    await expect(badge).toHaveAttribute('title', /offline/i, { timeout: 10000 });
   });
 
   test('header reflects missing API keys warning', async ({ page }) => {
