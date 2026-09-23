@@ -5,7 +5,7 @@ import logging
 
 import redis
 from celery.result import AsyncResult
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
 
 from app.celery_app import celery
 from app.config import settings
@@ -17,15 +17,22 @@ redis_client = redis.from_url(settings.REDIS_URL)
 
 router = APIRouter(tags=["tasks"])
 
+ALLOWED_TASK_TYPES = frozenset({"transcode", "thumbnail", "waveform", "audio_extract"})
+
 
 @router.post("/api/tasks/process")
 def run_processing_pipeline(
     path: str = Query(..., description="Key of the object to process"),
     task_type: str = Query(
-        "transcode", description="Generation pipeline: transcode, audio_extract, upscale"
+        "transcode", description="Pipeline type: transcode, audio_extract, thumbnail, waveform"
     ),
 ):
     """Dispatch long-running celery worker multimedia task processing pipeline."""
+    if task_type not in ALLOWED_TASK_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid task_type '{task_type}'. Allowed types: {sorted(ALLOWED_TASK_TYPES)}",
+        )
     task = process_multimedia_task.delay(path, task_type)
     return {
         "message": "Processing pipeline initiated successfully",
