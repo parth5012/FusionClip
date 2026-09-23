@@ -1,3 +1,9 @@
+import {
+  normalizeSettingsStatus,
+  resolveTunnelStatus,
+} from './tunnel';
+import type { TunnelStatus } from './tunnel';
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export interface StorageItem {
@@ -215,4 +221,71 @@ export async function fetchColabMetrics(): Promise<ColabMetricsResponse> {
     throw new Error('Failed to fetch Colab metrics');
   }
   return res.json();
+}
+
+/* ── Colab Tunnel (backend-backed, #79) ──────────────────────────────────
+ * The tunnel endpoint URL and connection intent live in the server-side
+ * settings store (keys `colab_tunnel_url` / `colab_tunnel_status`) and are
+ * written via POST /api/colab/tunnel. The *effective* status additionally
+ * honours the GET /api/colab/metrics 10s-staleness rule: a tunnel whose
+ * notebook stopped reporting is shown as disconnected even if the stored
+ * intent is still "running". Nothing here reads localStorage.
+ * ------------------------------------------------------------------------ */
+
+export type { TunnelStatus };
+
+export interface TunnelSettings {
+  url: string;
+  status: TunnelStatus;
+}
+
+export interface ColabTunnelState extends TunnelSettings {
+  /** Raw liveness from GET /api/colab/metrics (fresh notebook report?). */
+  metricsConnected: boolean;
+}
+
+/** Read the persisted tunnel URL + intent from GET /api/settings. */
+export async function fetchTunnelSettings(): Promise<TunnelSettings> {
+  const res = await fetch(`${API_BASE_URL}/api/settings`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch tunnel settings');
+  }
+  const body = await res.json();
+  return {
+    url: typeof body?.colab_tunnel_url === 'string' ? body.colab_tunnel_url : '',
+    status: normalizeSettingsStatus(body?.colab_tunnel_status),
+  };
+}
+
+/** Persist the tunnel URL + intent via POST /api/colab/tunnel. */
+export async function configureColabTunnel(
+  url: string,
+  status: TunnelStatus,
+): Promise<TunnelSettings> {
+  const res = await fetch(
+    `${API_BASE_URL}/api/colab/tunnel?url=${encodeURIComponent(url)}&status=${encodeURIComponent(status)}`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    throw new Error('Failed to configure Colab tunnel');
+  }
+  const body = await res.json();
+  return {
+    url: typeof body?.colab_url === 'string' ? body.colab_url : url,
+    status: normalizeSettingsStatus(body?.colab_status),
+  };
+}
+
+/** Effective tunnel state: settings intent resolved against metrics liveness. */
+export async function fetchColabTunnelState(): Promise<ColabTunnelState> {
+  const [settings, metrics] = await Promise.all([
+    fetchTunnelSettings(),
+    fetchColabMetrics(),
+  ]);
+  const metricsConnected = metrics.status === 'connected';
+  return {
+    url: settings.url,
+    status: resolveTunnelStatus(settings.status, metrics.status),
+    metricsConnected,
+  };
 }
