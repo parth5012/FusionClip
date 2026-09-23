@@ -18,7 +18,7 @@ import threading
 import zlib
 import requests
 
-from typing import Optional, Any, Callable
+from typing import Optional
 
 try:
     import psutil
