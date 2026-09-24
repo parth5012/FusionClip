@@ -9,6 +9,7 @@ import GenerationPanel from '../components/GenerationPanel';
 import SettingsPanel from '../components/SettingsPanel';
 import PlayersPanel from '../components/PlayersPanel';
 import MonitorPanel from '../components/MonitorPanel';
+import UpscalePanel from '../components/UpscalePanel';
 import { useStore } from '../store/useStore';
 
 export default function Home() {
@@ -32,6 +33,8 @@ export default function Home() {
         return <CatalogPanel />;
       case 'generation':
         return <GenerationPanel />;
+      case 'upscale':
+        return <UpscalePanel />;
       case 'players':
         return <PlayersPanel />;
       case 'settings':

@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-export type TabType = 'library' | 'catalog' | 'generation' | 'players' | 'settings' | 'tunnels' | 'monitor';
+export type TabType = 'library' | 'catalog' | 'generation' | 'upscale' | 'players' | 'settings' | 'tunnels' | 'monitor';
 
 export interface ProviderKeyStatus {
   configured: boolean;
