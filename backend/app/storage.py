@@ -79,6 +79,15 @@ def delete_object(object_name: str) -> bool:
         logger.error(f"Failed to delete object {object_name}: {e}")
         return False
 
+def get_object_bytes(object_name: str) -> bytes:
+    """Read binary bytes of an object from S3."""
+    try:
+        response = s3_client.get_object(Bucket=settings.MINIO_BUCKET_NAME, Key=object_name)
+        return response["Body"].read()
+    except Exception as e:
+        logger.error(f"Failed to read object {object_name} from MinIO: {e}")
+        raise
+
 def list_workspace_files(prefix: str = ""):
     """List S3 bucket directory content support directories hierarchy."""
     # Ensure prefix ends with '/' if it represents a folder

@@ -77,6 +77,14 @@ def stub_storage(monkeypatch):
     def _generate_url(object_name, expires_in=3600):
         return f"http://test-minio/{object_name}"
 
+    def _get_object_bytes(object_name):
+        if object_name in uploaded:
+            data = uploaded[object_name]["data"]
+            if isinstance(data, bytes):
+                return data
+            return str(data).encode("utf-8")
+        raise FileNotFoundError(f"Object {object_name} not in test storage")
+
     def _delete_object(object_name):
         deleted.append(object_name)
         uploaded.pop(object_name, None)
@@ -87,9 +95,10 @@ def stub_storage(monkeypatch):
             prefix += "/"
         return {"current_dir": prefix, "directories": [], "files": []}
 
-    for module in ("app.storage", "app.routers.storage", "app.routers.generate", "app.routers.media", "app.tasks"):
+    for module in ("app.storage", "app.routers.storage", "app.routers.generate", "app.routers.media", "app.tasks", "app.routers.upscale", "app.services.upscaler"):
         for name, impl in (
             ("upload_object", _upload_object),
+            ("get_object_bytes", _get_object_bytes),
             ("generate_url", _generate_url),
             ("delete_object", _delete_object),
             ("list_workspace_files", _list_workspace_files),
@@ -105,16 +114,19 @@ def stub_redis(monkeypatch, fake_redis):
     monkeypatch.setattr("app.routers.tasks.redis_client", fake_redis, raising=False)
     monkeypatch.setattr("app.routers.settings.redis_client", fake_redis, raising=False)
     monkeypatch.setattr("app.routers.generate.redis_client", fake_redis, raising=False)
+    monkeypatch.setattr("app.routers.upscale.redis_client", fake_redis, raising=False)
+    monkeypatch.setattr("app.services.upscaler.redis_client", fake_redis, raising=False)
     monkeypatch.setattr("app.tasks.redis_client", fake_redis, raising=False)
     return fake_redis
 
 
 def patch_tasks_db(monkeypatch, db_session):
-    """Ensure SessionLocal in app.tasks returns the test db_session."""
+    """Ensure SessionLocal in app.tasks and app.routers.upscale returns the test db_session."""
     class MockSessionLocal:
         def __call__(self):
             return db_session
     monkeypatch.setattr("app.tasks.SessionLocal", MockSessionLocal(), raising=False)
+    monkeypatch.setattr("app.routers.upscale.SessionLocal", MockSessionLocal(), raising=False)
 
 patch_tasks_db = pytest.fixture(autouse=True)(patch_tasks_db)
 
