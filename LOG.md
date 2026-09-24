@@ -96,3 +96,20 @@
 - Python compile check: clean.
 
 
+
+## 2026-09-24: Wayfinder Map #70 - Magnific Core Upscaler (#96 ship)
+
+### Iteration Status: Done
+
+- **#96 Ship presets, categories, bulk, compare, FileManager rewiring**
+  - Backend: `upscale.py` unique `task_token` output paths + status lookup via `file_path.contains(token)` (fixes 6-char task_id prefix collisions). 4 new tests in `test_upscale_ship.py`.
+  - Frontend: `utils/upscale.ts` helpers, `types.ts` piecewise slider-mapping parity, `api.ts` upscale client, `FileManager.tsx` live Upscale button/modal/jobs panel/polling, `VariantA.tsx` real source picker + bulk queue (max 8) + compare-on-complete.
+  - E2E: new `09-upscaler.spec.ts` (3 tests). Replaced corrupt shared `PNG_HEADER` fixture with PIL-verified 69-byte PNG (hand-rolled bytes had broken IDAT stream — upload accepted but pipeline decode failed).
+  - Local no-Docker stack for e2e: moto S3 :9000, backend :8001, frontend :3001 (8000/3000 occupied by another worktree).
+
+### Overall Verification:
+- Backend: `pytest backend/tests/ -q` → **223 passed**.
+- Typecheck: `tsc --noEmit` → TSC_OK.
+- Unit: `bun test frontend/src/utils/` → 10 pass.
+- E2E: `09-upscaler.spec.ts` → **3 passed** (registries, FileManager flow, Magnific panel).
+- Issue #96 closed with resolution comment.

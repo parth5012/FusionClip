@@ -1,15 +1,33 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  Folder, File, Upload, Trash2, Plus, Play, RefreshCw, 
+import {
+  Folder, File, Upload, Trash2, Plus, Play, RefreshCw,
   ChevronRight, Volume2, Video as VideoIcon, Image as ImageIcon,
-  Loader2, Cpu, ArrowLeft, ArrowUpRight, CheckCircle2, AlertCircle
+  Loader2, Cpu, ArrowLeft, ArrowUpRight, CheckCircle2, AlertCircle, Sparkles, X
 } from 'lucide-react';
-import { 
-  fetchFiles, uploadFile, deleteFile, createFolder, 
-  startTask, getTaskStatus, StorageItem, TaskStatusResponse 
+import {
+  fetchFiles, uploadFile, deleteFile, createFolder,
+  startTask, getTaskStatus, startUpscale, getUpscaleStatus,
+  StorageItem, TaskStatusResponse, UpscaleStatusResponse
 } from '../utils/api';
+import { isUpscalableImage } from '../utils/upscale';
+
+const UPSCALE_SCALES = [2, 4, 8, 16] as const;
+const UPSCALE_PRESETS = [
+  { id: 'subtle', label: 'Subtle' },
+  { id: 'vivid', label: 'Vivid' },
+  { id: 'wild', label: 'Wild' },
+  { id: 'custom', label: 'Custom' },
+] as const;
+const UPSCALE_CATEGORIES = [
+  { id: 'universal', label: 'Universal' },
+  { id: 'portraits', label: 'Portraits' },
+  { id: 'landscapes', label: 'Landscapes' },
+  { id: 'anime', label: 'Anime' },
+  { id: 'architecture', label: 'Architecture' },
+  { id: 'product', label: 'Product' },
+] as const;
 
 export default function FileManager() {
   const [currentDir, setCurrentDir] = useState<string>('');
@@ -34,6 +52,25 @@ export default function FileManager() {
     state: string;
     percent?: number;
     statusText?: string;
+  }>>({});
+
+  // Magnific upscale jobs (#96)
+  const [upscaleTarget, setUpscaleTarget] = useState<StorageItem | null>(null);
+  const [upscaleScale, setUpscaleScale] = useState<number>(4);
+  const [upscalePreset, setUpscalePreset] = useState<string>('vivid');
+  const [upscaleCategory, setUpscaleCategory] = useState<string>('universal');
+  const [upscalePrompt, setUpscalePrompt] = useState<string>('');
+  const [dispatchingUpscale, setDispatchingUpscale] = useState(false);
+  const [upscaleError, setUpscaleError] = useState<string | null>(null);
+  const [activeUpscaleJobs, setActiveUpscaleJobs] = useState<Record<string, {
+    id: string;
+    objectName: string;
+    scale: number;
+    state: string;
+    progress: number;
+    resultUrl?: string;
+    outputPath?: string;
+    error?: string;
   }>>({});
 
   const loadDirectory = async (dir: string) => {
@@ -96,6 +133,49 @@ export default function FileManager() {
 
     return () => clearInterval(interval);
   }, [activeTasks, currentDir]);
+
+  // Poll upscale job statuses (separate contract from Celery tasks: #96)
+  useEffect(() => {
+    const upscaleIds = Object.keys(activeUpscaleJobs).filter((id) =>
+      ['QUEUED', 'PROCESSING'].includes(activeUpscaleJobs[id].state)
+    );
+
+    if (upscaleIds.length === 0) return;
+
+    const interval = setInterval(async () => {
+      for (const id of upscaleIds) {
+        try {
+          const status: UpscaleStatusResponse = await getUpscaleStatus(id);
+
+          setActiveUpscaleJobs(prev => {
+            const current = prev[id];
+            if (!current) return prev;
+
+            const updated = {
+              ...current,
+              state: status.status,
+              progress: status.progress ?? current.progress,
+              resultUrl: status.result_url ?? current.resultUrl,
+              outputPath: status.output_path ?? current.outputPath,
+              error: status.error ?? current.error,
+            };
+
+            if (status.status === 'COMPLETED') {
+              // Output lands in the upscaled/ prefix — refresh so the new
+              // folder/file shows up when the user is browsing the root.
+              loadDirectory(currentDir);
+            }
+
+            return { ...prev, [id]: updated };
+          });
+        } catch (taskErr) {
+          console.error('Upscale polling error: ', taskErr);
+        }
+      }
+    }, 1500);
+
+    return () => clearInterval(interval);
+  }, [activeUpscaleJobs, currentDir]);
 
   // Navigate folder level
   const handleFolderClick = (dirPath: string) => {
@@ -188,6 +268,38 @@ export default function FileManager() {
     }
   };
 
+  // Dispatch Magnific upscale job (#96)
+  const handleStartUpscale = async () => {
+    if (!upscaleTarget) return;
+    setDispatchingUpscale(true);
+    setUpscaleError(null);
+    try {
+      const res = await startUpscale({
+        image_path: upscaleTarget.path,
+        scale: upscaleScale,
+        preset: upscalePreset,
+        category: upscaleCategory,
+        prompt: upscalePrompt.trim() || undefined,
+      });
+      setActiveUpscaleJobs(prev => ({
+        ...prev,
+        [res.task_id]: {
+          id: res.task_id,
+          objectName: upscaleTarget.name,
+          scale: res.scale,
+          state: res.status,
+          progress: 0,
+        },
+      }));
+      setUpscaleTarget(null);
+      setUpscalePrompt('');
+    } catch (err: any) {
+      setUpscaleError(err.message || 'Failed to start upscale job');
+    } finally {
+      setDispatchingUpscale(false);
+    }
+  };
+
   // Help format filesizes
   const formatSize = (bytes?: number) => {
     if (bytes === undefined || bytes === 0) return '0 B';
@@ -214,6 +326,62 @@ export default function FileManager() {
 
   return (
     <div className="space-y-6">
+      {/* Magnific upscale jobs panel (#96) */}
+      {Object.keys(activeUpscaleJobs).length > 0 && (
+        <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
+          <h3 className="font-semibold text-slate-200 mb-3 flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-emerald-400" />
+            Magnific Upscale Jobs
+          </h3>
+          <div className="space-y-3">
+            {Object.values(activeUpscaleJobs).map(job => (
+              <div key={job.id} className="bg-slate-950 p-3 rounded border border-slate-900 text-sm">
+                <div className="flex justify-between items-center mb-1">
+                  <span className="font-medium text-slate-300">
+                    {job.scale}x: <span className="text-slate-400 text-xs font-mono">{job.objectName}</span>
+                  </span>
+                  <span className={`text-xs px-2 py-0.5 rounded font-mono ${
+                    job.state === 'COMPLETED' ? 'bg-emerald-950 text-emerald-400' :
+                    job.state === 'FAILED' ? 'bg-rose-950 text-rose-400' :
+                    'bg-sky-950 text-sky-400 animate-pulse'
+                  }`}>
+                    {job.state}
+                  </span>
+                </div>
+
+                {job.state !== 'COMPLETED' && job.state !== 'FAILED' && (
+                  <div className="mt-2 w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                    <div
+                      className="bg-emerald-500 h-full transition-all duration-300"
+                      style={{ width: `${Math.max(job.progress, 5)}%` }}
+                    />
+                  </div>
+                )}
+
+                {job.state === 'COMPLETED' && job.resultUrl && (
+                  <a
+                    href={job.resultUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-1.5 inline-flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 underline underline-offset-2"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Open upscaled result{job.outputPath ? ` (${job.outputPath})` : ''}
+                  </a>
+                )}
+
+                {job.state === 'FAILED' && (
+                  <p className="text-xs text-rose-400 mt-1 flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5" />
+                    {job.error || 'Upscale job failed'}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Active Jobs panel */}
       {Object.keys(activeTasks).length > 0 && (
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-5">
@@ -424,12 +592,27 @@ export default function FileManager() {
                     </button>
                     <div className="w-[1px] h-3.5 bg-slate-850" />
                     <button
-                      disabled
-                      aria-disabled="true"
-                      className="text-xs opacity-50 cursor-not-allowed text-slate-500 p-1 px-1.5 rounded flex items-center gap-1"
-                      title="Upscale pipeline coming soon (pending Magnific Core map)"
+                      onClick={() => {
+                        if (isUpscalableImage(file.name)) {
+                          setUpscaleError(null);
+                          setUpscaleTarget(file);
+                        }
+                      }}
+                      disabled={!isUpscalableImage(file.name)}
+                      aria-disabled={!isUpscalableImage(file.name)}
+                      aria-label={`Upscale ${file.name}`}
+                      className={`text-xs p-1 px-1.5 rounded flex items-center gap-1 transition ${
+                        isUpscalableImage(file.name)
+                          ? 'text-slate-300 hover:bg-slate-800 hover:text-emerald-400'
+                          : 'opacity-50 cursor-not-allowed text-slate-500'
+                      }`}
+                      title={
+                        isUpscalableImage(file.name)
+                          ? 'Magnific generative upscale (2x–16x)'
+                          : 'Upscale supports image files only'
+                      }
                     >
-                      <Cpu className="w-3 h-3 text-slate-600" /> Upscale
+                      <Cpu className={`w-3 h-3 ${isUpscalableImage(file.name) ? 'text-emerald-500' : 'text-slate-600'}`} /> Upscale
                     </button>
                   </div>
 
@@ -457,6 +640,133 @@ export default function FileManager() {
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* Magnific upscale modal (#96) */}
+      {upscaleTarget && (
+        <div
+          data-testid="upscale-modal"
+          className="fixed inset-0 z-50 bg-slate-950/90 backdrop-blur-sm flex items-center justify-center p-4"
+        >
+          <div className="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-lg p-5 space-y-4 shadow-2xl">
+            <div className="flex items-start justify-between border-b border-slate-800 pb-3">
+              <div>
+                <h3 className="font-bold text-sm text-white flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-emerald-400" />
+                  Magnific Generative Upscale
+                </h3>
+                <p className="text-[11px] text-slate-400 font-mono mt-0.5 truncate max-w-xs">
+                  {upscaleTarget.path}
+                </p>
+              </div>
+              <button
+                onClick={() => setUpscaleTarget(null)}
+                className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition"
+                aria-label="Close upscale dialog"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Scale */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-300">Scale Factor</label>
+              <div className="flex gap-2">
+                {UPSCALE_SCALES.map((s) => (
+                  <button
+                    key={s}
+                    data-testid={`upscale-scale-${s}`}
+                    onClick={() => setUpscaleScale(s)}
+                    className={`flex-1 py-1.5 rounded-lg text-xs font-bold transition ${
+                      upscaleScale === s
+                        ? 'bg-emerald-500 text-slate-950'
+                        : 'bg-slate-800 text-slate-300 hover:bg-slate-750 border border-slate-700'
+                    }`}
+                  >
+                    {s}x
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Preset */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-300">Fidelity Preset</label>
+              <div className="grid grid-cols-4 gap-1.5">
+                {UPSCALE_PRESETS.map((p) => (
+                  <button
+                    key={p.id}
+                    data-testid={`upscale-preset-${p.id}`}
+                    onClick={() => setUpscalePreset(p.id)}
+                    className={`py-1.5 rounded-lg text-xs font-semibold transition ${
+                      upscalePreset === p.id
+                        ? 'bg-sky-600 text-white'
+                        : 'bg-slate-800 text-slate-400 hover:text-slate-200 border border-slate-700'
+                    }`}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Category */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-300">Content Category</label>
+              <select
+                value={upscaleCategory}
+                onChange={(e) => setUpscaleCategory(e.target.value)}
+                data-testid="upscale-category"
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-slate-200 focus:outline-none focus:border-sky-500"
+              >
+                {UPSCALE_CATEGORIES.map((c) => (
+                  <option key={c.id} value={c.id}>{c.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Prompt */}
+            <div className="space-y-1.5">
+              <label className="text-xs font-semibold text-slate-300">Prompt Guidance (optional)</label>
+              <textarea
+                rows={2}
+                value={upscalePrompt}
+                onChange={(e) => setUpscalePrompt(e.target.value)}
+                placeholder="e.g. ultra-detailed skin textures, 8k photograph..."
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg p-2.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500"
+              />
+            </div>
+
+            {upscaleError && (
+              <p className="text-xs text-rose-400 flex items-center gap-1.5">
+                <AlertCircle className="w-3.5 h-3.5" />
+                {upscaleError}
+              </p>
+            )}
+
+            <div className="flex gap-2 pt-1">
+              <button
+                onClick={() => setUpscaleTarget(null)}
+                className="flex-1 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition border border-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                data-testid="upscale-start"
+                onClick={handleStartUpscale}
+                disabled={dispatchingUpscale}
+                className="flex-[2] py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-2"
+              >
+                {dispatchingUpscale ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Cpu className="w-3.5 h-3.5" />
+                )}
+                Upscale Now ({upscaleScale}x)
+              </button>
+            </div>
           </div>
         </div>
       )}

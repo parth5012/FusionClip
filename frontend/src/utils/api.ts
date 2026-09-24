@@ -371,3 +371,111 @@ export async function generateImage(
   return postGenerate<GenerateImageResponse>(url, 'Image generation failed');
 }
 
+/* ── Magnific Upscaler API (#94 / #96) ──────────────────────────────── */
+
+export interface UpscalePayload {
+  image_path: string;
+  scale: number;
+  preset?: string;
+  creativity?: number;
+  resemblance?: number;
+  fractality?: number;
+  hdr?: number;
+  category?: string;
+  prompt?: string;
+}
+
+export interface UpscaleStartResponse {
+  message: string;
+  task_id: string;
+  status: string;
+  scale: number;
+  preset: string;
+  category: string;
+  output_path: string;
+  parameters: {
+    creativity: number;
+    resemblance: number;
+    fractality: number;
+    hdr: number;
+    denoise: number;
+    controlnet_scale: number;
+  };
+}
+
+export interface UpscaleStatusResponse {
+  task_id: string;
+  name: string | null;
+  status: string; // QUEUED | PROCESSING | COMPLETED | FAILED
+  progress: number;
+  error: string | null;
+  logs: string | null;
+  output_path: string | null;
+  result_url: string | null;
+}
+
+export interface UpscalePresetDefinition {
+  name: string;
+  description: string;
+  creativity: number;
+  resemblance: number;
+  fractality: number;
+  hdr: number;
+}
+
+export interface UpscaleCategoryDefinition {
+  label: string;
+  description: string;
+  prompt_keywords: string;
+}
+
+async function readErrorDetail(res: Response, fallback: string): Promise<string> {
+  const err = await res.json().catch(() => ({ detail: res.statusText }));
+  const detail = err?.detail;
+  if (typeof detail === 'string') return detail;
+  if (detail) return JSON.stringify(detail);
+  return fallback;
+}
+
+/** Dispatch a Magnific-style tile upscale job. */
+export async function startUpscale(payload: UpscalePayload): Promise<UpscaleStartResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/upscale`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Upscale request failed'));
+  }
+  return res.json();
+}
+
+/** Poll progress/result for an upscale job. */
+export async function getUpscaleStatus(taskId: string): Promise<UpscaleStatusResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/upscale/status/${encodeURIComponent(taskId)}`);
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to fetch upscale status'));
+  }
+  return res.json();
+}
+
+/** Engine preset registry (Subtle / Vivid / Wild / Custom). */
+export async function fetchUpscalePresets(): Promise<Record<string, UpscalePresetDefinition>> {
+  const res = await fetch(`${API_BASE_URL}/api/upscale/presets`);
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to fetch upscale presets'));
+  }
+  const body = await res.json();
+  return body.presets ?? {};
+}
+
+/** Engine content-category registry (v1 six categories). */
+export async function fetchUpscaleCategories(): Promise<Record<string, UpscaleCategoryDefinition>> {
+  const res = await fetch(`${API_BASE_URL}/api/upscale/categories`);
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to fetch upscale categories'));
+  }
+  const body = await res.json();
+  return body.categories ?? {};
+}
+

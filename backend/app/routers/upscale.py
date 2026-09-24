@@ -90,9 +90,13 @@ def trigger_upscale(
             detail=f"Invalid category '{payload.category}'. Allowed: {list(CONTENT_CATEGORIES.keys())}",
         )
 
-    task_id = f"upscale_{uuid.uuid4().hex[:12]}"
+    # Unique per-job token: task_id[:6] used to collapse to the shared
+    # "upscal" prefix for every task, so concurrent jobs on the same source
+    # overwrote each other's output and status lookups cross-linked (#96).
+    task_token = uuid.uuid4().hex[:12]
+    task_id = f"upscale_{task_token}"
     clean_stem = Path(payload.image_path).stem
-    output_path = f"upscaled/{clean_stem}_{payload.scale}x_{task_id[:6]}.png"
+    output_path = f"upscaled/{clean_stem}_{payload.scale}x_{task_token}.png"
 
     db_task = Task(
         task_id=task_id,
@@ -149,8 +153,14 @@ def get_upscale_task_status(task_id: str, db: Session = Depends(get_db)):
     output_path = None
 
     if db_task.status == "COMPLETED":
-        # Check if output media asset exists
-        asset = db.query(MediaAsset).filter(MediaAsset.title.contains(task_id[:6])).first()
+        # Resolve THIS task's output asset via the unique token embedded in
+        # the object key — never via title, which is shared across jobs.
+        task_token = task_id.split("_", 1)[-1]
+        asset = (
+            db.query(MediaAsset)
+            .filter(MediaAsset.file_path.contains(task_token))
+            .first()
+        )
         if asset:
             output_path = asset.file_path
             result_url = generate_url(asset.file_path)

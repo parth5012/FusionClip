@@ -42,3 +42,12 @@
 - API token authentication in FastAPI handlers should use `secrets.compare_digest` rather than `!=` to eliminate timing side channels, and must check that both candidate and secret are non-empty strings.
 
 
+
+## 2026-09-24: Magnific upscaler ship (#96)
+
+- **`task_id[:6]` is not unique enough**: two `upscale_*` ids sharing the first 6 chars cross-linked `file_path.contains(prefix)` status lookups → silent wrong-job results. Fix: per-job `uuid4().hex[:12]` token embedded in the output object path; status lookup contains the token (not the id prefix).
+- **Hand-rolled "minimal PNG" bytes can be structurally valid (signature/IHDR/IEND) yet have a corrupt IDAT stream**: FastAPI upload round-trips bytes fine, but PIL `Image.open().convert('RGB')` raises `OSError: broken data stream when reading image file` only when the pipeline decodes. E2E fixture must be PIL-verified, not just byte-plausible. A 1×1 PNG with IDAT `78 9c 63 f8 cf c0 00 00 03 01 01 00 c9 fe 92 ef` (zlib deflate of `\x00\xff\x00\x00\x00`) decodes cleanly.
+- **Playwright `<option>` elements inside a closed `<select>` are never "visible"**: `expect(option).toBeVisible()` always fails even when the option is present. Assert `toHaveCount(1)` (or rely on `selectOption`'s built-in wait) instead.
+- **E2E tests that seed state via an earlier test are order-coupled**: making the panel test self-seed its own upload via `apiUploadFile` removes the dependency on test 2's UI upload having completed.
+- **No-Docker local e2e stack recipe**: moto server on :9000 + uvicorn :8001 (SQLITE DATABASE_URL, MINIO_ENDPOINT=127.0.0.1:9000, CORS_ORIGINS for the next dev origin) + `next dev` on :3001 with `NEXT_PUBLIC_API_URL` pointing at the backend. Ports 8000/3000 may be held by a sibling worktree — pick alternates.
+- **Playwright browser revision mismatch workaround**: when `npx playwright install` can't fetch (CDN redirect 400), symlink the expected revision dir (`chromium-1234 -> chromium-1243`) in `~/.cache/ms-playwright/`; binary layout matches on linux-x64.

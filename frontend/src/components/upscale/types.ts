@@ -99,20 +99,32 @@ export interface QueueItem {
   stepMessage?: string;
   previewUrl: string;
   resultUrl?: string;
+  /** Backend task id once dispatched (absent while still pending in the bulk queue). */
+  taskId?: string;
+  /** Storage object key of the source image. */
+  sourcePath?: string;
 }
 
 /**
- * Maps -10..+10 creativity slider to diffusion denoise strength [0.10, 0.65]
+ * Maps -10..+10 creativity slider to diffusion denoise strength [0.10, 0.65].
+ * Piecewise so the default (0) lands exactly on 0.35 — must stay in lockstep
+ * with backend `map_creativity_to_denoise` (#93/#96).
  */
 export function mapCreativityToDenoise(val: number): number {
-  const norm = (val + 10) / 20; // 0..1
-  return Number((0.10 + norm * 0.55).toFixed(2));
+  const v = Math.max(-10, Math.min(10, val));
+  return v <= 0
+    ? Number((0.35 + (v / 10) * 0.25).toFixed(2))
+    : Number((0.35 + (v / 10) * 0.3).toFixed(2));
 }
 
 /**
- * Maps -10..+10 resemblance slider to ControlNet conditioning scale [0.40, 1.20]
+ * Maps -10..+10 resemblance slider to ControlNet conditioning weight [0.40, 1.20].
+ * Piecewise so the default (0) lands exactly on 0.85 — mirrors backend
+ * `map_resemblance_to_controlnet` (#93/#96).
  */
 export function mapResemblanceToControlNet(val: number): number {
-  const norm = (val + 10) / 20; // 0..1
-  return Number((0.40 + norm * 0.80).toFixed(2));
+  const v = Math.max(-10, Math.min(10, val));
+  return v <= 0
+    ? Number((0.85 + (v / 10) * 0.45).toFixed(2))
+    : Number((0.85 + (v / 10) * 0.35).toFixed(2));
 }
