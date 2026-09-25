@@ -87,7 +87,17 @@ def stub_storage(monkeypatch):
             prefix += "/"
         return {"current_dir": prefix, "directories": [], "files": []}
 
-    for module in ("app.storage", "app.routers.storage", "app.routers.generate", "app.routers.media", "app.tasks"):
+    # Every module that binds these helpers into its own namespace needs an entry
+    # here, otherwise it calls the real storage client and the stub silently
+    # records nothing. Patch where the name is *read*, not where it is defined.
+    for module in (
+        "app.storage",
+        "app.routers.storage",
+        "app.routers.generate",
+        "app.routers.media",
+        "app.tasks",
+        "app.ml.image",
+    ):
         for name, impl in (
             ("upload_object", _upload_object),
             ("generate_url", _generate_url),

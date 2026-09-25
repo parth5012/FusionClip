@@ -25,6 +25,11 @@ from app.ml.registry import (
     ModelRegistry,
     model_registry,
 )
+from app.ml.image import (
+    ASPECT_RATIO_DIMENSIONS,
+    SUPPORTED_SCHEDULERS,
+    run_local_image_generation,
+)
 
 __all__ = [
     "DegradedReason",
@@ -40,4 +45,7 @@ __all__ = [
     "ModelMetadata",
     "ModelRegistry",
     "model_registry",
+    "SUPPORTED_SCHEDULERS",
+    "ASPECT_RATIO_DIMENSIONS",
+    "run_local_image_generation",
 ]
