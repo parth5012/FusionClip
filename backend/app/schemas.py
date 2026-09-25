@@ -109,10 +109,71 @@ class GenerationTextOut(GenerationOut):
     output: str
 
 
+class GenerationAnalyzedFile(BaseModel):
+    """One uploaded media file handed to the Gemini multimodal pipeline."""
+
+    filename: str
+    original_name: str
+    content_type: str
+    url: str
+    gemini_file: Optional[str] = None
+    gemini_uri: Optional[str] = None
+
+
+class GenerationMultimodalOut(GenerationOut):
+    """Response from /api/generate/text when media files are attached."""
+
+    output: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    analyzed_files: List[GenerationAnalyzedFile] = Field(default_factory=list)
+
+
+class GenerationGeminiImageOut(GenerationOut):
+    prompt: str
+    model: str
+    filename: str
+    url: str
+    content_type: str
+
+
+class GenerationGeminiVideoOut(GenerationOut):
+    prompt: str
+    model: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    url: Optional[str] = None
+    filename: Optional[str] = None
+
+
 class GenerationAudioOut(GenerationOut):
     type: str
     filename: str
     url: str
+
+
+class GenerationTtsOut(GenerationOut):
+    """Response from POST /api/generate/tts (real ElevenLabs synthesis)."""
+
+    voice_id: str
+    model: str
+    stability: float
+    clarity: float
+    filename: str
+    url: str
+    content_type: str
+
+
+class GenerationVoice(BaseModel):
+    """One ElevenLabs voice surfaced by the voice-list endpoint."""
+
+    voice_id: str
+    name: Optional[str] = None
+    labels: Dict[str, str] = Field(default_factory=dict)
+    category: Optional[str] = None
+    preview_url: Optional[str] = None
+
+
+class GenerationVoiceListOut(GenerationOut):
+    voices: List[GenerationVoice] = Field(default_factory=list)
 
 
 class GenerationImageParameters(BaseModel):
@@ -129,6 +190,15 @@ class GenerationImageOut(GenerationOut):
 # --- Media -----------------------------------------------------------------
 
 
+class UpscaledAssetOut(BaseModel):
+    """A derived asset (e.g. an upscaled output) linked to a source asset."""
+
+    id: int
+    title: str
+    file_path: str
+    url: str
+
+
 class MediaAssetOut(BaseModel):
     id: int
     title: str
@@ -137,4 +207,23 @@ class MediaAssetOut(BaseModel):
     content_type: str
     duration: Optional[float] = None
     url: str
+    # Before/after comparison support (#58): the original this asset was
+    # derived from, plus any upscaled outputs derived from this asset.
+    source_path: Optional[str] = None
+    source_url: Optional[str] = None
+    upscaled_assets: List[UpscaledAssetOut] = Field(default_factory=list)
     created_at: Optional[str] = None
+
+
+# --- Batch Export ---------------------------------------------------------
+
+
+class BatchExportIn(BaseModel):
+    paths: list[str] = Field(..., min_length=1)
+    format: str = "original"
+
+
+class BatchExportOut(BaseModel):
+    message: str
+    task_id: str
+    status: str

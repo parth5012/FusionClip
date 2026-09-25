@@ -11,8 +11,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
@@ -25,6 +25,7 @@ from app.services.upscaler import (
     map_resemblance_to_controlnet,
 )
 from app.storage import generate_url
+from app.tasks import process_upscale_task
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +46,56 @@ class UpscaleRequest(BaseModel):
     prompt: Optional[str] = Field(None, description="Optional prompt guidance")
 
 
+class LegacyUpscaleRequest(BaseModel):
+    """Celery-dispatch request shape (moved here from app.routers.tasks /api/upscale)."""
+
+    denoising_strength: float = 0.35
+    controlnet_weight: float = 1.25
+    preset: str = "Portraits"
+    preview: bool = False
+
+
 @router.post("")
-def trigger_upscale(
-    payload: UpscaleRequest,
+async def trigger_upscale(
+    request: Request,
     background_tasks: BackgroundTasks,
+    path: Optional[str] = Query(
+        None, description="Legacy Celery dispatch: key of the image object to upscale"
+    ),
     db: Session = Depends(get_db),
 ):
-    """Trigger a Magnific-style generative tile upscale."""
+    """Trigger a Magnific-style generative tile upscale.
+
+    With a ``path`` query parameter this preserves the legacy Celery dispatch
+    flow (Task row + process_upscale_task.delay). Without it the JSON body
+    drives the local tile-upscale pipeline.
+    """
+    raw_body = {}
+    if (request.headers.get("content-type") or "").split(";")[0].strip() == "application/json":
+        try:
+            parsed = await request.json()
+            if isinstance(parsed, dict):
+                raw_body = parsed
+        except Exception:
+            raw_body = {}
+
+    if path is not None:
+        legacy = LegacyUpscaleRequest(**raw_body)
+        task_id = f"upscale_{uuid.uuid4().hex[:8]}"
+        db_task = Task(task_id=task_id, name="upscale", status="PROCESSING", progress=0)
+        db.add(db_task)
+        db.commit()
+        process_upscale_task.delay(task_id, path, legacy.model_dump())
+        return {
+            "message": "Upscale task initiated successfully",
+            "task_id": task_id,
+            "status": "PROCESSING",
+        }
+
+    try:
+        payload = UpscaleRequest.model_validate(raw_body)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
     if payload.scale not in ALLOWED_SCALES:
         raise HTTPException(
             status_code=400,

@@ -6,7 +6,9 @@ import {
   Pause, 
   Volume2, 
   VolumeX, 
-  Upload, 
+  Upload,
+  Captions,
+  Subtitles,
   ChevronLeft, 
   ChevronRight, 
   Music, 
@@ -45,8 +47,14 @@ export default function PlayersPanel() {
   const [videoPlaybackRate, setVideoPlaybackRate] = useState<number>(1.0);
   const [videoLoop, setVideoLoop] = useState<boolean>(false);
   const [videoError, setVideoError] = useState<string | null>(null);
-
   const videoRef = useRef<HTMLVideoElement>(null);
+
+  // Subtitle track support (#46)
+  const [subtitleTracks, setSubtitleTracks] = useState<
+    { id: string; label: string; language: string; cues: { start: number; end: number; text: string }[] }[]
+  >([]);
+  const [activeSubtitleId, setActiveSubtitleId] = useState<string | null>(null);
+  const [subtitlesEnabled, setSubtitlesEnabled] = useState<boolean>(false);
 
   // Load and destroy Wavesurfer instance
   useEffect(() => {
@@ -256,6 +264,70 @@ export default function PlayersPanel() {
       setIsVideoPlaying(false);
     }
   };
+  // Parse SRT or WebVTT subtitle content into cue objects
+  const parseSubtitleFile = (
+    text: string,
+    filename: string
+  ): { start: number; end: number; text: string }[] => {
+    const cues: { start: number; end: number; text: string }[] = [];
+    const timestampPattern =
+      /(\d{1,2}):(\d{2}):(\d{2})[,.]\d{1,3}\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.]\d{1,3}/;
+    const parseTime = (h: string, m: string, s: string, ms: string) =>
+      parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + parseInt(s, 10) + parseInt(ms.padEnd(3, '0'), 10) / 1000;
+
+    const blocks = text.split(/\r?\n\r?\n/);
+    blocks.forEach((block) => {
+      const blockLines = block.split(/\r?\n/);
+      const timingLine = blockLines.find((line) => line.includes('-->'));
+      if (!timingLine) return;
+      const match = timingLine.match(timestampPattern);
+      if (!match) return;
+      const start = parseTime(match[1], match[2], match[3], match[4]);
+      const end = parseTime(match[5], match[6], match[7], match[8]);
+      const textIndex = blockLines.indexOf(timingLine) + 1;
+      const cueText = blockLines
+        .slice(textIndex)
+        .filter((line) => line.trim() !== '')
+        .join(' ')
+        .replace(/<[^>]+>/g, '')
+        .trim();
+      if (cueText) {
+        cues.push({ start, end, text: cueText });
+      }
+    });
+    return cues.sort((a, b) => a.start - b.start);
+  };
+
+  // Add a subtitle track from an uploaded .srt / .vtt file
+  const handleSubtitleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const content = String(reader.result || '');
+      const cues = parseSubtitleFile(content, file.name);
+      const label = file.name.replace(/\.(srt|vtt)$/i, '') || file.name;
+      const id = `${Date.now()}-${label}`;
+      setSubtitleTracks((prev) => [...prev, { id, label, language: label, cues }]);
+      setActiveSubtitleId(id);
+      setSubtitlesEnabled(true);
+      setVideoError(null);
+    };
+    reader.onerror = () => {
+      setVideoError('Failed to read subtitle file');
+    };
+    reader.readAsText(file);
+  };
+
+  // Resolve the currently visible cue from the active track
+  const activeSubtitleTrack =
+    subtitleTracks.find((track) => track.id === activeSubtitleId) || null;
+  const activeSubtitleCue =
+    activeSubtitleTrack && subtitlesEnabled
+      ? activeSubtitleTrack.cues.find(
+          (cue) => videoCurrentTime >= cue.start && videoCurrentTime < cue.end
+        ) || null
+      : null;
 
   // Human friendly formatting
   const formatTime = (timeInSeconds: number) => {
@@ -463,6 +535,17 @@ export default function PlayersPanel() {
                   onChange={handleVideoFileUpload} 
                 />
               </label>
+                {/* Subtitle upload */}
+                <label className="cursor-pointer px-3 py-1 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded border border-slate-700 flex items-center gap-1.5 transition-colors">
+                  <Captions className="w-3 h-3" />
+                  Upload Subtitles
+                  <input
+                    type="file"
+                    accept=".srt,.vtt,text/vtt"
+                    className="hidden"
+                    onChange={handleSubtitleFileUpload}
+                  />
+                </label>
             </div>
 
             {videoError && (
@@ -487,8 +570,17 @@ export default function PlayersPanel() {
               {!isVideoPlaying && (
                 <div onClick={handleVideoPlayPause} className="absolute inset-0 flex items-center justify-center bg-slate-950/30 cursor-pointer transition-opacity group-hover:bg-slate-950/40">
                   <div className="p-4 rounded-full bg-slate-950/80 border border-slate-800/80 text-indigo-400 hover:text-indigo-300 hover:scale-105 transition">
-                    <Play className="w-6 h-6 fill-indigo-400/20" />
+                  <Play className="w-6 h-6 fill-indigo-400/20" />
                   </div>
+                </div>
+              )}
+
+              {/* Subtitle overlay */}
+              {activeSubtitleCue && (
+                <div className="absolute bottom-4 left-0 right-0 flex justify-center px-6 pointer-events-none">
+                  <span className="bg-black/75 text-white text-base font-medium px-3 py-1.5 rounded-md text-center max-w-[90%] shadow-lg">
+                    {activeSubtitleCue.text}
+                  </span>
                 </div>
               )}
             </div>
@@ -587,6 +679,38 @@ export default function PlayersPanel() {
                   onChange={handleVideoVolumeChange}
                   className="w-16 h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
                 />
+              </div>
+              {/* Group 3: Subtitles */}
+              <div className="flex items-center gap-2 bg-slate-950/40 px-3 py-1.5 rounded border border-slate-800/40">
+                <button
+                  onClick={() => setSubtitlesEnabled((v) => !v)}
+                  disabled={subtitleTracks.length === 0}
+                  className={`p-1 rounded transition disabled:opacity-40 ${
+                    subtitlesEnabled && activeSubtitleId
+                      ? 'text-amber-400 hover:text-amber-300'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                  title={subtitlesEnabled ? 'Hide subtitles' : 'Show subtitles'}
+                >
+                  <Captions className="w-4 h-4" />
+                </button>
+                <select
+                  value={activeSubtitleId || ''}
+                  onChange={(e) => {
+                    setActiveSubtitleId(e.target.value || null);
+                    if (e.target.value) setSubtitlesEnabled(true);
+                  }}
+                  disabled={subtitleTracks.length === 0}
+                  className="bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[11px] text-slate-300 focus:outline-none focus:border-amber-500 max-w-[140px]"
+                  title="Select subtitle track"
+                >
+                  <option value="">Off</option>
+                  {subtitleTracks.map((track) => (
+                    <option key={track.id} value={track.id}>
+                      {track.label}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               {/* Loop / Rate Options */}

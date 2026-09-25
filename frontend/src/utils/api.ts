@@ -40,6 +40,37 @@ export interface TaskStatusResponse {
   info: any;
 }
 
+export interface TaskListItem {
+  id: number;
+  task_id: string;
+  name: string;
+  status: string;
+  progress: number;
+  error: string | null;
+  logs: string | null;
+  traceback: string | null;
+  error_type: string | null;
+  retry_count: number;
+  max_retries: number;
+  last_retry_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface TaskListResponse {
+  total: number;
+  page: number;
+  page_size: number;
+  tasks: TaskListItem[];
+}
+
+export interface RetryResponse {
+  message: string;
+  original_task_id: string;
+  new_task_id: string;
+  retry_count: number;
+}
+
 export async function fetchFiles(prefix = ''): Promise<ListResponse> {
   const url = `${API_BASE_URL}/api/storage/list?prefix=${encodeURIComponent(prefix)}`;
   const res = await fetch(url);
@@ -53,12 +84,12 @@ export async function uploadFile(file: File, folder = ''): Promise<UploadRespons
   const url = `${API_BASE_URL}/api/storage/upload?folder=${encodeURIComponent(folder)}`;
   const formData = new FormData();
   formData.append('file', file);
-  
+
   const res = await fetch(url, {
     method: 'POST',
     body: formData,
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to upload file');
   }
@@ -70,7 +101,7 @@ export async function deleteFile(path: string): Promise<{ message: string }> {
   const res = await fetch(url, {
     method: 'DELETE',
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to delete file');
   }
@@ -82,19 +113,40 @@ export async function createFolder(folderPath: string): Promise<{ message: strin
   const res = await fetch(url, {
     method: 'POST',
   });
-  
+
   if (!res.ok) {
     throw new Error('Failed to create folder');
   }
   return res.json();
 }
 
-export async function startTask(path: string, taskType = 'transcode'): Promise<TaskResponse> {
-  const url = `${API_BASE_URL}/api/tasks/process?path=${encodeURIComponent(path)}&task_type=${encodeURIComponent(taskType)}`;
+export interface UpscaleParams {
+  denoise?: number; // Denoising Strength (Creativity)
+  controlnet_weight?: number; // ControlNet Weight (Resemblance)
+  hdr?: number; // HDR post-pass strength
+  fractality?: number; // Fractality noise + guidance bump
+  prompt?: string; // optional img2img positive prompt
+  temporal_strength?: number; // video_upscale: motion-aware temporal blend 0..1 (0 = off)
+}
+
+export async function startTask(
+  path: string,
+  taskType = 'transcode',
+  upscaleParams?: UpscaleParams
+): Promise<TaskResponse> {
+  let url = `${API_BASE_URL}/api/tasks/process?path=${encodeURIComponent(path)}&task_type=${encodeURIComponent(taskType)}`;
+  if (upscaleParams) {
+    if (upscaleParams.denoise !== undefined) url += `&denoise=${encodeURIComponent(upscaleParams.denoise)}`;
+    if (upscaleParams.controlnet_weight !== undefined) url += `&controlnet_weight=${encodeURIComponent(upscaleParams.controlnet_weight)}`;
+    if (upscaleParams.hdr !== undefined) url += `&hdr=${encodeURIComponent(upscaleParams.hdr)}`;
+    if (upscaleParams.fractality !== undefined) url += `&fractality=${encodeURIComponent(upscaleParams.fractality)}`;
+    if (upscaleParams.prompt) url += `&prompt=${encodeURIComponent(upscaleParams.prompt)}`;
+    if (upscaleParams.temporal_strength !== undefined) url += `&temporal_strength=${encodeURIComponent(upscaleParams.temporal_strength)}`;
+  }
   const res = await fetch(url, {
     method: 'POST',
   });
-  
+
   if (!res.ok) {
     throw new Error(`Failed to start task: ${taskType}`);
   }
@@ -110,6 +162,61 @@ export async function getTaskStatus(taskId: string): Promise<TaskStatusResponse>
   return res.json();
 }
 
+export interface UpscaledAsset {
+  id: number;
+  title: string;
+  file_path: string;
+  url: string;
+}
+
+
+export async function fetchTasks(
+  page = 1,
+  pageSize = 25,
+  status?: string,
+  taskType?: string,
+  search?: string,
+  errorType?: string,
+): Promise<TaskListResponse> {
+  const params = new URLSearchParams();
+  params.set('page', String(page));
+  params.set('page_size', String(pageSize));
+  if (status) params.set('status', status);
+  if (taskType) params.set('type', taskType);
+  if (search) params.set('search', search);
+  if (errorType) params.set('error_type', errorType);
+  const url = `${API_BASE_URL}/api/tasks/list?${params.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch tasks');
+  }
+  return res.json();
+}
+
+export async function retryTask(taskId: string): Promise<RetryResponse> {
+  const url = `${API_BASE_URL}/api/tasks/${taskId}/retry`;
+  const res = await fetch(url, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || 'Failed to retry task');
+  }
+  return res.json();
+}
+
+export async function getErrorTypes(): Promise<string[]> {
+  const url = `${API_BASE_URL}/api/tasks/errors/types`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch error types');
+  }
+  const data = await res.json();
+  return data.error_types;
+}
+
+
+
 export interface MediaAsset {
   id: number;
   title: string;
@@ -118,6 +225,11 @@ export interface MediaAsset {
   content_type: string;
   duration: number;
   url: string;
+  // Before/after comparison support (#58): the original this asset was
+  // derived from, plus any upscaled outputs derived from this asset.
+  source_path: string | null;
+  source_url: string | null;
+  upscaled_assets: UpscaledAsset[];
   created_at: string | null;
 }
 
@@ -132,11 +244,30 @@ export async function fetchMediaCatalog(query = '', limit = 20): Promise<MediaAs
   return res.json();
 }
 
-/* ── Provider API keys ─────────────────────────────────────────────────────
- * Keys are submitted once in plaintext and stored encrypted server-side.
- * They are never readable again: the status endpoint returns only whether a
- * provider is configured plus the last four characters.
- * ------------------------------------------------------------------------ */
+/* Provider API keys */
+export async function getApiKey(provider: string): Promise<{ key: string | null }> {
+  const url = `${API_BASE_URL}/api/config/${provider}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch API key');
+  }
+  return res.json();
+}
+
+export async function setApiKey(provider: string, key: string): Promise<{ message: string }> {
+  const url = `${API_BASE_URL}/api/config/${provider}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key }),
+  });
+  if (!res.ok) {
+    throw new Error('Failed to set API key');
+  }
+  return res.json();
+}
+
+/* ── Provider API keys (encrypted server-side) ────────────────────────── */
 
 export type SecretProvider = 'gemini' | 'elevenlabs';
 
@@ -333,6 +464,14 @@ async function postGenerate<T>(url: string, fallbackMessage: string): Promise<T>
   return res.json();
 }
 
+export async function fetchSettings(): Promise<Record<string, string>> {
+  const res = await fetch(`${API_BASE_URL}/api/settings`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch settings');
+  }
+  return res.json();
+}
+
 export async function generateText(prompt: string, model?: string): Promise<GenerateTextResponse> {
   const params = new URLSearchParams({ prompt });
   if (model) params.set('model', model);
@@ -450,6 +589,43 @@ export async function startUpscale(payload: UpscalePayload): Promise<UpscaleStar
   return res.json();
 }
 
+export async function saveSettings(data: Record<string, any>): Promise<any> {
+  const res = await fetch(`${API_BASE_URL}/api/settings`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    throw new Error('Failed to save settings');
+  }
+  return res.json();
+}
+
+export interface BatchExportResponse {
+  message: string;
+  task_id: string;
+  status: string;
+}
+
+export async function startBatchExport(
+  paths: string[],
+  format: string = 'original'
+): Promise<BatchExportResponse> {
+  const url = `${API_BASE_URL}/api/storage/download-batch`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ paths, format }),
+  });
+
+  if (!res.ok) {
+    throw new Error('Failed to start batch export');
+  }
+  return res.json();
+}
+
 /** Poll progress/result for an upscale job. */
 export async function getUpscaleStatus(taskId: string): Promise<UpscaleStatusResponse> {
   const res = await fetch(`${API_BASE_URL}/api/upscale/status/${encodeURIComponent(taskId)}`);
@@ -479,3 +655,15 @@ export async function fetchUpscaleCategories(): Promise<Record<string, UpscaleCa
   return body.categories ?? {};
 }
 
+export function triggerDownload(url: string, filename?: string) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  if (filename) {
+    a.download = filename;
+  }
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}

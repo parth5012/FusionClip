@@ -30,4 +30,5 @@ celery.conf.task_queues = (
 celery.conf.task_routes = {
     'app.tasks.process_media_fast': {'queue': 'media.fast'},
     'app.tasks.process_media_heavy': {'queue': 'media.heavy'},
+    'app.tasks.generate_media_embedding': {'queue': 'media.fast'},
 }

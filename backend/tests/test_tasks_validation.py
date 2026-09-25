@@ -6,14 +6,15 @@ import pytest
 class TestTaskTypeValidation:
     def test_unknown_task_type_rejected_with_400(self, client):
         """POST /api/tasks/process must reject unknown/unimplemented task types with 400."""
-        # 'upscale' is not implemented in v1 and was previously lying by running a transcode
-        res = client.post("/api/tasks/process?path=sample.mp4&task_type=upscale")
+        # 'upscale'/'video_upscale' are real pipelines now (#96 + upscaler), so
+        # only genuinely unknown names must trip the enum guard.
+        res = client.post("/api/tasks/process?path=sample.mp4&task_type=unknown_pipeline")
         assert res.status_code == 400
-        assert "Invalid task_type 'upscale'" in res.json()["detail"]
+        assert "Invalid task_type 'unknown_pipeline'" in res.json()["detail"]
         assert "Allowed types" in res.json()["detail"]
 
         # Completely bogus pipeline name
-        res_bogus = client.post("/api/tasks/process?path=sample.mp4&task_type=unknown_pipeline")
+        res_bogus = client.post("/api/tasks/process?path=sample.mp4&task_type=definitely_not_real")
         assert res_bogus.status_code == 400
 
     def test_implemented_task_types_accepted(self, client, monkeypatch):

@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>FusionClip — Before/After Comparison Slider (Prototype)</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --panel: #1e293b;
+    --panel-2: #0f172a;
+    --border: #1e293b;
+    --border-2: #334155;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --sky: #38bdf8;
+    --emerald: #34d399;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+  }
+  .app-shell { max-width: 1100px; margin: 0 auto; padding: 24px 20px 64px; }
+  header.top {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding-bottom: 16px; margin-bottom: 20px; border-bottom: 1px solid var(--border);
+  }
+  header.top h1 { font-size: 18px; font-weight: 700; }
+  header.top .sub { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .badge {
+    font-size: 10px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+    padding: 4px 10px; border-radius: 6px;
+    background: rgba(56, 189, 248, .12); color: var(--sky); border: 1px solid rgba(56, 189, 248, .35);
+    white-space: nowrap;
+  }
+
+  /* ---- Placement switcher ---- */
+  .placement-bar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 24px;
+  }
+  .placement-bar .label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-right: 6px; }
+  .placement-bar button {
+    font-size: 12px; font-weight: 600; padding: 7px 12px; border-radius: 7px; cursor: pointer;
+    background: var(--panel-2); color: var(--muted); border: 1px solid var(--border-2);
+    transition: all .15s ease;
+  }
+  .placement-bar button.active { background: rgba(56, 189, 248, .14); color: var(--sky); border-color: rgba(56, 189, 248, .5); }
+  .placement-bar button:hover { border-color: var(--sky); color: var(--text); }
+
+  /* ---- The comparison slider ---- */
+  .compare-wrap { position: relative; width: 100%; border-radius: 12px; overflow: hidden; user-select: none; touch-action: none; }
+  .compare-wrap img { display: block; width: 100%; height: auto; }
+  .compare-before, .compare-after { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .compare-before { overflow: hidden; }
+  .compare-before img, .compare-after img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .compare-divider {
+    position: absolute; top: 0; bottom: 0; width: 2px; background: #fff;
+    box-shadow: 0 0 0 1px rgba(15, 23, 42, .25), 0 0 12px rgba(0,0,0,.5);
+    cursor: ew-resize; z-index: 5;
+  }
+  .compare-handle {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    width: 38px; height: 38px; border-radius: 50%;
+    background: #fff; color: #0f172a;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 2px 10px rgba(0,0,0,.4);
+    font-size: 14px; font-weight: 800; z-index: 6;
+  }
+  .compare-handle::before, .compare-handle::after {
+    content: ""; position: absolute; width: 2px; height: 12px; background: #0f172a; top: 50%; transform: translateY(-50%);
+  }
+  .compare-handle::before { left: 12px; }
+  .compare-handle::after { right: 12px; }
+  .tag {
+    position: absolute; z-index: 7; top: 14px; font-size: 11px; font-weight: 700;
+    letter-spacing: .04em; text-transform: uppercase; padding: 5px 10px; border-radius: 6px;
+    background: rgba(15, 23, 42, .82); backdrop-filter: blur(4px);
+  }
+  .tag.before { left: 14px; color: #fca5a5; border: 1px solid rgba(252, 165, 165, .35); }
+  .tag.after { right: 14px; color: var(--emerald); border: 1px solid rgba(52, 211, 153, .35); }
+  .caption {
+    position: absolute; bottom: 14px; left: 14px; right: 14px; z-index: 7;
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    font-size: 11px; color: #cbd5e1;
+  }
+  .caption .meta { background: rgba(15, 23, 42, .8); border: 1px solid var(--border-2); padding: 4px 10px; border-radius: 6px; backdrop-filter: blur(4px); }
+
+  /* ---- Zoom magnifier (on divider) ---- */
+  .zoom-lens {
+    position: absolute; z-index: 8; width: 140px; height: 140px; border-radius: 50%;
+    border: 2px solid rgba(255,255,255,.9); box-shadow: 0 4px 18px rgba(0,0,0,.55);
+    overflow: hidden; pointer-events: none; display: none;
+    transform: translate(-50%, -50%);
+    background: #0f172a;
+  }
+  .zoom-lens canvas { width: 100%; height: 100%; display: block; }
+  .zoom-lens .zoom-crosshair {
+    position: absolute; inset: 0; z-index: 3;
+    background:
+      linear-gradient(to right, rgba(255,255,255,.8) 0 1px, transparent 1px 100%),
+      linear-gradient(to bottom, rgba(255,255,255,.8) 0 1px, transparent 1px 100%);
+    background-size: 50% 50%; background-position: center; background-repeat: no-repeat;
+    opacity: .5; pointer-events: none;
+  }
+
+  /* ---- Placement shells ---- */
+  .shell { display: none; }
+  .shell.active { display: block; animation: fade .25s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  /* Fullscreen modal shell */
+  .modal-backdrop {
+    position: relative; border-radius: 12px; background: rgba(2, 6, 23, .92);
+    border: 1px solid var(--border-2); padding: 18px;
+  }
+  .modal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .modal-header h3 { font-size: 14px; font-weight: 700; }
+  .modal-header .close { width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--border-2); background: var(--panel-2); color: var(--muted); cursor: pointer; font-size: 14px; }
+  .modal-header .close:hover { color: #fca5a5; border-color: #f87171; }
+
+  /* Inline catalog card shell */
+  .catalog-shell { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; max-width: 420px; }
+  .catalog-shell .preview { position: relative; }
+  .catalog-shell .card-body { padding: 14px; }
+  .catalog-shell .card-title { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+  .catalog-shell .card-sub { font-size: 11px; color: var(--muted); font-family: ui-monospace, monospace; }
+  .catalog-shell .card-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .catalog-shell .btn {
+    flex: 1; text-align: center; font-size: 12px; font-weight: 600; padding: 8px 10px;
+    border-radius: 7px; cursor: pointer; border: 1px solid var(--border-2); background: var(--panel-2); color: var(--text);
+  }
+  .catalog-shell .btn.primary { background: #0284c7; border-color: #0284c7; color: #fff; }
+  .catalog-shell .btn:hover { filter: brightness(1.15); }
+
+  /* Dedicated page shell */
+  .page-shell header { display: flex; align-items: center; gap: 10px; padding: 14px 0; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .page-shell header .back { border: 1px solid var(--border-2); background: var(--panel-2); color: var(--muted); width: 30px; height: 30px; border-radius: 7px; cursor: pointer; }
+  .page-shell header h2 { font-size: 15px; font-weight: 700; }
+  .page-shell .controls {
+    display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap;
+  }
+  .page-shell .controls .btn { border: 1px solid var(--border-2); background: var(--panel); color: var(--text); font-size: 12px; font-weight: 600; padding: 8px 12px; border-radius: 7px; cursor: pointer; }
+  .page-shell .controls .btn.primary { background: #0284c7; border-color: #0284c7; color: #fff; }
+  .page-shell .controls .btn:hover { filter: brightness(1.15); }
+
+  /* Notes */
+  .notes { margin-top: 24px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .notes h4 { font-size: 13px; font-weight: 700; margin-bottom: 10px; color: var(--sky); }
+  .notes ul { list-style: none; }
+  .notes li { font-size: 12px; color: var(--muted); padding: 5px 0 5px 18px; position: relative; line-height: 1.55; }
+  .notes li::before { content: "•"; position: absolute; left: 2px; color: var(--sky); }
+  .notes li strong { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <header class="top">
+    <div>
+      <h1>Before/After Comparison Slider</h1>
+      <div class="sub">Wayfinder prototype — #58 · Magnific-style drag-to-reveal upscale comparison</div>
+    </div>
+    <span class="badge">Prototype v1</span>
+  </header>
+
+  <!-- Placement switcher -->    <div class="placement-bar">
+    <span class="label">Chosen: fullscreen modal</span>
+    <button data-placement="modal" class="active">Fullscreen overlay modal ✓</button>
+    <button data-placement="inline">Inline catalog card (ref)</button>
+    <button data-placement="page">Dedicated result page (ref)</button>
+  </div>
+
+  <!-- 1. Fullscreen modal -->
+  <div class="shell active" id="shell-modal">
+    <div class="modal-backdrop">
+      <div class="modal-header">
+        <h3>Upscale Comparison — portrait_001.png</h3>
+        <button class="close" title="Close">&times;</button>
+      </div>
+      <div id="compare-modal" class="compare-wrap" style="aspect-ratio: 4/3;">
+        <img alt="" />
+        <div class="compare-after"><img alt="after" /></div>
+        <div class="compare-before"><img alt="before" /></div>
+        <div class="tag before">Original</div>
+        <div class="tag after">Upscaled</div>
+        <div class="compare-divider"><div class="compare-handle">↔</div></div>
+        <div class="zoom-lens">
+          <canvas width="420" height="420"></canvas>
+          <div class="zoom-crosshair"></div>
+        </div>
+        <div class="caption">
+          <span class="meta">512×384 · 412 KB</span>
+          <span class="meta">2048×1536 · 4× · 3.1 MB</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Inline catalog card (kept for reference) -->
+  <div class="shell" id="shell-inline">
+    <div class="catalog-shell">
+      <div class="preview">
+        <div id="compare-inline" class="compare-wrap" style="aspect-ratio: 4/3;">
+          <img alt="" />
+          <div class="compare-after"><img alt="after" /></div>
+          <div class="compare-before"><img alt="before" /></div>
+          <div class="tag before">Original</div>
+          <div class="tag after">Upscaled</div>
+          <div class="compare-divider"><div class="compare-handle">↔</div></div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="card-title">portrait_001_upscaled.png</div>
+        <div class="card-sub">processed/portrait_001.png · 4× · SDXL + ControlNet Tile</div>
+        <div class="card-actions">
+          <button class="btn primary">Keep</button>
+          <button class="btn">Re-run</button>
+          <button class="btn">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. Dedicated page (kept for reference) -->
+  <div class="shell" id="shell-page">
+    <div class="page-shell">
+      <header>
+        <button class="back" title="Back">←</button>
+        <h2>portrait_001.png — Upscale Result</h2>
+      </header>
+      <div id="compare-page" class="compare-wrap" style="aspect-ratio: 4/3;">
+        <img alt="" />
+        <div class="compare-after"><img alt="after" /></div>
+        <div class="compare-before"><img alt="before" /></div>
+        <div class="tag before">Original</div>
+        <div class="tag after">Upscaled</div>
+        <div class="compare-divider"><div class="compare-handle">↔</div></div>
+        <div class="caption">
+          <span class="meta">512×384 · 412 KB</span>
+          <span class="meta">2048×1536 · 4× · 3.1 MB</span>
+        </div>
+      </div>
+      <div class="controls">
+        <button class="btn primary">Save to Catalog</button>
+        <button class="btn">Re-run with new settings</button>
+        <button class="btn">Download</button>
+      </div>
+    </div>
+  </div>      <div class="notes">
+    <h4>Prototype notes — decisions made</h4>
+    <ul>
+      <li><strong>Placement:</strong> fullscreen overlay modal (chosen). Inline card + dedicated page kept as reference shells.</li>
+      <li><strong>Trigger:</strong> on-demand from the asset's catalog card — hover the slider icon on a card that has an upscaled sibling to open the modal. No auto-open on task completion.</li>
+      <li><strong>Interaction:</strong> drag the circular handle (or arrow keys) to reveal original vs. upscaled. Zoom magnifier ships in v1 — it tracks the divider while dragging or when hovering near it.</li>
+      <li><strong>Data model:</strong> requires linking the source asset to its upscaled output (the task result already returns <code>original_object</code> — persist that relation so the UI can pair them).</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+  // --- Generate demo image pairs on canvas (before = low-res-ish, after = sharp) ---
+  function drawDemo(canvas, size) {
+    const ctx = canvas.getContext('2d');
+    canvas.width = size.w; canvas.height = size.h;
+    const w = size.w, h = size.h;
+    const grad = ctx.createLinearGradient(0, 0, w, h);
+    grad.addColorStop(0, '#312e81');   // indigo-900
+    grad.addColorStop(0.55, '#1e3a8a'); // blue-900
+    grad.addColorStop(1, '#0f172a');    // slate-900
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+
+    // A "subject" — bright circle with rings
+    const cx = w * 0.38, cy = h * 0.42, r = w * 0.16;
+    const ring = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r);
+    ring.addColorStop(0, '#fbbf24'); ring.addColorStop(0.7, '#f59e0b'); ring.addColorStop(1, '#b45309');
+    ctx.fillStyle = ring;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = r * 0.07;
+    ctx.beginPath(); ctx.arc(cx, cy, r * 0.62, 0, Math.PI * 2); ctx.stroke();
+
+    // Fine texture strokes so sharpness difference is visible
+    ctx.strokeStyle = 'rgba(224,242,254,.5)'; ctx.lineWidth = 1;
+    for (let i = 0; i < 140; i++) {
+      const x = Math.random() * w, y = Math.random() * h, len = 6 + Math.random() * 26;
+      const a = Math.random() * Math.PI;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(a) * len, y + Math.sin(a) * len); ctx.stroke();
+    }
+    // Sparkles
+    for (let i = 0; i < 60; i++) {
+      const x = Math.random() * w, y = Math.random() * h, r2 = 0.8 + Math.random() * 1.8;
+      ctx.fillStyle = 'rgba(255,255,255,' + (0.35 + Math.random() * 0.5) + ')';
+      ctx.beginPath(); ctx.arc(x, y, r2, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+
+  function initPair(container) {
+    const ratio = 4 / 3;
+    const cw = 800, ch = Math.round(cw / ratio);
+    const before = document.createElement('canvas'); before.width = cw; before.height = ch;
+    drawDemo(before, { w: cw, h: ch });
+    const after = document.createElement('canvas'); after.width = cw * 2; after.height = ch * 2;
+    drawDemo(after, { w: cw * 2, h: ch * 2 });
+
+    const afterImg = container.querySelector('.compare-after img');
+    const beforeImg = container.querySelector('.compare-before img');
+    afterImg.src = after.toDataURL('image/png');
+    // "before" = same content at lower resolution + slight blur for the low-res feel
+    const low = document.createElement('canvas'); low.width = cw; low.height = ch;
+    const lctx = low.getContext('2d');
+    lctx.filter = 'blur(1.6px) saturate(.82)';
+    lctx.drawImage(after, 0, 0, cw, ch);
+    lctx.filter = 'none';
+    beforeImg.src = low.toDataURL('image/png');
+
+    // Cover image (for absolute-positioned imgs we set them to fill)
+    afterImg.style.position = 'absolute'; afterImg.style.inset = '0'; afterImg.style.width = '100%'; afterImg.style.height = '100%'; afterImg.style.objectFit = 'cover';
+    beforeImg.style.position = 'absolute'; beforeImg.style.inset = '0'; beforeImg.style.width = '100%'; beforeImg.style.height = '100%'; beforeImg.style.objectFit = 'cover';
+    container.querySelector('.compare-after').style.position = 'absolute';
+    container.querySelector('.compare-before').style.position = 'absolute';
+    container.querySelector('.compare-wrap > img').style.display = 'none';
+
+    // Wire the divider
+    const divider = container.querySelector('.compare-divider');
+    const beforeLayer = container.querySelector('.compare-before');
+    const handle = container.querySelector('.compare-handle');
+    let dragging = false;
+
+    // Zoom lens wiring (only present in the modal)
+    const lens = container.querySelector('.zoom-lens');
+    let lensCanvas = null;
+    let lensCtx = null;
+    let beforeSrc = null, afterSrc = null;
+
+    if (lens) {
+      lensCanvas = lens.querySelector('canvas');
+      lensCtx = lensCanvas.getContext('2d');
+      beforeSrc = container.querySelector('.compare-before img');
+      afterSrc = container.querySelector('.compare-after img');
+    }
+
+    function updateLens(clientX, clientY) {
+      if (!lens) return;
+      const rect = container.getBoundingClientRect();
+      const fx = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      const fy = Math.min(1, Math.max(0, (clientY - rect.top) / rect.height));
+      const beforePct = parseFloat(beforeLayer.style.width) || 50;
+      const Z = 2.4; // zoom factor
+      const S = 420;  // canvas backing size
+
+      // Source region in BEFORE-image pixels, centered on the pointer
+      const srcW = beforeSrc.naturalWidth, srcH = beforeSrc.naturalHeight;
+      const viewW = (S / Z), viewH = (S / Z);
+      const sx = Math.min(srcW - viewW, Math.max(0, fx * srcW - viewW / 2));
+      const sy = Math.min(srcH - viewH, Math.max(0, fy * srcH - viewH / 2));
+      // AFTER image is 2x resolution — scale the source rect accordingly
+      const kx = afterSrc.naturalWidth / srcW, ky = afterSrc.naturalHeight / srcH;
+
+      // Redraw the magnified pair with the current divider split baked in
+      lensCtx.clearRect(0, 0, S, S);
+      lensCtx.drawImage(afterSrc, sx * kx, sy * ky, viewW * kx, viewH * ky, 0, 0, S, S);
+      lensCtx.save();
+      lensCtx.beginPath();
+      lensCtx.rect(0, 0, S * (beforePct / 100), S);
+      lensCtx.clip();
+      lensCtx.drawImage(beforeSrc, sx, sy, viewW, viewH, 0, 0, S, S);
+      lensCtx.restore();
+
+      // Position the lens just above the pointer so it doesn't cover the handle
+      lens.style.display = 'block';
+      lens.style.left = (fx * rect.width) + 'px';
+      lens.style.top = Math.max(76, fy * rect.height - 44) + 'px';
+    }
+
+    function hideLens() {
+      if (lens) { lens.style.display = 'none'; }
+    }
+
+    function setPos(clientX, clientY) {
+      const rect = container.getBoundingClientRect();
+      let x = clientX - rect.left;
+      x = Math.max(0, Math.min(rect.width, x));
+      const pct = (x / rect.width) * 100;
+      divider.style.left = pct + '%';
+      handle.style.left = pct + '%';
+      beforeLayer.style.width = pct + '%';
+      if (clientY !== undefined && lens) updateLens(clientX, clientY);
+    }
+
+    divider.addEventListener('mousedown', e => { dragging = true; setPos(e.clientX, e.clientY); e.preventDefault(); });
+    container.addEventListener('mousemove', e => { if (dragging) setPos(e.clientX, e.clientY); });
+    // Show the lens while hovering near the divider line
+    container.addEventListener('mousemove', e => {
+      const rect = container.getBoundingClientRect();
+      const dx = Math.abs((e.clientX - rect.left) - (parseFloat(divider.style.left) / 100) * rect.width);
+      if (dx < 90) { updateLens(e.clientX, e.clientY); }
+      else if (!dragging) { hideLens(); }
+    });
+    container.addEventListener('mouseleave', hideLens);
+    window.addEventListener('mouseup', () => { dragging = false; });
+    divider.addEventListener('touchstart', e => { dragging = true; setPos(e.touches[0].clientX); e.preventDefault(); }, { passive: false });
+    container.addEventListener('touchmove', e => { if (dragging) setPos(e.touches[0].clientX); }, { passive: false });
+    container.addEventListener('touchend', () => { dragging = false; hideLens(); });
+
+    // Keyboard: focusable divider, arrow keys
+    divider.setAttribute('tabindex', '0');
+    divider.addEventListener('keydown', e => {
+      const rect = container.getBoundingClientRect();
+      const cur = parseFloat(divider.style.left) || 50;
+      const step = e.key === 'ArrowRight' ? 5 : e.key === 'ArrowLeft' ? -5 : 0;
+      if (step) {
+        e.preventDefault();
+        const next = Math.max(0, Math.min(100, cur + step));
+        divider.style.left = next + '%';
+        handle.style.left = next + '%';
+        beforeLayer.style.width = next + '%';
+      }
+    });
+
+    // Start at 50%
+    setPos(container.getBoundingClientRect().left + container.getBoundingClientRect().width / 2);
+  }
+
+  ['compare-modal', 'compare-inline', 'compare-page'].forEach(id => {
+    const el = document.getElementById(id);
+    initPair(el);
+  });
+
+  // --- Placement switcher ---
+  document.querySelectorAll('.placement-bar button').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.placement-bar button').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      document.querySelectorAll('.shell').forEach(s => s.classList.remove('active'));
+      document.getElementById('shell-' + btn.dataset.placement).classList.add('active');
+    });
+  });
+</script>
+</body>
+</html>

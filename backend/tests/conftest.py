@@ -69,6 +69,7 @@ def stub_storage(monkeypatch):
     """
     uploaded: dict = {}
     deleted: list = []
+    downloaded: dict = {}
 
     def _upload_object(data, object_name, content_type="application/octet-stream"):
         uploaded[object_name] = {"data": data, "content_type": content_type}
@@ -95,17 +96,30 @@ def stub_storage(monkeypatch):
             prefix += "/"
         return {"current_dir": prefix, "directories": [], "files": []}
 
-    for module in ("app.storage", "app.routers.storage", "app.routers.generate", "app.routers.media", "app.tasks", "app.routers.upscale", "app.services.upscaler"):
+    def _download_bytes(object_name):
+        return downloaded.get(object_name, b"")
+
+    for module in (
+        "app.storage",
+        "app.routers.storage",
+        "app.routers.generate",
+        "app.routers.media",
+        "app.tasks",
+        "app.upscaler",
+        "app.routers.upscale",
+        "app.services.upscaler",
+    ):
         for name, impl in (
             ("upload_object", _upload_object),
             ("get_object_bytes", _get_object_bytes),
             ("generate_url", _generate_url),
             ("delete_object", _delete_object),
             ("list_workspace_files", _list_workspace_files),
+            ("download_bytes", _download_bytes),
         ):
             monkeypatch.setattr(f"{module}.{name}", impl, raising=False)
 
-    return {"uploaded": uploaded, "deleted": deleted}
+    return {"uploaded": uploaded, "deleted": deleted, "downloaded": downloaded}
 
 
 @pytest.fixture()

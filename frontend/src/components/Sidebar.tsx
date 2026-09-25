@@ -2,7 +2,7 @@
 
 import React from 'react';
 import { useStore, TabType } from '../store/useStore';
-import { Folder, Sparkles, Settings, Sliders, Menu, X, Search, Activity, Cpu } from 'lucide-react';
+import { Folder, Sparkles, Settings, Sliders, Menu, X, Search, Activity, Cpu, Wand2, ListOrdered } from 'lucide-react';
 
 export default function Sidebar() {
   const { activeTab, setActiveTab, sidebarOpen, toggleSidebar } = useStore();
@@ -33,6 +33,12 @@ const menuItems = [
     description: 'Tile & Feather Diffusion',
   },
   {
+    id: 'upscaler' as TabType,
+    label: 'Upscaler',
+    icon: Wand2,
+    description: 'Magnific-style upscale',
+  },
+  {
     id: 'players' as TabType,
     label: 'Media Players',
     icon: Sliders,
@@ -49,6 +55,12 @@ const menuItems = [
       label: 'Compute Monitor',
       icon: Activity,
       description: 'GPU / CPU Live Metrics',
+    },
+    {
+      id: 'queue' as TabType,
+      label: 'Queue Dashboard',
+      icon: ListOrdered,
+      description: 'Background task history',
     },
   ];
 

@@ -60,3 +60,4 @@ frontend/*.tsbuildinfo
 
 .pipeline/
 graphify-out/
+.tmp/
