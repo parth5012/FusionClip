@@ -42,6 +42,17 @@ test.describe('Generation & Catalog', () => {
     expect(res.ok).toBeTruthy();
 
     const body = await res.json();
+
+    // Decision #3: when no API key / no GPU is available the local path refuses
+    // honestly instead of returning placeholder bytes. Accept either outcome,
+    // but never a mock payload.
+    if (body.degraded === true) {
+      expect(typeof body.reason).toBe('string');
+      expect(body.reason.length).toBeGreaterThan(0);
+      expect(JSON.stringify(body)).not.toMatch(/Mock .* bytes/i);
+      return;
+    }
+
     expect(body.status).toBe('COMPLETED');
     expect(body.type).toBe('sfx');
     expect(body.filename).toMatch(/^gen_audio_\d+\.mp3$/);
@@ -65,6 +76,15 @@ test.describe('Generation & Catalog', () => {
     expect(res.ok).toBeTruthy();
 
     const body = await res.json();
+
+    // Same honest-fallback contract as audio: degraded is a valid, labeled outcome.
+    if (body.degraded === true) {
+      expect(typeof body.reason).toBe('string');
+      expect(body.reason.length).toBeGreaterThan(0);
+      expect(JSON.stringify(body)).not.toMatch(/Mock .* bytes/i);
+      return;
+    }
+
     expect(body.status).toBe('COMPLETED');
     expect(body.filename).toMatch(/^gen_image_\d+\.png$/);
     expect(body.parameters.steps).toBe(20);
