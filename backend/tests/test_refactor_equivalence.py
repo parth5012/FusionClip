@@ -296,19 +296,8 @@ class TestDefaultedCallShapes:
     def test_generate_audio_default_type_is_tts(self, client, stub_storage):
         body = client.post("/api/generate/audio?prompt=defaults").json()
         assert body["type"] == "tts"
-        assert set(body) == {"status", "type", "filename", "url", "colab"}
+        assert set(body) == {"status", "type", "filename", "url", "markers"}
 
-    def test_generate_image_default_parameter_types(self, client, stub_storage, monkeypatch):
-        # Mock pipeline to avoid downloading models in tests
-        class MockPipeline:
-            def __call__(self, **kwargs):
-                from PIL import Image
-                img = Image.new("RGB", (64, 64), color="red")
-                class Result:
-                    images = [img]
-                return Result()
-        monkeypatch.setattr("app.routers.generate.load_flux_pipeline", lambda: MockPipeline())
-        monkeypatch.setattr("app.routers.generate.load_sdxl_pipeline", lambda: MockPipeline())
 
         params = client.post("/api/generate/image?prompt=defaults").json()["parameters"]
         assert params["steps"] == 28

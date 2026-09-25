@@ -30,6 +30,12 @@ from app.ml.image import (
     SUPPORTED_SCHEDULERS,
     run_local_image_generation,
 )
+from app.ml.audio import (
+    SUPPORTED_AUDIO_TYPES,
+    build_audio_filename,
+    make_audio_loader,
+    run_local_audio_generation,
+)
 
 __all__ = [
     "DegradedReason",
@@ -48,4 +54,8 @@ __all__ = [
     "SUPPORTED_SCHEDULERS",
     "ASPECT_RATIO_DIMENSIONS",
     "run_local_image_generation",
+    "SUPPORTED_AUDIO_TYPES",
+    "build_audio_filename",
+    "make_audio_loader",
+    "run_local_audio_generation",
 ]

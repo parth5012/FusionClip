@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException, Request, File, Upl
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
+from app.ml.audio import SUPPORTED_AUDIO_TYPES, run_local_audio_generation
 from app.ml.image import SUPPORTED_SCHEDULERS, run_local_image_generation
 from app.models import Configuration, MediaAsset, Task
 from app.services.embedding import get_embedding
@@ -138,6 +139,15 @@ def _validate_aspect_ratio(val: Optional[str]) -> None:
             status_code=400,
             detail="Invalid aspect_ratio: both parts must be >= 1",
         )
+
+
+def _validate_safe_reference(val: Optional[str], param_name: str = "reference") -> None:
+    if val is not None:
+        if not val or ".." in val or len(val) > 128 or not SAFE_IDENTIFIER_PATTERN.match(val):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {param_name}: must be non-empty, cannot contain '..', and must match safe identifier pattern",
+            )
 
 
 def is_colab_connected():
@@ -397,201 +407,192 @@ def generate_audio(
     prompt: str = Query(...),
     type: str = Query("tts"),
     voice_id: Optional[str] = Query(None),
-    stability: float = Query(0.5, ge=0.0, le=1.0),
-    clarity: float = Query(0.75, ge=0.0, le=1.0),
-    language: str = Query("en", description="Language code for local TTS"),
-    speed: float = Query(1.0, description="Speech speed multiplier"),
-    emotion: str = Query("neutral", description="Emotion: neutral, breathy, laughing, etc."),
-    reference_audio: Optional[UploadFile] = File(None, description="Reference audio for local voice cloning"),
-    use_chattts: bool = Query(False, description="Use ChatTTS (True) or XTTSv2 (False) for local TTS"),
+    duration: Optional[float] = Query(None),
+    reference: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Audio synthesis.
+    """Generate audio via ElevenLabs API, Colab worker, or local PyTorch pipeline."""
+    _validate_safe_identifier(voice_id, "voice_id")
+    _validate_safe_identifier(type, "type")
+    _validate_safe_identifier(provider, "provider")
+    _validate_safe_reference(reference, "reference")
 
-    Preference order: Colab dispatch (when connected), real ElevenLabs (when
-    key configured), local XTTS/ChatTTS (offloaded Colab models), mock fallback.
-    """
+    if type not in SUPPORTED_AUDIO_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio type '{type}'. Supported types: {', '.join(sorted(SUPPORTED_AUDIO_TYPES))}",
+        )
+
+    if type == "voice_clone":
+        if not reference or not reference.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="voice_clone requires a 'reference' parameter specifying an existing audio file path",
+            )
+
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="audio_generation",
             parameters={
                 "prompt": prompt,
                 "type": type,
-                "language": language,
-                "speed": speed,
-                "emotion": emotion,
-                "use_chattts": use_chattts,
+                "voice_id": voice_id,
+                "duration": duration,
+                "reference": reference,
+
             },
             db=db,
             file_extension="mp3",
             content_type="audio/mpeg",
         )
 
-    api_key = _resolve_elevenlabs_key(db, request)
-    if api_key:
-        try:
+    if provider != "local":
+        eleven_key = get_secret("elevenlabs", db)
+        if eleven_key:
             if type == "sfx":
-                audio = elevenlabs_service.generate_sound_effect(
-                    api_key,
+                content = call_elevenlabs_sfx(
+                    api_key=eleven_key,
                     text=prompt,
-                    duration_seconds=None,
+                    duration_seconds=duration if duration is not None else 5.0,
                 )
                 filename = f"eleven_sfx_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
             else:
-                audio = elevenlabs_service.synthesize(
-                    api_key,
-                    prompt,
-                    voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
-                    stability=stability,
-                    clarity=clarity,
+                content = call_elevenlabs_tts(
+                    api_key=eleven_key,
+                    text=prompt,
+                    voice_id=voice_id or "21m00Tcm4TlvDq8ikWAM",
                 )
                 filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"ElevenLabs audio synthesis failed: {e}")
-            raise HTTPException(status_code=502, detail=f"ElevenLabs audio synthesis failed: {e}")
 
-        upload_success = upload_object(audio, filename, content_type="audio/mpeg")
-        _save_asset(
-            db,
-            title=f"ElevenLabs Synthesized: {prompt[:30]}...",
-            filename=filename,
-            content_type="audio/mpeg",
-            size=len(audio),
-        )
-        return {
-            "status": "COMPLETED",
-            "type": type,
-            "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
-        }
+            upload_success = upload_object(content, filename, content_type="audio/mpeg")
 
-    try:
-        return _generate_local_tts_audio(
-            prompt, type, language, speed, emotion, reference_audio, use_chattts, db
-        )
-    except Exception as e:
-        logger.warning(f"Local TTS unavailable, falling back to mock: {e}")
+            if upload_success:
+                try:
+                    title = f"ElevenLabs {'SFX' if type == 'sfx' else 'TTS'}: {prompt[:30]}..."
+                    asset = MediaAsset(
+                        title=title,
+                        file_path=filename,
+                        file_size=len(content),
+                        content_type="audio/mpeg",
+                        duration=3.0,
+                        embedding=get_embedding(prompt or title),
+                    )
+                    db.add(asset)
+                    db.commit()
+                except Exception as e:
+                    logger.error(f"Failed to save generated audio asset: {e}")
+                    db.rollback()
 
-    filename = f"gen_audio_{int(time.time())}.mp3"
-    content = b"Mock elevenlabs generated audio bytes."
-    upload_success = upload_object(content, filename, content_type="audio/mpeg")
-    _save_asset(
-        db,
-        title=f"ElevenLabs Synthesized: {prompt[:30]}...",
-        filename=filename,
-        content_type="audio/mpeg",
-        size=len(content),
-    )
-    return {
-        "status": "COMPLETED",
-        "type": type,
-        "filename": filename,
-        "url": generate_url(filename) if upload_success else "",
-    }
-
-def _generate_local_tts_audio(
-    prompt: str = Query(...),
-    type: str = Query("tts"),
-    language: str = Query("en", description="Language code for TTS"),
-    speed: float = Query(1.0, description="Speech speed multiplier"),
-    emotion: str = Query("neutral", description="Emotion: neutral, breathy, laughing, etc."),
-    reference_audio: Optional[UploadFile] = File(None, description="Reference audio for voice cloning"),
-    use_chattts: bool = Query(False, description="Use ChatTTS (True) or XTTS v2 (False)"),
-    db: Session = Depends(get_db)
-):
-    """Local TTS and voice cloning using XTTS v2 or ChatTTS, or offload to Colab."""
-    if is_colab_connected():
-        return dispatch_gen_to_colab(
-            task_type="audio_generation",
-            parameters={
-                "prompt": prompt, 
+            return {
+                "status": "COMPLETED",
                 "type": type,
-                "language": language,
-                "speed": speed,
-                "emotion": emotion,
-                "use_chattts": use_chattts
-            },
-            db=db,
-            file_extension="mp3",
-            content_type="audio/mpeg"
-        )
+                "filename": filename,
+                "url": generate_url(filename) if upload_success else "",
+            }
 
-    try:
-        # Load TTS pipeline
-        if use_chattts:
-            tts_pipeline = load_chattts_pipeline()
-        else:
-            tts_pipeline = load_xtts_pipeline()
+    # Local ML pipeline path (XTTS v2 voice / voice clone + MusicGen audio / sfx)
+    return run_local_audio_generation(
+        prompt=prompt,
+        type=type,
+        voice_id=voice_id,
+        duration=duration,
+        reference=reference,
+        db=db,
+    )
 
-        # Voice cloning with reference audio
-        if reference_audio:
-            ref_audio_data = reference_audio.file.read()
-            audio = tts_pipeline.tts(
-                text=prompt,
-                speaker_wav=ref_audio_data,
-                language=language,
-                speed=speed,
-                emotion=emotion
+
+# --- MusicGen music route (from origin/main; #101 routes sfx/audio via the
+# registry instead, so this legacy direct-transformers path is kept as-is) ---
+musicgen_pipeline = None
+
+
+def load_flux_pipeline():
+    """Load Flux.1 pipeline with caching."""
+    global flux_pipeline
+    if flux_pipeline is None:
+        try:
+            import torch
+            from diffusers import FluxPipeline
+            flux_pipeline = FluxPipeline.from_pretrained(
+                "black-forest-labs/FLUX.1-schnell",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
             )
-        # Standard TTS
-        else:
-            audio = tts_pipeline.tts(
-                text=prompt,
-                language=language,
-                speed=speed,
-                emotion=emotion
+            if torch.cuda.is_available():
+                flux_pipeline = flux_pipeline.to("cuda")
+        except Exception as e:
+            logger.error(f"Failed to load Flux pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load Flux pipeline: {e}")
+    return flux_pipeline
+
+
+def load_sdxl_pipeline():
+    """Load SDXL pipeline with caching."""
+    global sdxl_pipeline
+    if sdxl_pipeline is None:
+        try:
+            import torch
+            from diffusers import StableDiffusionXLPipeline
+            sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
+                "stabilityai/stable-diffusion-xl-base-1.0",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                variant="fp16",
+                use_safetensors=True
             )
+            if torch.cuda.is_available():
+                sdxl_pipeline = sdxl_pipeline.to("cuda")
+        except Exception as e:
+            logger.error(f"Failed to load SDXL pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load SDXL pipeline: {e}")
+    return sdxl_pipeline
 
-        # Convert to MP3 bytes
-        import numpy as np
-        from scipy.io import wavfile
-        import io as io_module
 
-        # TTS returns numpy array (sample_rate, audio)
-        if isinstance(audio, tuple):
-            sample_rate, audio_data = audio
-        else:
-            sample_rate = 22050
-            audio_data = audio
+def load_xtts_pipeline():
+    """Load XTTS v2 pipeline with caching."""
+    global xtts_pipeline
+    if xtts_pipeline is None:
+        try:
+            import torch
+            from TTS.api import TTS
+            xtts_pipeline = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
+        except Exception as e:
+            logger.error(f"Failed to load XTTS pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load XTTS pipeline: {e}")
+    return xtts_pipeline
 
-        # Convert to 16-bit PCM
-        audio_int16 = (audio_data * 32767).astype(np.int16)
 
-        # Write to WAV buffer
-        wav_buffer = io_module.BytesIO()
-        wavfile.write(wav_buffer, sample_rate, audio_int16)
-        wav_bytes = wav_buffer.getvalue()
+def load_chattts_pipeline():
+    """Load ChatTTS pipeline with caching."""
+    global chattts_pipeline
+    if chattts_pipeline is None:
+        try:
+            import ChatTTS
+            chattts_pipeline = ChatTTS.Chat()
+            chattts_pipeline.load(compile=False)
+        except Exception as e:
+            logger.error(f"Failed to load ChatTTS pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load ChatTTS pipeline: {e}")
+    return chattts_pipeline
 
-        # Upload to MinIO
-        filename = f"gen_audio_{int(time.time())}.wav"
-        upload_success = upload_object(wav_bytes, filename, content_type="audio/wav")
 
-        # Calculate duration
-        duration = len(audio_int16) / sample_rate
-
-        # Save media asset
-        asset = MediaAsset(
-            title=f"{'ChatTTS' if use_chattts else 'XTTS'} Synthesized: {prompt[:30]}...",
-            file_path=filename,
-            file_size=len(wav_bytes),
-            content_type="audio/wav",
-            duration=duration
-        )
-        db.add(asset)
-        db.commit()
-
-        return {
-            "status": "COMPLETED",
-            "type": type,
-            "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
-            "colab": False
-        }
-    except Exception as e:
-        logger.error(f"Failed to generate audio: {e}")
-        raise HTTPException(status_code=500, detail=f"Audio generation failed: {e}")
+def load_musicgen_pipeline():
+    """Load MusicGen pipeline with caching."""
+    global musicgen_pipeline
+    if musicgen_pipeline is None:
+        try:
+            import torch
+            from transformers import MusicgenForConditionalGeneration, AutoProcessor
+            musicgen_pipeline = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+            musicgen_processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+            if torch.cuda.is_available():
+                musicgen_pipeline = musicgen_pipeline.to("cuda")
+        except Exception as e:
+            logger.error(f"Failed to load MusicGen pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load MusicGen pipeline: {e}")
+    return musicgen_pipeline, musicgen_processor
 
 
 
@@ -978,102 +979,6 @@ def generate_image(
         scheduler=scheduler,
         db=db,
     )
-
-
-
-flux_pipeline = None
-sdxl_pipeline = None
-xtts_pipeline = None
-chattts_pipeline = None
-musicgen_pipeline = None
-
-
-def load_flux_pipeline():
-    """Load Flux.1 pipeline with caching."""
-    global flux_pipeline
-    if flux_pipeline is None:
-        try:
-            import torch
-            from diffusers import FluxPipeline
-            flux_pipeline = FluxPipeline.from_pretrained(
-                "black-forest-labs/FLUX.1-schnell",
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-            )
-            if torch.cuda.is_available():
-                flux_pipeline = flux_pipeline.to("cuda")
-        except Exception as e:
-            logger.error(f"Failed to load Flux pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load Flux pipeline: {e}")
-    return flux_pipeline
-
-
-def load_sdxl_pipeline():
-    """Load SDXL pipeline with caching."""
-    global sdxl_pipeline
-    if sdxl_pipeline is None:
-        try:
-            import torch
-            from diffusers import StableDiffusionXLPipeline
-            sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
-                "stabilityai/stable-diffusion-xl-base-1.0",
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                variant="fp16",
-                use_safetensors=True
-            )
-            if torch.cuda.is_available():
-                sdxl_pipeline = sdxl_pipeline.to("cuda")
-        except Exception as e:
-            logger.error(f"Failed to load SDXL pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load SDXL pipeline: {e}")
-    return sdxl_pipeline
-
-
-def load_xtts_pipeline():
-    """Load XTTS v2 pipeline with caching."""
-    global xtts_pipeline
-    if xtts_pipeline is None:
-        try:
-            import torch
-            from TTS.api import TTS
-            xtts_pipeline = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
-        except Exception as e:
-            logger.error(f"Failed to load XTTS pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load XTTS pipeline: {e}")
-    return xtts_pipeline
-
-
-def load_chattts_pipeline():
-    """Load ChatTTS pipeline with caching."""
-    global chattts_pipeline
-    if chattts_pipeline is None:
-        try:
-            import ChatTTS
-            chattts_pipeline = ChatTTS.Chat()
-            chattts_pipeline.load(compile=False)
-        except Exception as e:
-            logger.error(f"Failed to load ChatTTS pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load ChatTTS pipeline: {e}")
-    return chattts_pipeline
-
-
-def load_musicgen_pipeline():
-    """Load MusicGen pipeline with caching."""
-    global musicgen_pipeline
-    if musicgen_pipeline is None:
-        try:
-            import torch
-            from transformers import MusicgenForConditionalGeneration, AutoProcessor
-            musicgen_pipeline = MusicgenForConditionalGeneration.from_pretrained(
-                "facebook/musicgen-small",
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-            )
-            musicgen_processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-            if torch.cuda.is_available():
-                musicgen_pipeline = musicgen_pipeline.to("cuda")
-        except Exception as e:
-            logger.error(f"Failed to load MusicGen pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load MusicGen pipeline: {e}")
-    return musicgen_pipeline, musicgen_processor
 
 
 
