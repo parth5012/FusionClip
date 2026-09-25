@@ -95,4 +95,18 @@
 - Backend: 205 pytest unit & integration tests passing (`pytest backend/tests/` 205 passed in 45.19s).
 - Python compile check: clean.
 
+## 2026-09-25: Wayfinder Map #71 - Local Torch Models (Scaffold)
+
+### Iteration Status: Done
+
+- **Phase 2 (AFK): #99 - Create the shared local-inference foundation (scaffold)**
+  - Implemented `app.ml.registry`: Model registry managing the pinned roster (Flux-schnell [image/FP8/13GB/Apache-2.0], SDXL [image/FP8/6.5GB/OpenRAIL++-M], XTTS v2 [voice/FP16/4GB/CPML], MusicGen [audio/FP16/10.4GB/MIT], SVD [video/FP16/16GB resident/8GB offload/OpenRAIL++-M]) with lazy loading, idempotent caching, and CUDA VRAM cleanup on unload.
+  - Implemented `app.ml.guard`: VRAM guard with distinct detection for `NoGPUError` vs `InsufficientVRAMError`, working overhead accounting, admission checks, and auto-downgrade selection (e.g. Flux-schnell -> SDXL).
+  - Implemented `app.ml.contracts`: Labeled honest fallback tier (`DegradedResponse`, `DegradedReason`, `FallbackTier`) satisfying Decision #3, explicitly forbidding byte-string mock payloads ("Mock ... bytes").
+  - Configured Celery queue isolation in `app/celery_app.py` with dedicated `media.gpu` queue and route for `app.tasks.process_gpu_task`, isolated from existing CPU queues `media.fast` and `media.heavy`.
+  - Added health and queue metrics in `app/routers/tasks.py` (`GET /api/tasks/gpu/health` and alias `/api/tasks/metrics`) reporting GPU availability, VRAM memory usage, model loaded states, and queue depth.
+  - Authored comprehensive test suite `backend/tests/test_localml_scaffold.py` covering registry lazy loading, idempotent load/unload, VRAM guard refusal, no-GPU detection, auto-downgrade model selection, queue isolation, degraded contract shape, and health endpoint.
+  - Verified: All 16 scaffold unit/integration tests passing; 221 total tests passing in backend test suite.
+
+
 
