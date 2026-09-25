@@ -109,6 +109,12 @@
 - To present smooth monotonic progress in the UI (which monitors `status.info.percent` between 0 and 99), denoising steps map to 0-79% and ffmpeg frame encoding maps to 80-99% (strictly capped at 99 so the Celery task remains in PROGRESS state until final return).
 - FFmpeg progress updates on stderr use carriage return (`\r`) rather than newline (`\n`), requiring character-by-character chunked reads or splitting on `\r` and `\n` to reliably scrape `frame=\s*(\d+)` progress lines without buffering stalls.
 
+### 26. CPU vs. GPU PyTorch Dtype Selection & Subprocess Lifecycle Protection
+- Stable Video Diffusion (SVD) and similar diffusion pipelines must not use `torch.float16` unconditionally: on CPU (`cuda == False`), PyTorch float16 convolution and attention kernels raise fatal runtime errors. Explicitly selecting `torch.float16 if cuda else torch.float32` preserves the GPU VRAM contract while keeping CPU fallback safe.
+- Subprocesses invoked during inference (such as `ffmpeg` for MP4 encoding) must be guarded with `try/finally` blocks that actively kill the child process (`process.kill()`) and close stream handles (`process.stderr.close()`) if exceptions occur or if `progress_cb` fails; otherwise stalled children orphan and leave locks like `INFERENCE_LOCK` held indefinitely.
+- Background worker tasks (Celery) executing generative jobs must guarantee terminal database updates (`Task.status = "FAILED"`) and Redis pub/sub notifications on both unhandled exceptions and degraded responses (`degraded: true`), preventing tasks from lingering in `PROCESSING` state indefinitely.
+
+
 
 
 
