@@ -199,6 +199,21 @@
   - FIX 7: Added unit test with real `tts_to_file` signature asserting `speaker_wav` receives resolved temporary file path and is cleaned up, and omitted for plain TTS.
   - FIX 8: Fixed `test_audio_module_imports_without_torch` to safely pop `app.ml.audio`, mask torch/transformers/TTS, test clean imports, and restore module state.
   - Verified: 294 backend tests passing (15 added, 294 passed in 54.53s).
+  - Code review gate verdict: FIX-FIRST (2 blocker, 3 major, 3 minor, 2 nit) - all applied.
+  - Follow-up fix: eviction kept every candidate model, so a resident SDXL pinned
+    VRAM and forced an avoidable downgrade to it instead of admitting
+    flux-schnell. `check_vram` now evicts only the model being admitted (safe
+    under `INFERENCE_LOCK`). Red first: `test_priority_model_admitted_by_evicting_resident_downgrade`.
+    295 backend tests green.
+  - Frontend wiring (`264005f`): `AudioMarker` + `markers?` on
+    `GenerateAudioResponse`; session-only `waveAudio` store slice;
+    GenerationPanel publishes the clip, renders marker chips, a `voice clone`
+    badge, the degraded reason, and a Voice Reference field (non-empty => local
+    XTTS zero-shot clone); PlayersPanel loads the generated clip and redraws
+    WaveSurfer markers with a legend. Verified with `npx tsc --noEmit` (exit 0)
+    and `npx next build` (compiled + types clean). Playwright e2e not run: no
+    FusionClip backend stack is up in this worktree.
+  - Final verified state for #101: **295 backend tests passing**, frontend build clean.
 
 
 
