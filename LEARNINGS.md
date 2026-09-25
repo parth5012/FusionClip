@@ -85,6 +85,19 @@
 - `denoising_strength` was accepted on a text-to-image route with no source image. Diffusers raises `TypeError` on `strength` for txt2img; the try/except then reported it as `load_failed`, i.e. a bogus infrastructure error for a client input problem.
 - Two failure modes to avoid: forwarding it (crashes into an unrelated error bucket) and silently dropping it (the response echoes a parameter that did nothing). Reject with 400 and an actionable message until the feature that needs it exists.
 
+### 21. Parameter Shadowing with Builtin Python Names
+- Using `type: str = "tts"` as a function argument shadows Python's builtin `type()`, causing runtime errors when attempting `type(obj)` in exception messages or type inspect calls.
+- In handlers with legacy `type` query params, use `obj.__class__.__name__` or assign `audio_type = type` immediately to prevent type-check confusion and namespace collisions.
+
+### 22. Voice Clone Markers Contract Without Schema Migration
+- Providing waveform player markers (`time: 0.0, label: "voice clone: ...", kind: "voice_clone"`) in the API response allows the frontend waveform player to render clone start positions immediately upon generation.
+- To persist marker provenance across catalog reloads without requiring an Alembic schema migration on `MediaAsset`, prefixing the asset title with `Voice Clone: <prompt[:30]>...` allows the frontend UI to deterministically reconstruct the clone marker on playback.
+
+### 23. Zero-Copy WAV Header Introspection for Duration
+- Parsing audio duration directly from in-memory WAV byte arrays using Python's standard library `wave.open(io.BytesIO(wav_bytes), "rb")` yields exact duration (`frames / framerate`) without invoking heavy external dependencies like `ffmpeg` or `sox`.
+- If the byte stream is malformed or non-WAV, cleanly falling back to the requested duration parameter or a sensible default prevents upload failures.
+
+
 
 
 
