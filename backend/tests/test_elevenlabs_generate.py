@@ -33,7 +33,7 @@ class TestGenerateAudioNoKey:
 
 class TestGenerateAudioElevenLabs:
     def test_voice_clone_success(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         # Mock clone_voice
         mock_voice_id = "cloned-voice-123"
         def mock_clone(*args, **kwargs):
@@ -62,7 +62,7 @@ class TestGenerateAudioElevenLabs:
         assert response.status_code == 503
 
     def test_voice_clone_invalid_format(self, client, db_session):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         test_file = ("test.jpg", b"dummy image", "image/jpeg")
         response = client.post(
             "/api/generate/voice-clone",
@@ -73,7 +73,7 @@ class TestGenerateAudioElevenLabs:
         assert "Invalid audio" in response.json()["detail"]
 
     def test_voice_clone_too_long(self, client, db_session, monkeypatch, tmp_path):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         # Mock parse_duration to return 70 seconds
         monkeypatch.setattr("app.routers.generate.parse_duration", lambda x: 70.0)
         test_file = ("long.mp3", b"long audio", "audio/mpeg")
@@ -86,7 +86,7 @@ class TestGenerateAudioElevenLabs:
         assert "exceeds 1 minute" in response.json()["detail"]
 
     def test_stored_key_calls_real_elevenlabs(self, client, db_session, stub_storage, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         captured = {}
 
         def fake_synthesize(api_key, text, voice_id=DEFAULT_VOICE_ID, stability=0.5, clarity=0.75, model=DEFAULT_MODEL):
@@ -110,7 +110,7 @@ class TestGenerateAudioElevenLabs:
         assert body["url"].startswith("http://test-minio/")
         assert body["filename"] in stub_storage["uploaded"]
         assert captured == {
-            "api_key": "xi-stored-key-0001",
+            "api_key": "unit-test-placeholder-value",
             "text": "hello elevenlabs",
             "voice_id": DEFAULT_VOICE_ID,
             "stability": 0.5,
@@ -135,13 +135,13 @@ class TestGenerateAudioElevenLabs:
 
         res = client.post(
             "/api/generate/audio?prompt=hi",
-            headers={"X-ElevenLabs-Key": "xi-header-key-0002"},
+            headers={"X-ElevenLabs-Key": "unit-test-header-value"},
         )
         assert res.status_code == 200
-        assert captured["api_key"] == "xi-header-key-0002"
+        assert captured["api_key"] == "unit-test-header-value"
 
     def test_stored_key_precedes_header(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0003", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value-2", db=db_session)
         captured = {}
 
         def fake_synthesize(api_key, text, voice_id=DEFAULT_VOICE_ID, stability=0.5, clarity=0.75, model=DEFAULT_MODEL):
@@ -152,12 +152,12 @@ class TestGenerateAudioElevenLabs:
 
         client.post(
             "/api/generate/audio?prompt=hi",
-            headers={"X-ElevenLabs-Key": "xi-header-key-0002"},
+            headers={"X-ElevenLabs-Key": "unit-test-header-value"},
         )
-        assert captured["api_key"] == "xi-stored-key-0003"
+        assert captured["api_key"] == "unit-test-placeholder-value-2"
 
     def test_voice_and_settings_passthrough(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         captured = {}
 
         def fake_synthesize(api_key, text, voice_id=DEFAULT_VOICE_ID, stability=0.5, clarity=0.75, model=DEFAULT_MODEL):
@@ -172,7 +172,7 @@ class TestGenerateAudioElevenLabs:
         assert captured == {"voice_id": "ExsVoice123", "stability": 0.3, "clarity": 0.9}
 
     def test_synthesis_failure_returns_502(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
 
         def fake_synthesize(api_key, text, voice_id=DEFAULT_VOICE_ID, stability=0.5, clarity=0.75, model=DEFAULT_MODEL):
             raise RuntimeError("quota exceeded")
@@ -203,7 +203,7 @@ class TestGenerateTts:
         assert asset.content_type == "audio/mpeg"
 
     def test_stored_key_calls_real_elevenlabs(self, client, db_session, stub_storage, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         captured = {}
 
         def fake_synthesize(api_key, text, voice_id=DEFAULT_VOICE_ID, stability=0.5, clarity=0.75, model=DEFAULT_MODEL):
@@ -226,7 +226,7 @@ class TestGenerateTts:
         assert body["url"].startswith("http://test-minio/")
         assert body["filename"] in stub_storage["uploaded"]
         assert captured == {
-            "api_key": "xi-stored-key-0001",
+            "api_key": "unit-test-placeholder-value",
             "text": "hello there",
             "voice_id": "ExsVoice123",
             "stability": 0.5,
@@ -242,7 +242,7 @@ class TestGenerateTts:
         assert asset.content_type == "audio/mpeg"
 
     def test_default_voice_used_when_omitted(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         captured = {}
 
         def fake_synthesize(api_key, text, voice_id=DEFAULT_VOICE_ID, stability=0.5, clarity=0.75, model=DEFAULT_MODEL):
@@ -263,11 +263,11 @@ class TestGenerateTts:
 
         monkeypatch.setattr("app.services.elevenlabs.synthesize", fake_synthesize)
 
-        client.post("/api/generate/tts?text=hi", headers={"X-ElevenLabs-Key": "xi-header-key-0002"})
-        assert captured["api_key"] == "xi-header-key-0002"
+        client.post("/api/generate/tts?text=hi", headers={"X-ElevenLabs-Key": "unit-test-header-value"})
+        assert captured["api_key"] == "unit-test-header-value"
 
     def test_synthesis_failure_returns_502(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
 
         def fake_synthesize(api_key, text, voice_id=DEFAULT_VOICE_ID, stability=0.5, clarity=0.75, model=DEFAULT_MODEL):
             raise RuntimeError("synthesis failed")
@@ -284,7 +284,7 @@ class TestGenerateVoiceList:
         assert res.status_code == 503
 
     def test_stored_key_returns_voices(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         captured = {}
 
         def fake_list_voices(api_key):
@@ -304,7 +304,7 @@ class TestGenerateVoiceList:
         assert body["voices"][0]["voice_id"] == "ExsVoice123"
         assert body["voices"][0]["name"] == "Rachel"
         assert body["voices"][0]["labels"]["accent"] == "american"
-        assert captured["api_key"] == "xi-stored-key-0001"
+        assert captured["api_key"] == "unit-test-placeholder-value"
 
     def test_header_key_used_when_nothing_stored(self, client, monkeypatch):
         captured = {}
@@ -315,11 +315,11 @@ class TestGenerateVoiceList:
 
         monkeypatch.setattr("app.services.elevenlabs.list_voices", fake_list_voices)
 
-        client.get("/api/generate/voice-list", headers={"X-ElevenLabs-Key": "xi-header-key-0002"})
-        assert captured["api_key"] == "xi-header-key-0002"
+        client.get("/api/generate/voice-list", headers={"X-ElevenLabs-Key": "unit-test-header-value"})
+        assert captured["api_key"] == "unit-test-header-value"
 
     def test_list_failure_returns_502(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
 
         def fake_list_voices(api_key):
             raise RuntimeError("unauthorized")
@@ -336,7 +336,7 @@ class TestSoundEffects:
         assert res.status_code == 503
 
     def test_stored_key_generates_and_uploads(self, client, db_session, stub_storage, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
         captured = {}
 
         def fake_generate(api_key, text, duration_seconds=None):
@@ -360,7 +360,7 @@ class TestSoundEffects:
         assert body["url"].startswith("http://test-minio/")
         assert body["filename"] in stub_storage["uploaded"]
         assert captured == {
-            "api_key": "xi-stored-key-0001",
+            "api_key": "unit-test-placeholder-value",
             "text": "thunder storm",
             "duration_seconds": 4.0,
         }
@@ -369,7 +369,7 @@ class TestSoundEffects:
         assert asset.content_type == "audio/mpeg"
 
     def test_generation_failure_returns_502(self, client, db_session, monkeypatch):
-        secret_store.set_secret("elevenlabs", "xi-stored-key-0001", db=db_session)
+        secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)
 
         def fake_generate(api_key, text, duration_seconds=None):
             raise RuntimeError("generation failed")

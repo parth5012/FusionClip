@@ -2,7 +2,7 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
@@ -157,7 +157,17 @@ def search_media(
 
 
 @router.post("/api/media/backfill-embeddings")
-def backfill_embeddings_endpoint(db: Session = Depends(get_db)):
-    """Backfill missing 384-dimensional embeddings for MediaAsset rows."""
-    count = backfill_media_embeddings(db)
+def backfill_embeddings_endpoint(
+    max_rows: int = 1000, db: Session = Depends(get_db)
+):
+    """Backfill missing 384-dimensional embeddings for MediaAsset rows.
+
+    ``max_rows`` caps how many rows a single request may process so an
+    unauthenticated call cannot synchronously re-embed the whole table.
+    """
+    if max_rows < 1 or max_rows > 10000:
+        raise HTTPException(
+            status_code=400, detail="max_rows must be between 1 and 10000"
+        )
+    count = backfill_media_embeddings(db, max_rows=max_rows)
     return {"status": "ok", "backfilled": count}

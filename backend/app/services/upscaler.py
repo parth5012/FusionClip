@@ -352,6 +352,9 @@ def run_tile_upscale_pipeline(
                         db_task.logs = f"{step_message} (scale: {scale}x, {target_w}x{target_h})"
                         db.commit()
                 except Exception as db_err:
+                    # A failed commit poisons the session; roll back so the
+                    # next progress tick (and the failure handler) still work.
+                    db.rollback()
                     logger.warning(f"Could not update task {task_id} in DB: {db_err}")
 
             # Publish to Redis Pub/Sub for live WebSocket clients
@@ -462,6 +465,10 @@ def execute_upscale_job(
     except Exception as e:
         logger.error(f"Upscale job {task_id} failed: {e}", exc_info=True)
         try:
+            # A failed commit (e.g. MediaAsset insert) leaves the session in a
+            # failed transaction; roll back before recording the failure state
+            # or the status poller would wait on PROCESSING forever.
+            db.rollback()
             db_task = db.query(Task).filter(Task.task_id == task_id).first()
             if db_task:
                 db_task.status = "FAILED"

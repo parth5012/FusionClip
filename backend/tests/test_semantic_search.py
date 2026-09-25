@@ -5,6 +5,7 @@ from app.models import MediaAsset
 from app.services.embedding import (
     EMBEDDING_DIM,
     get_embedding,
+    get_model,
     backfill_media_embeddings,
     compute_cosine_distance,
 )
@@ -12,6 +13,8 @@ from app.services.embedding import (
 
 def test_embedding_dimensions_and_consistency():
     """Real embedder must produce exactly 384-dimensional normalized vectors."""
+    if get_model() is None:
+        pytest.skip("embedding model is unavailable")
     assert EMBEDDING_DIM == 384
     vec1 = get_embedding("ocean waves crashing on shore")
     assert isinstance(vec1, list)
@@ -35,6 +38,8 @@ def test_semantic_search_meaningfully_ranked(client, db_session, stub_storage):
 
     even when words do not overlap with the search query.
     """
+    if get_model() is None:
+        pytest.skip("embedding model is unavailable")
     assets = [
         MediaAsset(
             title="sea_water_coast_timelapse.mp4",
@@ -148,3 +153,32 @@ def test_backfill_endpoint(client, db_session, stub_storage):
     refetched = db_session.query(MediaAsset).filter_by(title="new_uploaded_file.mp4").first()
     assert refetched.embedding is not None
     assert len(refetched.embedding) == 384
+
+
+def test_backfill_endpoint_caps_rows_per_request(client, db_session, stub_storage):
+    """max_rows bounds how many NULL-embedding rows a single request re-embeds."""
+    for i in range(3):
+        db_session.add(
+            MediaAsset(
+                title=f"cap_{i}.mp4",
+                file_path=f"cap_{i}.mp4",
+                file_size=1,
+                content_type="video/mp4",
+                duration=1.0,
+                embedding=None,
+            )
+        )
+    db_session.commit()
+
+    res = client.post("/api/media/backfill-embeddings?max_rows=2")
+    assert res.status_code == 200
+    assert res.json()["backfilled"] == 2
+    remaining = (
+        db_session.query(MediaAsset)
+        .filter(MediaAsset.embedding.is_(None))
+        .count()
+    )
+    assert remaining == 1
+
+    bad = client.post("/api/media/backfill-embeddings?max_rows=0")
+    assert bad.status_code == 400

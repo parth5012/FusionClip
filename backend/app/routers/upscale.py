@@ -196,14 +196,25 @@ def get_upscale_task_status(task_id: str, db: Session = Depends(get_db)):
     result_url = None
     output_path = None
 
-    if db_task.status == "COMPLETED":
+    if db_task.status == "COMPLETED" and task_id.startswith("upscale_"):
         # Resolve THIS task's output asset via the unique token embedded in
         # the object key — never via title, which is shared across jobs.
+        # Only upscale tasks carry a token, and the router builds keys as
+        # upscaled/{stem}_{scale}x_{token}.png — match that exact suffix so an
+        # unrelated asset containing the token substring can never be returned.
         task_token = task_id.split("_", 1)[-1]
-        asset = (
+        candidates = (
             db.query(MediaAsset)
             .filter(MediaAsset.file_path.contains(task_token))
-            .first()
+            .all()
+        )
+        asset = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.file_path.endswith(f"_{task_token}.png")
+            ),
+            None,
         )
         if asset:
             output_path = asset.file_path

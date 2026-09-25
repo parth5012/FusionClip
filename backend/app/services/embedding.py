@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
@@ -19,33 +20,49 @@ EMBEDDING_DIM = 384
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 _model_instance = None
+_model_load_failed = False
+_model_lock = threading.Lock()
 
 
 def get_model():
-    """Lazy-load and cache the embedding model."""
-    global _model_instance
+    """Lazy-load and cache the embedding model.
+
+    A failed load is remembered so later calls do not retry a network model
+    download on every request; the lock prevents concurrent threadpool calls
+    from racing to load the model twice.
+    """
+    global _model_instance, _model_load_failed
     if _model_instance is not None:
         return _model_instance
+    if _model_load_failed:
+        return None
 
-    try:
-        from fastembed import TextEmbedding
+    with _model_lock:
+        if _model_instance is not None:
+            return _model_instance
+        if _model_load_failed:
+            return None
 
-        _model_instance = TextEmbedding(MODEL_NAME)
-        logger.info(f"Loaded embedding model via fastembed: {MODEL_NAME}")
-        return _model_instance
-    except Exception as fe_err:
-        logger.warning(f"Could not initialize fastembed model: {fe_err}")
+        try:
+            from fastembed import TextEmbedding
 
-    try:
-        from sentence_transformers import SentenceTransformer
+            _model_instance = TextEmbedding(MODEL_NAME)
+            logger.info(f"Loaded embedding model via fastembed: {MODEL_NAME}")
+            return _model_instance
+        except Exception as fe_err:
+            logger.warning(f"Could not initialize fastembed model: {fe_err}")
 
-        _model_instance = SentenceTransformer(MODEL_NAME)
-        logger.info(f"Loaded embedding model via sentence-transformers: {MODEL_NAME}")
-        return _model_instance
-    except Exception as st_err:
-        logger.warning(f"Could not initialize sentence-transformers model: {st_err}")
+        try:
+            from sentence_transformers import SentenceTransformer
 
-    return None
+            _model_instance = SentenceTransformer(MODEL_NAME)
+            logger.info(f"Loaded embedding model via sentence-transformers: {MODEL_NAME}")
+            return _model_instance
+        except Exception as st_err:
+            logger.warning(f"Could not initialize sentence-transformers model: {st_err}")
+
+        _model_load_failed = True
+        return None
 
 
 def get_embedding(text: str) -> List[float]:
@@ -118,14 +135,21 @@ def compute_l2_distance(v1: List[float], v2: List[float]) -> float:
     return math.sqrt(sum((a - b) ** 2 for a, b in zip(v1, v2)))
 
 
-def backfill_media_embeddings(db: Session, batch_size: int = 100) -> int:
-    """Backfill missing embeddings for existing MediaAsset rows using their title."""
+def backfill_media_embeddings(db: Session, batch_size: int = 100, max_rows: int = 1000) -> int:
+    """Backfill missing embeddings for existing MediaAsset rows using their title.
+
+    ``max_rows`` bounds the total work of a single invocation so one request
+    cannot loop over an unbounded table (CWE-400 hardening).
+    """
     from app.models import MediaAsset
+
+    if max_rows < 1:
+        raise ValueError("max_rows must be >= 1")
 
     unembedded = (
         db.query(MediaAsset)
         .filter(MediaAsset.embedding.is_(None))
-        .limit(batch_size)
+        .limit(min(batch_size, max_rows))
         .all()
     )
     total_updated = 0
@@ -136,11 +160,14 @@ def backfill_media_embeddings(db: Session, batch_size: int = 100) -> int:
             total_updated += 1
         db.commit()
 
+        if total_updated >= max_rows:
+            break
+
         # Fetch next batch
         unembedded = (
             db.query(MediaAsset)
             .filter(MediaAsset.embedding.is_(None))
-            .limit(batch_size)
+            .limit(min(batch_size, max_rows - total_updated))
             .all()
         )
 

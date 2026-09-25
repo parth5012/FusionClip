@@ -131,6 +131,64 @@ class TestStatusResultLinkage:
         assert asset_a is not None
         assert asset_b is not None
 
+    def test_status_ignores_non_upscale_tasks_and_near_miss_assets(
+        self, client, db_session
+    ):
+        """Result resolution only applies to upscale_ tasks and exact suffixes.
+
+        A completed non-upscale task whose id token appears in an unrelated
+        asset, or an upscale task whose token only appears in a non-output
+        file, must never resolve a result_url (review hardening).
+        """
+        from app.models import Task
+
+        db_session.add(
+            Task(
+                task_id="export_deadbeef01",
+                name="export something",
+                status="COMPLETED",
+                progress=100,
+            )
+        )
+        db_session.add(
+            MediaAsset(
+                title="leak",
+                file_path="processed/export_deadbeef01_leak.png",
+                file_size=1,
+                content_type="image/png",
+            )
+        )
+        db_session.commit()
+
+        s = client.get("/api/upscale/status/export_deadbeef01").json()
+        assert s["status"] == "COMPLETED"
+        assert s["output_path"] is None
+        assert s["result_url"] is None
+
+        token = "feedfacecafe12"
+        db_session.add(
+            Task(
+                task_id=f"upscale_{token}",
+                name="upscale: x (2x)",
+                status="COMPLETED",
+                progress=100,
+            )
+        )
+        db_session.add(
+            MediaAsset(
+                title="near",
+                file_path=f"notes_{token}.txt",
+                file_size=1,
+                content_type="text/plain",
+            )
+        )
+        db_session.commit()
+
+        s2 = client.get(f"/api/upscale/status/upscale_{token}").json()
+        assert s2["status"] == "COMPLETED"
+        assert s2["output_path"] is None
+        assert s2["result_url"] is None
+
 
 class TestPresetsAndCategoriesEndpoints:
     def test_presets_endpoint_returns_engine_registry(self, client):
