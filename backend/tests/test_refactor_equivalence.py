@@ -266,15 +266,34 @@ class TestDefaultedCallShapes:
     by a path-presence check but breaks e2e/05's `parameters.steps` assertion.
     """
 
-    def test_generate_audio_default_type_is_tts(self, client, stub_storage, monkeypatch):
-        # Mock TTS pipeline to avoid downloading models in tests
-        class MockTTS:
-            def tts(self, **kwargs):
-                import numpy as np
-                return (22050, np.zeros(22050, dtype=np.float32))
-        monkeypatch.setattr("app.routers.generate.load_xtts_pipeline", lambda: MockTTS())
-        monkeypatch.setattr("app.routers.generate.load_chattts_pipeline", lambda: MockTTS())
+    @pytest.fixture(autouse=True)
+    def stub_local_image_pipeline(self, monkeypatch):
+        """Provide lightweight GPU admission and model execution for default parameter checks."""
+        from app.ml.guard import vram_guard
+        from app.ml.registry import model_registry
 
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: lambda **kw: [b"\x89PNG\r\n\x1a\nequivalence-test-png-bytes"],
+        )
+
+    def test_generate_audio_default_type_is_tts(self, client, stub_storage):
         body = client.post("/api/generate/audio?prompt=defaults").json()
         assert body["type"] == "tts"
         assert set(body) == {"status", "type", "filename", "url", "colab"}

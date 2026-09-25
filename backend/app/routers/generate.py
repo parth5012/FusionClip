@@ -18,7 +18,10 @@ from fastapi import APIRouter, Depends, Query, HTTPException, Request, File, Upl
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
+from app.ml.image import SUPPORTED_SCHEDULERS, run_local_image_generation
 from app.models import Configuration, MediaAsset, Task
+from app.services.embedding import get_embedding
+from app.services.secrets import get_secret
 from app.storage import generate_url, upload_object
 from app.config import settings
 from app.scratchpad import scratchpad
@@ -43,6 +46,12 @@ redis_client = redis.from_url(settings.REDIS_URL)
 #: Client header consulted only when no key is stored server-side.
 GEMINI_KEY_HEADER = "X-Gemini-Key"
 ELEVENLABS_KEY_HEADER = "X-ElevenLabs-Key"
+
+# Aspect ratios are `W:H` with integer parts, e.g. '16:9'. The generic safe-identifier
+# pattern rejects ':', which made GenerationPanel's default '16:9' 400 before any
+# provider was consulted. Deliberately NOT a relaxation of SAFE_IDENTIFIER_PATTERN so
+# provider/scheduler stay injection-proof.
+ASPECT_RATIO_PATTERN = re.compile(r"^\d{1,4}:\d{1,4}$")
 
 
 import io
@@ -110,6 +119,25 @@ def _save_asset(db: Session, title: str, filename: str, content_type: str, size:
         logger.error(f"Failed to save generated asset {filename}: {e}")
         db.rollback()
 
+
+def _validate_aspect_ratio(val: Optional[str]) -> None:
+    """Accept `W:H` integer ratios only; reject everything else with 400."""
+    if val is None:
+        return
+    if not ASPECT_RATIO_PATTERN.match(val):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid aspect_ratio: must be an integer ratio like '16:9' "
+                "(digits, one colon, each part <= 9999)"
+            ),
+        )
+    width, height = (int(p) for p in val.split(":"))
+    if width < 1 or height < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid aspect_ratio: both parts must be >= 1",
+        )
 
 
 def is_colab_connected():
@@ -815,21 +843,64 @@ def generate_image(
     prompt: str = Query(...),
     steps: int = Query(28),
     scale: float = Query(7.5),
-    image_strength: float = Query(0.75, description="Denoising strength for img2img (0.0-1.0)"),
-    init_image: Optional[UploadFile] = File(None, description="Initial image for img2img mode"),
-    use_flux: bool = Query(True, description="Use Flux.1 (True) or SDXL (False)"),
-    db: Session = Depends(get_db)
+    aspect_ratio: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    scheduler: Optional[str] = Query(None),
+    denoising_strength: Optional[float] = Query(None),
+    db: Session = Depends(get_db),
 ):
-    """Generate images using local Flux.1/SDXL pipelines or offload to Colab."""
+    """Generate image via Gemini Nano Banana, Colab worker, or local PyTorch pipeline."""
+    _validate_aspect_ratio(aspect_ratio)
+    _validate_safe_identifier(provider, "provider")
+    _validate_safe_identifier(scheduler, "scheduler")
+
+    if scheduler is not None and scheduler.lower() not in SUPPORTED_SCHEDULERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported scheduler '{scheduler}'. Supported schedulers: {', '.join(sorted(SUPPORTED_SCHEDULERS.keys()))}",
+        )
+
+    if steps < 1 or steps > 150:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid steps: must be between 1 and 150, got {steps}",
+        )
+
+    if scale < 0.0 or scale > 30.0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid scale: must be between 0.0 and 30.0, got {scale}",
+        )
+
+    if denoising_strength is not None and (denoising_strength < 0.0 or denoising_strength > 1.0):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid denoising_strength: must be between 0.0 and 1.0, got {denoising_strength}",
+        )
+
+    # `strength` is img2img-only: diffusers txt2img pipelines raise TypeError on it,
+    # and this route has no source-image input yet. Accepting the value and quietly
+    # dropping it would be worse than refusing, so refuse with an actionable message.
+    if denoising_strength is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "denoising_strength requires a source image; image-to-image input "
+                "is not available on /api/generate/image yet. Omit the parameter "
+                "for text-to-image."
+            ),
+        )
+
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="image_generation",
             parameters={
-                "prompt": prompt, 
-                "steps": steps, 
+                "prompt": prompt,
+                "steps": steps,
                 "scale": scale,
-                "image_strength": image_strength,
-                "use_flux": use_flux
+                "aspect_ratio": aspect_ratio,
+                "provider": provider,
+                "scheduler": scheduler,
             },
             db=db,
             file_extension="png",
@@ -894,87 +965,19 @@ def generate_image(
             "url": generate_url(filename) if upload_success else "",
         }
 
-    try:
-        # Load pipeline
-        if use_flux:
-            pipeline = load_flux_pipeline()
-        else:
-            pipeline = load_sdxl_pipeline()
-
-        # Image-to-image mode
-        if init_image:
-            init_image_data = Image.open(io.BytesIO(init_image.file.read()))
-            image = pipeline(
-                prompt=prompt,
-                num_inference_steps=steps,
-                guidance_scale=scale,
-                strength=image_strength,
-                image=init_image_data
-            ).images[0]
-        # Text-to-image mode
-        else:
-            image = pipeline(
-                prompt=prompt,
-                num_inference_steps=steps,
-                guidance_scale=scale
-            ).images[0]
-
-        # Save image to bytes
-        img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format="PNG")
-        img_byte_arr = img_byte_arr.getvalue()
-
-        # Upload to MinIO
-        filename = f"gen_image_{int(time.time())}.png"
-        upload_success = upload_object(img_byte_arr, filename, content_type="image/png")
-
-        # Save media asset
-        asset = MediaAsset(
-            title=f"{'Flux' if use_flux else 'SDXL'} Generated: {prompt[:30]}...",
-            file_path=filename,
-            file_size=len(img_byte_arr),
-            content_type="image/png",
-            duration=0.0,
-            embedding=get_embedding(prompt or title),
-        )
-        db.add(asset)
-        db.commit()
-
-        return {
-            "status": "COMPLETED",
-            "parameters": {"steps": steps, "scale": scale, "use_flux": use_flux},
-            "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
-            "colab": False
-        }
-    except Exception as e:
-        logger.warning(f"Local image generation unavailable, falling back to mock: {e}")
-
-    filename = f"gen_image_{int(time.time())}.png"
-    content = b"Mock local flux generated image bytes."
-    upload_success = upload_object(content, filename, content_type="image/png")
-    try:
-        title = f"Flux Generated: {prompt[:30]}..."
-        asset = MediaAsset(
-            title=title,
-            file_path=filename,
-            file_size=len(content),
-            content_type="image/png",
-            duration=0.0,
-            embedding=get_embedding(prompt or title),
-        )
-        db.add(asset)
-        db.commit()
-    except Exception as e:
-        logger.error(f"Failed to save generated image asset: {e}")
-        db.rollback()
-    return {
-        "status": "COMPLETED",
-        "parameters": {"steps": steps, "scale": scale, "use_flux": use_flux},
-        "filename": filename,
-        "url": generate_url(filename) if upload_success else "",
-        "colab": False
-    }
+    # Local ML pipeline path (priority-1: flux-schnell with sdxl auto-downgrade).
+    # This replaces the legacy load_flux_pipeline/load_sdxl_pipeline block and its
+    # `b"Mock local flux generated image bytes."` fallback, both of which are gone:
+    # #100 routes local inference through the VRAM-guarded registry and #81 forbids
+    # ever returning fake image bytes (see app/ml/contracts.py).
+    return run_local_image_generation(
+        prompt=prompt,
+        steps=steps,
+        scale=scale,
+        aspect_ratio=aspect_ratio,
+        scheduler=scheduler,
+        db=db,
+    )
 
 
 
