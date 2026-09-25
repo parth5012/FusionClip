@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.deps import get_db
+from app.ml.contracts import DegradedReason, make_degraded_response
 from app.ml.audio import SUPPORTED_AUDIO_TYPES, run_local_audio_generation
 from app.ml.image import SUPPORTED_SCHEDULERS, run_local_image_generation
 from app.models import Configuration, MediaAsset, Task
@@ -507,29 +508,34 @@ def generate_audio(
                 filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
 
             upload_success = upload_object(content, filename, content_type="audio/mpeg")
+            if not upload_success:
+                logger.error(f"Failed to upload ElevenLabs audio asset '{filename}' to storage")
+                return make_degraded_response(
+                    reason=DegradedReason.LOAD_FAILED.value,
+                    message="Failed to upload generated audio to storage",
+                ).model_dump()
 
-            if upload_success:
-                try:
-                    title = f"ElevenLabs {'SFX' if type == 'sfx' else 'TTS'}: {prompt[:30]}..."
-                    asset = MediaAsset(
-                        title=title,
-                        file_path=filename,
-                        file_size=len(content),
-                        content_type="audio/mpeg",
-                        duration=3.0,
-                        embedding=get_embedding(prompt or title),
-                    )
-                    db.add(asset)
-                    db.commit()
-                except Exception as e:
-                    logger.error(f"Failed to save generated audio asset: {e}")
-                    db.rollback()
+            try:
+                title = f"ElevenLabs {'SFX' if type == 'sfx' else 'TTS'}: {prompt[:30]}..."
+                asset = MediaAsset(
+                    title=title,
+                    file_path=filename,
+                    file_size=len(content),
+                    content_type="audio/mpeg",
+                    duration=3.0,
+                    embedding=get_embedding(prompt or title),
+                )
+                db.add(asset)
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to save generated audio asset: {e}")
+                db.rollback()
 
             return {
                 "status": "COMPLETED",
                 "type": type,
                 "filename": filename,
-                "url": generate_url(filename) if upload_success else "",
+                "url": generate_url(filename),
             }
 
     # Local ML pipeline path (XTTS v2 voice / voice clone + MusicGen audio / sfx)
@@ -896,29 +902,34 @@ def generate_image(
 
             filename = f"gemini_img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
             upload_success = upload_object(img_bytes, filename, content_type="image/png")
+            if not upload_success:
+                logger.error(f"Failed to upload Gemini image asset '{filename}' to storage")
+                return make_degraded_response(
+                    reason=DegradedReason.LOAD_FAILED.value,
+                    message="Failed to upload generated image to storage",
+                ).model_dump()
 
-            if upload_success:
-                try:
-                    title = f"Gemini Image: {prompt[:30]}..."
-                    asset = MediaAsset(
-                        title=title,
-                        file_path=filename,
-                        file_size=len(img_bytes),
-                        content_type="image/png",
-                        duration=0.0,
-                        embedding=get_embedding(prompt or title),
-                    )
-                    db.add(asset)
-                    db.commit()
-                except Exception as e:
-                    logger.error(f"Failed to save generated image asset: {e}")
-                    db.rollback()
+            try:
+                title = f"Gemini Image: {prompt[:30]}..."
+                asset = MediaAsset(
+                    title=title,
+                    file_path=filename,
+                    file_size=len(img_bytes),
+                    content_type="image/png",
+                    duration=0.0,
+                    embedding=get_embedding(prompt or title),
+                )
+                db.add(asset)
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to save generated image asset: {e}")
+                db.rollback()
 
             return {
                 "status": "COMPLETED",
                 "parameters": {"steps": steps, "scale": scale},
                 "filename": filename,
-                "url": generate_url(filename) if upload_success else "",
+                "url": generate_url(filename),
             }
 
     # Local ML pipeline path (priority-1: flux-schnell with sdxl auto-downgrade)
@@ -1103,6 +1114,7 @@ def generate_video(
                 "fps": fps,
             },
             db=db,
+            timeout=300,
             file_extension="mp4",
             content_type="video/mp4",
         )

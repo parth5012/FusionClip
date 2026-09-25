@@ -595,3 +595,196 @@ class TestReviewFindings:
 
         for n in names:
             assert re.fullmatch(r"gen_image_\d+\.png", n), n
+
+
+class TestCodeRabbitFixesImage:
+    """Tests for CodeRabbit PR #130 review findings (B3, B4)."""
+
+    def test_b3_local_image_upload_failure_returns_degraded_and_does_not_persist(
+        self, client, monkeypatch, db_session
+    ):
+        """B3 Call Site 1: Forced upload_object -> False in local image path returns degraded response and does not persist."""
+        fake_png = b"\x89PNG\r\n\x1a\nfake-flux-image-bytes"
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: lambda **kw: [fake_png],
+        )
+
+        import app.ml.image as img_mod
+        monkeypatch.setattr(img_mod, "upload_object", lambda *a, **kw: False)
+
+        initial_count = db_session.query(MediaAsset).count()
+        res = client.post("/api/generate/image?prompt=A+cyberpunk+city&provider=local")
+        assert res.status_code == 200
+        body = res.json()
+        assert body.get("status") != "COMPLETED", "Upload failure must not report COMPLETED"
+        assert body.get("degraded") is True
+        assert body.get("reason") == DegradedReason.LOAD_FAILED.value
+        assert "storage" in body.get("message", "").lower() or "upload" in body.get("message", "").lower()
+        assert db_session.query(MediaAsset).count() == initial_count, "MediaAsset must not be persisted on upload failure"
+
+    def test_b3_gemini_image_upload_failure_returns_degraded_and_does_not_persist(
+        self, client, monkeypatch, db_session
+    ):
+        """B3 Call Site 2: Forced upload_object -> False in cloud/Gemini image path returns degraded response and does not persist."""
+        import base64
+        import app.routers.generate as gen_router
+        from app.services.secrets import set_secret
+
+        set_secret("gemini", "test-gemini-key", db_session)
+
+        fake_png_bytes = b"\x89PNG\r\n\x1a\ngemini-fake-png"
+        fake_b64 = base64.b64encode(fake_png_bytes).decode("utf-8")
+        gemini_response = {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"inlineData": {"mimeType": "image/png", "data": fake_b64}}
+                        ]
+                    }
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            gen_router, "call_gemini_generate_content", lambda **kw: gemini_response
+        )
+        monkeypatch.setattr(gen_router, "upload_object", lambda *a, **kw: False)
+
+        initial_count = db_session.query(MediaAsset).count()
+        res = client.post("/api/generate/image?prompt=Cloud+gemini+art&provider=gemini")
+        assert res.status_code == 200
+        body = res.json()
+        assert body.get("status") != "COMPLETED", "Upload failure must not report COMPLETED"
+        assert body.get("degraded") is True
+        assert body.get("reason") == DegradedReason.LOAD_FAILED.value
+        assert db_session.query(MediaAsset).count() == initial_count, "MediaAsset must not be persisted on upload failure"
+
+    def test_b4_flux_defaults_used_when_no_explicit_steps_or_scale(
+        self, client, monkeypatch, stub_storage
+    ):
+        """B4: FLUX.1-schnell defaults to 4 steps and 0.0 guidance scale when none specified."""
+        captured_kwargs = {}
+
+        class FakeFluxPipe:
+            def __call__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+                return [b"\x89PNG\r\n\x1a\nflux-png"]
+
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: FakeFluxPipe(),
+        )
+
+        res = client.post("/api/generate/image?prompt=Flux+defaults&provider=local")
+        assert res.status_code == 200
+        assert captured_kwargs.get("num_inference_steps") == 4, "FLUX.1-schnell must use 4 steps by default"
+        assert captured_kwargs.get("guidance_scale") == 0.0, "FLUX.1-schnell must use guidance_scale=0.0 by default"
+
+    def test_b4_flux_explicit_steps_and_scale_forwarded(
+        self, client, monkeypatch, stub_storage
+    ):
+        """B4: Caller can explicitly override steps and scale for FLUX.1-schnell."""
+        captured_kwargs = {}
+
+        class FakeFluxPipe:
+            def __call__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+                return [b"\x89PNG\r\n\x1a\nflux-png"]
+
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: FakeFluxPipe(),
+        )
+
+        res = client.post("/api/generate/image?prompt=Flux+custom&steps=8&scale=1.5&provider=local")
+        assert res.status_code == 200
+        assert captured_kwargs.get("num_inference_steps") == 8
+        assert captured_kwargs.get("guidance_scale") == 1.5
+
+    def test_b4_sdxl_defaults_preserved(
+        self, client, monkeypatch, stub_storage
+    ):
+        """B4: SDXL path keeps 28 steps and 7.5 guidance scale defaults."""
+        captured_kwargs = {}
+
+        class FakeSDXLPipe:
+            def __call__(self, **kwargs):
+                captured_kwargs.update(kwargs)
+                return [b"\x89PNG\r\n\x1a\nsdxl-png"]
+
+        # 10 GB free VRAM: FLUX doesn't fit (needs 14GB), SDXL fits (needs 8GB)
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 3080",
+                "total_bytes": int(10.0 * (1024 ** 3)),
+                "free_bytes": int(10.0 * (1024 ** 3)),
+                "used_bytes": 0,
+                "total_gb": 10.0,
+                "free_gb": 10.0,
+                "used_gb": 0.0,
+                "vram_percent": 0.0,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: FakeSDXLPipe(),
+        )
+
+        res = client.post("/api/generate/image?prompt=SDXL+defaults&provider=local")
+        assert res.status_code == 200
+        assert captured_kwargs.get("num_inference_steps") == 28, "SDXL must keep 28 steps by default"
+        assert captured_kwargs.get("guidance_scale") == 7.5, "SDXL must keep guidance_scale=7.5 by default"
+

@@ -246,25 +246,29 @@ def run_local_audio_generation(
                                 file_path=tmp_path,
                             )
                         else:
-                            speaker = None
-                            if hasattr(model_instance, "speakers") and model_instance.speakers:
-                                if voice_id and voice_id in model_instance.speakers:
-                                    speaker = voice_id
-                                else:
-                                    speaker = model_instance.speakers[0]
-                            if speaker:
-                                model_instance.tts_to_file(
-                                    text=prompt,
-                                    speaker=speaker,
-                                    language="en",
-                                    file_path=tmp_path,
+                            speakers = getattr(model_instance, "speakers", None)
+                            if not speakers:
+                                logger.warning(
+                                    f"XTTS plain-TTS request refused: model '{selected_model_id}' "
+                                    "exposes no speakers and no reference audio was provided"
                                 )
-                            else:
-                                model_instance.tts_to_file(
-                                    text=prompt,
-                                    language="en",
-                                    file_path=tmp_path,
-                                )
+                                return make_degraded_response(
+                                    reason=DegradedReason.LOAD_FAILED.value,
+                                    message=f"Model '{selected_model_id}' exposes no speakers and no reference audio was provided",
+                                    model_id=selected_model_id,
+                                ).model_dump()
+
+                            speaker = (
+                                voice_id
+                                if voice_id and voice_id in speakers
+                                else (speakers[0] if isinstance(speakers, (list, tuple)) else next(iter(speakers)))
+                            )
+                            model_instance.tts_to_file(
+                                text=prompt,
+                                speaker=speaker,
+                                language="en",
+                                file_path=tmp_path,
+                            )
                         with open(tmp_path, "rb") as f:
                             wav_bytes = f.read()
                     finally:
@@ -308,6 +312,13 @@ def run_local_audio_generation(
         # 4. Upload real WAV bytes
         filename = build_audio_filename()
         upload_success = upload_object(wav_bytes, filename, content_type="audio/wav")
+        if not upload_success:
+            logger.error(f"Failed to upload audio asset '{filename}' to storage")
+            return make_degraded_response(
+                reason=DegradedReason.LOAD_FAILED.value,
+                message="Failed to upload generated audio to storage",
+                model_id=selected_model_id,
+            ).model_dump()
 
         # 5. Determine duration
         duration_val = 3.0
@@ -322,7 +333,7 @@ def run_local_audio_generation(
                 duration_val = float(duration)
 
         # 6. Persist MediaAsset in DB
-        if upload_success and db is not None:
+        if db is not None:
             try:
                 if type == "voice_clone":
                     title = f"Voice Clone: {prompt[:30]}..."
@@ -360,6 +371,6 @@ def run_local_audio_generation(
             "status": "COMPLETED",
             "type": type,
             "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
+            "url": generate_url(filename),
             "markers": markers,
         }
