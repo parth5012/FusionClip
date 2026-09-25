@@ -97,10 +97,10 @@ export default function PlayersPanel() {
 
   // Load the generated clip instead of the demo URL once one exists.
   useEffect(() => {
-    if (waveAudio?.url && waveAudio.url !== audioUrl) {
+    if (waveAudio?.url) {
       setAudioUrl(waveAudio.url);
     }
-  }, [waveAudio, audioUrl]);
+  }, [waveAudio]);
 
   // Video Custom Player states
   const [videoUrl, setVideoUrl] = useState<string>('https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4');
@@ -149,14 +149,14 @@ export default function PlayersPanel() {
   // Hand-off from the generation panel for locally generated video (#102).
   const genVideo = useStore((s) => s.genVideo);
   useEffect(() => {
-    if (genVideo?.url && genVideo.url !== videoUrl) {
+    if (genVideo?.url) {
       setVideoUrl(genVideo.url);
     }
     // Step buttons and the frame readout must use the clip's real frame rate.
-    if (genVideo?.fps && genVideo.fps !== videoFps) {
+    if (genVideo?.fps) {
       setVideoFps(genVideo.fps);
     }
-  }, [genVideo, videoUrl, videoFps]);
+  }, [genVideo]);
 
   // Load and destroy Wavesurfer instance
   useEffect(() => {

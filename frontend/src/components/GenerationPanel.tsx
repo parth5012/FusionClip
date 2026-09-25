@@ -153,6 +153,14 @@ export default function GenerationPanel() {
         }
         // Async: returns a Celery task id, progress is polled below.
         const res = await startVideoGeneration(source, numFrames, videoFps);
+        if (!res.task_id) {
+          // Colab path completed synchronously.
+          const done = res as unknown as VideoGenerationResult;
+          setVideoResult(done);
+          setVideoProgress(null);
+          if (done.url) setGenVideo({ url: done.url, filename: done.filename ?? '', fps: videoFps });
+          return;
+        }
         setVideoTask(res);
         setVideoResult(null);
         setVideoProgress({ percent: 0, statusText: 'Queued on media.gpu…' });
@@ -171,7 +179,8 @@ export default function GenerationPanel() {
   // Frame-level progress for local SVD, using the same /api/tasks/status
   // contract (`info.percent` + `info.status`) as the file manager's job panel.
   useEffect(() => {
-    if (!videoTask) return;
+    const taskId = videoTask?.task_id;
+    if (!taskId) return;
     let cancelled = false;
     // A stalled or absent media.gpu worker must not leave this polling forever.
     const deadline = Date.now() + VIDEO_POLL_TIMEOUT_MS;
@@ -185,7 +194,7 @@ export default function GenerationPanel() {
       }
 
       try {
-        const status = await getTaskStatus(videoTask.task_id);
+        const status = await getTaskStatus(taskId);
         if (cancelled) return;
 
         if (status.state === 'PROGRESS' && status.info) {
@@ -229,10 +238,16 @@ export default function GenerationPanel() {
     ((activeModality === 'image' || activeModality === 'local') && imageResult) ||
     (activeModality === 'video' && (videoResult || videoProgress));
 
+  const isDegraded =
+    (activeModality === 'video' && Boolean(videoResult?.degraded)) ||
+    ((activeModality === 'tts' || activeModality === 'sfx' || activeModality === 'voice') && Boolean(audioResult?.degraded));
+
+  const isInFlight = activeModality === 'video' && Boolean(videoProgress && !videoResult);
+
   const getStageStatus = () => {
     if (isGenerating) return 'Status: GENERATING';
-    if (activeModality === 'video' && videoProgress && !videoResult) return 'Status: PROCESSING';
-    if (activeModality === 'video' && videoResult?.degraded) return 'Status: DEGRADED (200 OK)';
+    if (isInFlight) return 'Status: PROCESSING';
+    if (isDegraded) return 'Status: DEGRADED (200 OK)';
     if (hasResult) return 'Status: COMPLETED (200 OK)';
     return 'Status: IDLE';
   };
@@ -621,14 +636,16 @@ export default function GenerationPanel() {
 
               {!isGenerating && hasResult && (
                 <div className="w-full space-y-4 animate-fadeIn">
-                  <div className="flex items-center gap-2 text-xs text-emerald-400 bg-emerald-950/30 border border-emerald-800/50 px-3 py-2 rounded-lg">
-                    <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
-                    <span>
-                      {activeModality !== 'text' && (imageResult?.url || audioResult?.url)
-                        ? 'Generation completed successfully. Asset stored in S3.'
-                        : 'Generation completed successfully.'}
-                    </span>
-                  </div>
+                  {!isInFlight && !isDegraded && (
+                    <div className="flex items-center gap-2 text-xs text-emerald-400 bg-emerald-950/30 border border-emerald-800/50 px-3 py-2 rounded-lg">
+                      <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
+                      <span>
+                        {activeModality !== 'text' && (imageResult?.url || audioResult?.url || videoResult?.url)
+                          ? 'Generation completed successfully. Asset stored in S3.'
+                          : 'Generation completed successfully.'}
+                      </span>
+                    </div>
+                  )}
 
                   {/* Text Result */}
                   {activeModality === 'text' && textResult && (
@@ -667,7 +684,7 @@ export default function GenerationPanel() {
                     audioResult && (
                     <div
                       className={`bg-slate-950 border rounded-lg p-4 space-y-3 ${
-                        videoResult?.degraded ? 'border-amber-900/60' : 'border-slate-800'
+                        audioResult.degraded ? 'border-amber-900/60' : 'border-slate-800'
                       }`}
                     >
                         {audioResult.degraded ? (
