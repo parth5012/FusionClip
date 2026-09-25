@@ -1,19 +1,22 @@
-﻿import time
-import os
-import subprocess
-import traceback
-import sys
-import json
-import redis
-from datetime import datetime, timezone
-from app.celery_app import celery
-from app.storage import upload_object, generate_url, get_object_bytes
-from app.upscaler import TileUpscaler, calculate_tile_size
-from app.scratchpad import scratchpad
-from app.database import SessionLocal
-from app.models import Task, MediaAsset
-from app.config import settings
+﻿import json
 import logging
+import os
+import re
+import subprocess
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
+from typing import Optional
+
+import redis
+from app.celery_app import celery
+from app.config import settings
+from app.database import SessionLocal
+from app.models import MediaAsset, Task
+from app.scratchpad import scratchpad
+from app.storage import generate_url, get_object_bytes, upload_object
+from app.upscaler import TileUpscaler, calculate_tile_size
 
 logger = logging.getLogger(__name__)
 
@@ -1468,3 +1471,40 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
                 os.remove(tmp_path)
             except Exception as rm_err:
                 logger.warning(f"Failed to remove temporary export file {tmp_path}: {rm_err}")
+
+
+# Isolated GPU task endpoint (#99)
+@celery.task(bind=True, name="app.tasks.process_gpu_task")
+def process_gpu_task(self, model_id: str, payload: Optional[dict] = None):
+    """Execute a local ML inference task on the isolated media.gpu queue."""
+    req = getattr(self, "request", None)
+    task_id = getattr(req, "id", None) or f"gpu-{int(time.time())}"
+    logger.info(f"Processing GPU task {task_id} for model '{model_id}'")
+
+    from app.ml.contracts import DegradedReason, make_degraded_response
+    from app.ml.guard import vram_guard, VRAMRefusalError
+
+    try:
+        admission = vram_guard.check_vram(model_id)
+    except VRAMRefusalError as e:
+        logger.warning(f"GPU task {task_id} refused by VRAM guard: {e}")
+        return e.to_degraded_response().model_dump()
+    except KeyError:
+        # Defense in depth: never let an uncaught KeyError flip the Celery task to
+        # FAILURE instead of returning the Decision #3 degraded contract.
+        logger.warning(f"GPU task {task_id} requested unknown model '{model_id}'")
+        return make_degraded_response(
+            reason=DegradedReason.MODEL_NOT_FOUND.value,
+            message=f"Model '{model_id}' is not registered in ModelRegistry",
+            model_id=model_id,
+        ).model_dump()
+
+    return {
+        "status": "SUCCESS",
+        "task_id": task_id,
+        "model_id": model_id,
+        "admitted": True,
+        "admission": admission,
+        "message": f"Scaffold GPU task admitted for {model_id}",
+    }
+

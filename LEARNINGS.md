@@ -43,6 +43,22 @@
 
 ## 2026-09-24: Magnific upscaler ship (#96)
 
+## 2026-09-25: Local Torch Model Scaffold (Map #71)
+
+### 11. Import-Guarded PyTorch & CUDA Detection
+- Machines running backend unit tests or non-GPU nodes may not have `torch` or NVIDIA CUDA drivers installed.
+- Any GPU memory queries (`torch.cuda.mem_get_info`, `torch.cuda.is_available`) or cache clearing (`torch.cuda.empty_cache`) must be enclosed in guarded `try ... except (ImportError, Exception)` blocks so the server boots cleanly and tests pass deterministically in headless CI / CPU environments without raising unhandled import errors.
+
+### 12. Celery Queue Isolation for Mixed Hardware Workloads
+- Celery workers with concurrency > 1 on CPU queues (`media.fast`, `media.heavy`) can starve or conflict with GPU-intensive diffusion/transformers workloads if routed to common queues.
+- Creating an isolated `media.gpu` queue with dedicated task routes prevents CPU tasks (e.g. ffmpeg transcoding) from competing for worker slots with local VRAM-guarded inference tasks.
+
+### 13. Honest Degraded Tier Contract
+- When local ML execution cannot fit into GPU memory or when no GPU is detected, returning fake byte payloads ("Mock ... bytes") violates data integrity and corrupts downstream media decoders.
+- Surfacing a typed degraded envelope (`degraded: true` with machine-readable `reason` such as `insufficient_vram` or `no_gpu`) enables the API client and UI to present transparent fallback options (e.g., auto-downgrading from Flux to SDXL, routing to cloud APIs, or displaying actionable VRAM requirements) rather than masking failure with corrupted files.
+
+
+
 - **`task_id[:6]` is not unique enough**: two `upscale_*` ids sharing the first 6 chars cross-linked `file_path.contains(prefix)` status lookups → silent wrong-job results. Fix: per-job `uuid4().hex[:12]` token embedded in the output object path; status lookup contains the token (not the id prefix).
 - **Hand-rolled "minimal PNG" bytes can be structurally valid (signature/IHDR/IEND) yet have a corrupt IDAT stream**: FastAPI upload round-trips bytes fine, but PIL `Image.open().convert('RGB')` raises `OSError: broken data stream when reading image file` only when the pipeline decodes. E2E fixture must be PIL-verified, not just byte-plausible. A 1×1 PNG with IDAT `78 9c 63 f8 cf c0 00 00 03 01 01 00 c9 fe 92 ef` (zlib deflate of `\x00\xff\x00\x00\x00`) decodes cleanly.
 - **Playwright `<option>` elements inside a closed `<select>` are never "visible"**: `expect(option).toBeVisible()` always fails even when the option is present. Assert `toHaveCount(1)` (or rely on `selectOption`'s built-in wait) instead.
