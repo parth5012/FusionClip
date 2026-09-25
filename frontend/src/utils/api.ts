@@ -662,6 +662,7 @@ export async function generateImage(
   return postGenerate<GenerateImageResponse>(url, 'Image generation failed');
 }
 
+<<<<<<< HEAD
 /* ── Magnific Upscaler API (#94 / #96) ──────────────────────────────── */
 
 export interface UpscalePayload {
@@ -951,14 +952,18 @@ export async function deleteAssetSubtitle(
   return res.json();
 }
 
-/** Dispatch handle returned by POST /api/generate/video (poll with getTaskStatus). */
+/** Dispatch handle returned by POST /api/generate/video (poll with getTaskStatus, or synchronous Colab payload). */
 export interface GenerateVideoResponse {
-  task_id: string;
+  task_id?: string;
   status: string;
-  type: string;
-  source: string;
-  num_frames: number;
-  fps: number;
+  type?: string;
+  source?: string;
+  num_frames?: number;
+  fps?: number;
+  filename?: string;
+  url?: string;
+  colab?: boolean;
+  parameters?: Record<string, any>;
 }
 
 /** Final payload of a finished video job (Celery SUCCESS result). */
