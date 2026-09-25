@@ -592,6 +592,8 @@ export default function FileManager() {
             ))}
           </div>
         </div>
+      )}
+
       {/* Drag & drop overlay */}
       {isDragOver && (
         <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-sky-950/60 backdrop-blur-sm border-4 border-dashed border-sky-400 rounded-2xl">
