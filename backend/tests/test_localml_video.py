@@ -738,3 +738,27 @@ class TestGenerateVideoEndpoint:
         assert dispatched[0][1]["source"] == "input.png"
         assert dispatched[0][1]["num_frames"] == 14
         assert dispatched[0][1]["fps"] == 7
+
+    def test_b5_endpoint_colab_dispatch_uses_300s_timeout(self, client, stub_storage, monkeypatch):
+        """B5: Colab video dispatch sets timeout=300 to accommodate 25-frame SVD renders."""
+        stub_storage["uploaded"]["input.png"] = {"data": create_test_png_bytes(), "content_type": "image/png"}
+
+        import app.routers.generate as gen_router
+        monkeypatch.setattr(gen_router, "is_colab_connected", lambda: True)
+
+        captured_kwargs = {}
+        def fake_dispatch(task_type, parameters, db, **kwargs):
+            captured_kwargs.update(kwargs)
+            return {
+                "status": "COMPLETED",
+                "colab": True,
+                "filename": "colab_video.mp4",
+                "url": "http://testserver/colab_video.mp4",
+            }
+
+        monkeypatch.setattr(gen_router, "dispatch_gen_to_colab", fake_dispatch)
+
+        res = client.post("/api/generate/video?source=input.png&num_frames=25&fps=7")
+        assert res.status_code == 200
+        assert captured_kwargs.get("timeout") == 300, "Colab video dispatch must use timeout=300"
+
