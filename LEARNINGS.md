@@ -114,6 +114,12 @@
 - Subprocesses invoked during inference (such as `ffmpeg` for MP4 encoding) must be guarded with `try/finally` blocks that actively kill the child process (`process.kill()`) and close stream handles (`process.stderr.close()`) if exceptions occur or if `progress_cb` fails; otherwise stalled children orphan and leave locks like `INFERENCE_LOCK` held indefinitely.
 - Background worker tasks (Celery) executing generative jobs must guarantee terminal database updates (`Task.status = "FAILED"`) and Redis pub/sub notifications on both unhandled exceptions and degraded responses (`degraded: true`), preventing tasks from lingering in `PROCESSING` state indefinitely.
 
+### 27. Polling State Machines Must Record Results Before Branching on Them
+- A poller that early-returns on a degraded/failed payload *before* storing that payload leaves the render branch below it unreachable: the styled error card becomes dead code and the panel silently falls back to its idle/empty state while the API correctly returned 200. Store the payload first, then branch on its fields.
+- Task-status pollers need a wall-clock deadline, not just terminal-state checks — if the worker process dies between dispatch and completion, `PROGRESS` simply stops arriving and a `setInterval` without a deadline polls `/api/tasks/status` forever while showing a stale progress bar.
+- Celery `FAILURE` payloads are not guaranteed to be strings (`info` may be a dict/exception repr); string interpolating them renders `[object Object]`. Normalise through a single `formatTaskFailure()` helper so user-facing error text stays legible.
+- Handing a generated asset to a player must carry its physical parameters (here `fps`): a player that defaults to 30 fps steps frames at the wrong interval and reports the wrong frame index for a 7 fps clip.
+
 
 
 
