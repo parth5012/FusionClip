@@ -1,14 +1,18 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useStore } from '../store/useStore';
 import {
   generateText,
   generateAudio,
   generateImage,
+  startVideoGeneration,
+  getTaskStatus,
   GenerateTextResponse,
   GenerateAudioResponse,
   GenerateImageResponse,
+  GenerateVideoResponse,
+  VideoGenerationResult,
 } from '../utils/api';
 import {
   Sparkles,
@@ -26,12 +30,13 @@ import {
   CheckCircle2,
   FolderPlus,
   Cpu,
+  Film,
 } from 'lucide-react';
 
-type Modality = 'text' | 'image' | 'tts' | 'sfx' | 'voice' | 'local';
+type Modality = 'text' | 'image' | 'tts' | 'sfx' | 'voice' | 'local' | 'video';
 
 export default function GenerationPanel() {
-  const { keyStatus, setActiveTab, colabTunnel, setWaveAudio } = useStore();
+  const { keyStatus, setActiveTab, colabTunnel, setWaveAudio, setGenVideo } = useStore();
   const [activeModality, setActiveModality] = useState<Modality>('text');
   const [prompt, setPrompt] = useState('A cinematic drone shot over a cybernetic neon city at dusk');
   const [isGenerating, setIsGenerating] = useState(false);
@@ -47,10 +52,18 @@ export default function GenerationPanel() {
   // Catalog file_path of a >=3s sample to clone from (local XTTS zero-shot path).
   const [voiceReference, setVoiceReference] = useState('');
 
+  // Local SVD image-to-video (map #71 / issue #102)
+  const [videoSource, setVideoSource] = useState('');
+  const [numFrames, setNumFrames] = useState(14);
+  const [videoFps, setVideoFps] = useState(7);
+  const [videoTask, setVideoTask] = useState<GenerateVideoResponse | null>(null);
+  const [videoProgress, setVideoProgress] = useState<{ percent: number; statusText: string } | null>(null);
+
   // Result states
   const [textResult, setTextResult] = useState<GenerateTextResponse | null>(null);
   const [audioResult, setAudioResult] = useState<GenerateAudioResponse | null>(null);
   const [imageResult, setImageResult] = useState<GenerateImageResponse | null>(null);
+  const [videoResult, setVideoResult] = useState<VideoGenerationResult | null>(null);
 
   const missingCommercialKeys = !keyStatus.gemini.configured || !keyStatus.elevenlabs.configured;
 
@@ -76,7 +89,15 @@ export default function GenerationPanel() {
     (isElevenLabsRequired && !keyStatus.elevenlabs.configured);
 
   const handleGenerate = async () => {
-    if (!prompt.trim()) return;
+    // Video is conditioned on a library image, not on free text.
+    if (activeModality === 'video') {
+      if (!videoSource.trim()) {
+        setError('Provide the source image file_path from the library.');
+        return;
+      }
+    } else if (!prompt.trim()) {
+      return;
+    }
     setIsGenerating(true);
     setError(null);
 
@@ -105,24 +126,83 @@ export default function GenerationPanel() {
           ? await generateAudio(prompt, 'voice_clone', undefined, undefined, reference)
           : await generateAudio(prompt, 'tts', voiceId);
         commitAudio(res);
+      } else if (activeModality === 'video') {
+        const source = videoSource.trim();
+        if (!source) {
+          setError('Provide the source image file_path from the library.');
+          return;
+        }
+        // Async: returns a Celery task id, progress is polled below.
+        const res = await startVideoGeneration(source, numFrames, videoFps);
+        setVideoTask(res);
+        setVideoResult(null);
+        setVideoProgress({ percent: 0, statusText: 'Queued on media.gpu…' });
       }
     } catch (err: unknown) {
       console.error('Generation request failed:', err);
       const message =
         err instanceof Error ? err.message : 'Generation failed. Please verify provider credentials.';
       setError(message);
+      setVideoProgress(null);
     } finally {
       setIsGenerating(false);
     }
   };
 
+  // Frame-level progress for local SVD, using the same /api/tasks/status
+  // contract (`info.percent` + `info.status`) as the file manager's job panel.
+  useEffect(() => {
+    if (!videoTask) return;
+    let cancelled = false;
+
+    const interval = setInterval(async () => {
+      try {
+        const status = await getTaskStatus(videoTask.task_id);
+        if (cancelled) return;
+
+        if (status.state === 'PROGRESS' && status.info) {
+          setVideoProgress({
+            percent: typeof status.info.percent === 'number' ? status.info.percent : 0,
+            statusText: status.info.status ?? '',
+          });
+        } else if (status.state === 'SUCCESS') {
+          clearInterval(interval);
+          const info = (status.info ?? {}) as VideoGenerationResult;
+          if (info.degraded) {
+            setVideoProgress(null);
+            setError(info.message || info.reason || 'Local GPU refused the video job.');
+            return;
+          }
+          setVideoProgress({ percent: 100, statusText: 'Completed' });
+          setVideoResult(info);
+          if (info.url) {
+            setGenVideo({ url: info.url, filename: info.filename ?? '' });
+          }
+        } else if (status.state === 'FAILURE') {
+          clearInterval(interval);
+          setVideoProgress(null);
+          setError(`Video generation failed: ${status.info}`);
+        }
+      } catch (err) {
+        console.error('Video task polling error:', err);
+      }
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [videoTask, setGenVideo]);
+
   const hasResult =
     (activeModality === 'text' && textResult) ||
     ((activeModality === 'tts' || activeModality === 'sfx' || activeModality === 'voice') && audioResult) ||
-    ((activeModality === 'image' || activeModality === 'local') && imageResult);
+    ((activeModality === 'image' || activeModality === 'local') && imageResult) ||
+    (activeModality === 'video' && (videoResult || videoProgress));
 
   const getStageStatus = () => {
     if (isGenerating) return 'Status: GENERATING';
+    if (activeModality === 'video' && videoProgress && !videoResult) return 'Status: PROCESSING';
     if (hasResult) return 'Status: COMPLETED (200 OK)';
     return 'Status: IDLE';
   };
@@ -157,6 +237,7 @@ export default function GenerationPanel() {
           { id: 'sfx', label: 'ElevenLabs Sound Effects', icon: Volume2, badge: 'ElevenLabs' },
           { id: 'voice', label: 'ElevenLabs Voice Lab', icon: Wand2, badge: 'Voice Preview' },
           { id: 'local', label: 'Flux / SDXL Sandbox', icon: Cpu, badge: 'Colab / Local' },
+          { id: 'video', label: 'SVD Image-to-Video', icon: Film, badge: 'Local GPU' },
         ].map((tab) => {
           const Icon = tab.icon;
           const active = activeModality === tab.id;
@@ -169,6 +250,9 @@ export default function GenerationPanel() {
                 setTextResult(null);
                 setAudioResult(null);
                 setImageResult(null);
+                // Video polling is deliberately left running across tab
+                // switches so a job in flight is not abandoned.
+                setVideoResult(null);
               }}
               className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition ${
                 active
@@ -398,10 +482,62 @@ export default function GenerationPanel() {
             </div>
           )}
 
+          {activeModality === 'video' && (
+            <div className="space-y-3 pt-1">
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium text-slate-300">Source Image (library file_path)</label>
+                <input
+                  type="text"
+                  value={videoSource}
+                  onChange={(e) => setVideoSource(e.target.value)}
+                  placeholder="e.g. condition_frame.png"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-sky-500"
+                />
+              </div>
+              <div>
+                <div className="flex justify-between text-xs">
+                  <span className="text-slate-300 font-medium">Frames ({numFrames})</span>
+                  <span className="text-slate-500 text-[10px]">2 – 25</span>
+                </div>
+                <input
+                  type="range"
+                  min={2}
+                  max={25}
+                  step={1}
+                  value={numFrames}
+                  onChange={(e) => setNumFrames(parseInt(e.target.value, 10))}
+                  className="w-full accent-sky-500"
+                />
+              </div>
+              <div>
+                <div className="flex justify-between text-xs">
+                  <span className="text-slate-300 font-medium">Frame Rate ({videoFps} fps)</span>
+                  <span className="text-slate-500 text-[10px]">1 – 30</span>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={30}
+                  step={1}
+                  value={videoFps}
+                  onChange={(e) => setVideoFps(parseInt(e.target.value, 10))}
+                  className="w-full accent-sky-500"
+                />
+              </div>
+              <p className="text-[10px] text-slate-500">
+                Runs Stable Video Diffusion on the local GPU. Progress is reported per
+                denoising step and per encoded frame.
+              </p>
+            </div>
+          )}
+
           {/* Generate Button */}
           <button
             onClick={handleGenerate}
-            disabled={isGenerating || !prompt.trim()}
+            disabled={
+              isGenerating ||
+              (activeModality === 'video' ? !videoSource.trim() : !prompt.trim())
+            }
             className="w-full py-3 bg-gradient-to-r from-sky-500 to-blue-600 hover:from-sky-400 hover:to-blue-500 text-slate-950 font-bold rounded-lg text-xs flex items-center justify-center gap-2 shadow-lg shadow-sky-500/20 disabled:opacity-50 transition"
           >
             {isGenerating ? (
@@ -544,6 +680,51 @@ export default function GenerationPanel() {
                         )}
                       </div>
                     )}
+
+                  {/* Video Result (local SVD) */}
+                  {activeModality === 'video' && (videoResult || videoProgress) && (
+                    <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-3">
+                      {videoProgress && !videoResult && (
+                        <div className="space-y-2">
+                          <div className="flex justify-between text-xs">
+                            <span className="font-medium text-slate-300">{videoProgress.statusText}</span>
+                            <span className="font-mono text-sky-400">{videoProgress.percent}%</span>
+                          </div>
+                          <div className="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                            <div
+                              className="bg-sky-500 h-full transition-all duration-300"
+                              style={{ width: `${videoProgress.percent}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                      {videoResult?.degraded ? (
+                        <div className="space-y-1.5">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="font-bold text-slate-200">Local GPU refused the video job</span>
+                            <span className="text-[10px] font-mono text-amber-400">{videoResult.reason}</span>
+                          </div>
+                          <p className="text-[11px] text-slate-400">{videoResult.message}</p>
+                        </div>
+                      ) : videoResult ? (
+                        <>
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="font-bold text-slate-200">{videoResult.filename}</span>
+                            <span className="text-[10px] font-mono text-slate-500">
+                              {videoResult.num_frames}f @ {videoResult.fps}fps
+                            </span>
+                          </div>
+                          {videoResult.url ? (
+                            <video controls src={videoResult.url} className="w-full rounded" />
+                          ) : (
+                            <div className="text-xs text-slate-500">
+                              Video uploaded: {videoResult.filename}
+                            </div>
+                          )}
+                        </>
+                      ) : null}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -553,7 +734,7 @@ export default function GenerationPanel() {
           {!isGenerating &&
             hasResult &&
             activeModality !== 'text' &&
-            Boolean(imageResult?.url || audioResult?.url) && (
+            Boolean(imageResult?.url || audioResult?.url || videoResult?.url) && (
               <div className="border-t border-slate-800 pt-4 flex items-center justify-end gap-3 mt-4">
                 <button
                   onClick={() => setActiveTab('library')}

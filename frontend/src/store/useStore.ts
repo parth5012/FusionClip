@@ -45,6 +45,12 @@ export interface WaveAudio {
   markers: AudioMarker[];
 }
 
+/** A generated video clip handed to the library video player. */
+export interface GeneratedVideo {
+  url: string;
+  filename: string;
+}
+
 interface AppState {
   // Navigation
   activeTab: TabType;
@@ -80,6 +86,10 @@ interface AppState {
   // Session-only: a stale marker must not survive a reload.
   waveAudio: WaveAudio | null;
   setWaveAudio: (waveAudio: WaveAudio | null) => void;
+
+  // Latest locally generated video handed to the library video player.
+  genVideo: GeneratedVideo | null;
+  setGenVideo: (genVideo: GeneratedVideo | null) => void;
 }
 
 export const EMPTY_KEY_STATUS: KeyStatus = {
@@ -123,6 +133,9 @@ export const useStore = create<AppState>()(
 
       waveAudio: null,
       setWaveAudio: (waveAudio) => set({ waveAudio }),
+
+      genVideo: null,
+      setGenVideo: (genVideo) => set({ genVideo }),
     }),
     {
       name: 'fusionclip-settings', // persisted in localStorage
