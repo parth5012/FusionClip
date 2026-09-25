@@ -251,6 +251,14 @@
   - **F9 NIT**: Enhanced `VideoEncodingError` with `returncode` and `stderr` fields and added focused test exercising genuine ffmpeg failure with non-zero exit code.
   - Verified: 320 passed in pytest suite (7 new tests added, 320 passed in 57.19s); lazy import check verified with no torch installed.
 
+- **Phase 2 (AFK): #102 Frontend Implementation + Review Gate Fixes**
+  - `api.ts`: `startVideoGeneration(source, num_frames, fps)` + `VideoGenerationResult`; session-only `genVideo` store slice (`url`, `filename`, `fps`).
+  - GenerationPanel: new `SVD Image-to-Video` modality (library `file_path`, frames 2-25, fps 1-30) dispatching to `/api/generate/video` and polling the existing `/api/tasks/status/{id}` contract every 1.5s, rendering the same `info.percent` / `info.status` bar the file-manager job panel uses (denoise 0-79%, encode 80-99%). Generate button validates `source` instead of free text for this modality.
+  - Review fixes: `setVideoResult(info)` before the degraded early-return (the refusal card was unreachable dead code) + `Status: DEGRADED (200 OK)` + amber border; 10-minute polling deadline so a dead worker surfaces a timeout instead of polling forever; `formatTaskFailure()` for structured Celery failures; `GeneratedVideo.fps` synced into PlayersPanel so frame stepping matches the clip; nested ternary split.
+  - PlayersPanel: loads the generated clip into the video player and captions it.
+  - Deviations: Playwright e2e not run — no FusionClip stack in this worktree (running ports belong to another project); UI verified with `tsc` + `next build` only.
+  - Verified: `npx tsc --noEmit` exit 0, `npx next build` exit 0, backend 320 passed.
+
 
 
 
