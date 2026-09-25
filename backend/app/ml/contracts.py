@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field, field_validator
 
 # Matches legacy placeholder payloads the map exists to eliminate, e.g.
-# "Mock elevenlabs generated audio bytes." / forbidden mock byte strings
+# legacy audio placeholder bytes / forbidden mock byte strings
 _MOCK_BYTES_RE = re.compile(r"mock\b.*\bbytes\b", re.IGNORECASE)
 
 
