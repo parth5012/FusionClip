@@ -150,4 +150,43 @@
 
 **Deviation / not yet specified:** `features.md` §3 promises denoising strength and image-to-image templates. This ticket's Question only asks for steps/guidance/scheduler, and there is no source-image input on `POST /api/generate/image`, so img2img (and therefore real denoising strength) is rejected rather than silently ignored. Needs its own ticket.
 
+## 2026-09-25: Wayfinder Map #71 - Local Torch Models (Real Audio Pipelines)
+
+### Iteration Status: Done
+
+- **Phase 2 (AFK): #101 - Real audio pipelines (XTTS v2 voice clone + MusicGen) replacing audio mock**
+  - Deleted the legacy mock branch and eliminated the placeholder string `"Mock elevenlabs generated audio bytes"` completely from production code and comments.
+  - Implemented `app.ml.audio`:
+    - `run_local_audio_generation`: Implemented admission check via `vram_guard.select_fitting_model` routing `tts`/`voice`/`voice_clone` to `xtts-v2` and `sfx`/`music` to `musicgen`.
+    - Returns typed DegradedResponse (`degraded: true` with machine-readable reasons `no_gpu`, `insufficient_vram`, `load_failed`, or `model_not_found`) whenever GPU resources are unavailable or admission is refused.
+    - Lazy loader factory `make_audio_loader`: Strictly encapsulates torch, transformers, and TTS imports inside loader functions so the FastAPI backend imports cleanly and boots without torch.
+    - XTTS v2 execution supports both plain TTS with built-in speaker and zero-shot voice cloning using reference speaker WAV.
+    - MusicGen execution generates tokens based on duration (~15s default at 50 tokens/sec) and outputs 16-bit PCM WAV.
+    - Audio output container is WAV (`audio/wav`) with nanosecond filenames `gen_audio_{time_ns}.wav` via `build_audio_filename()`.
+    - Exact duration extracted via standard library `wave.open` from generated WAV bytes.
+    - Uploads real WAV bytes to storage and persists `MediaAsset` records.
+    - Response structure includes `"markers": [...]`: includes `{"time": 0.0, "label": f"voice clone: {reference}", "kind": "voice_clone"}` for `type=voice_clone`, and `[]` for plain audio types.
+    - MediaAsset title for voice clone output prefixed with `Voice Clone: <prompt[:30]>...` for schema-free frontend marker derivation.
+  - Updated `backend/app/routers/generate.py`:
+    - Added `_validate_safe_reference` rejecting empty paths, path traversals (`..`), or invalid characters.
+    - Validates `type` against `SUPPORTED_AUDIO_TYPES` (400 if invalid).
+    - Requires non-empty `reference` parameter when `type="voice_clone"` (400 if missing).
+    - Preserved ElevenLabs cloud path when API key is configured.
+    - Forwards `reference` parameter to Colab dispatch when connected.
+  - Updated `conftest.py`: Added `app.ml.audio` to `stub_storage` fixture.
+  - Authored comprehensive test suite `backend/tests/test_localml_audio.py` (19 tests):
+    - Verified elimination of forbidden mock string from all production python files.
+    - Verified degraded refusal on `no_gpu` and `insufficient_vram`.
+    - Verified model selection: `tts`/`voice` -> `xtts-v2`, `sfx`/`music` -> `musicgen`.
+    - Verified voice clone requires reference (400) and passes reference to loader when present.
+    - Verified marker generation for voice clone and empty markers for other audio types.
+    - Verified real bytes uploaded, content_type `audio/wav`, and MediaAsset persisted.
+    - Verified load failure returns degraded response with `load_failed`.
+    - Verified ElevenLabs TTS and SFX cloud paths are preserved when key is configured.
+    - Verified `app.ml.audio` imports cleanly without torch.
+  - Updated smoke and equivalence tests (`test_routers_smoke.py`, `test_refactor_equivalence.py`, `test_generate_real_api.py`) to align with WAV container, markers contract, and honest degraded refusal.
+  - Updated `frontend/e2e/05-generation-catalog.spec.ts`: Relaxed filename regex to `/^gen_audio_\d+\.(mp3|wav)$/` and content_type to either `audio/mpeg` or `audio/wav`.
+  - Verified: 279 backend tests passing (19 added, 279 passed in 50.65s).
+
+
 
