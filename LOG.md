@@ -243,6 +243,15 @@
   - Authored comprehensive test suite `backend/tests/test_localml_video.py` (18 tests passing).
   - Verified: 313 backend tests passing (18 added, 313 passed in 52.76s).
 
+- **Phase 2 (AFK): #102 Backend Review Gate Fixes**
+  - **F1 BLOCKER**: Updated `make_video_loader` in `app/ml/video.py` to pick dtype dynamically based on device (`torch.float16 if cuda else torch.float32`).
+  - **F3 MAJOR**: Wrapped `process_gpu_task` in `app/tasks.py` with `try/except Exception` to record `FAILED` status and error in DB `Task` table and publish terminal failure to Redis channel `task_updates`. Published terminal `task_updates` event for degraded results with status `FAILED` to ensure frontend pollers and `FileManager` observe completion.
+  - **F4 MAJOR**: Enforced child process cleanup in `encode_frames_to_mp4` via `try/finally` (killing child and closing stderr on exit/error) and added bounded timeout (default 60s) raising `VideoEncodingError`.
+  - **F7 MINOR**: Removed local host disk fallback reads in `app/routers/generate.py` and `app/tasks.py` to maintain strict object-storage isolation.
+  - **F9 NIT**: Enhanced `VideoEncodingError` with `returncode` and `stderr` fields and added focused test exercising genuine ffmpeg failure with non-zero exit code.
+  - Verified: 320 passed in pytest suite (7 new tests added, 320 passed in 57.19s); lazy import check verified with no torch installed.
+
+
 
 
 
