@@ -102,6 +102,11 @@
 - Admission, model load, and inference must be serialized behind a global `INFERENCE_LOCK = threading.RLock()` across both image and audio pipelines to ensure eviction never runs while another request is mid-inference.
 - Audio references for zero-shot voice cloning must be resolved from S3/MinIO storage into secure temporary files (`tempfile.NamedTemporaryFile`) and passed as `speaker_wav` to XTTS with guaranteed cleanup.
 
+### 25. SVD Video Pipeline Progress Mapping & FFmpeg Carriage Return Scrapes
+- Stable Video Diffusion (SVD) generation involves two distinct stages: neural latent denoising (diffusers steps) and MP4 video encoding (ffmpeg binary).
+- To present smooth monotonic progress in the UI (which monitors `status.info.percent` between 0 and 99), denoising steps map to 0-79% and ffmpeg frame encoding maps to 80-99% (strictly capped at 99 so the Celery task remains in PROGRESS state until final return).
+- FFmpeg progress updates on stderr use carriage return (`\r`) rather than newline (`\n`), requiring character-by-character chunked reads or splitting on `\r` and `\n` to reliably scrape `frame=\s*(\d+)` progress lines without buffering stalls.
+
 
 
 
