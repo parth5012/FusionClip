@@ -20,6 +20,7 @@ from app.ml.guard import (
     vram_guard,
 )
 from app.ml.registry import (
+    INFERENCE_LOCK,
     PINNED_ROSTER,
     ModelMetadata,
     ModelRegistry,
@@ -51,6 +52,7 @@ __all__ = [
     "ModelMetadata",
     "ModelRegistry",
     "model_registry",
+    "INFERENCE_LOCK",
     "SUPPORTED_SCHEDULERS",
     "ASPECT_RATIO_DIMENSIONS",
     "run_local_image_generation",

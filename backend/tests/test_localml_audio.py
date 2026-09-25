@@ -320,6 +320,10 @@ class TestVoiceCloningAndMarkers:
         )
 
         ref_file = "speaker_sample_01.wav"
+        stub_storage["uploaded"][ref_file] = {
+            "data": b"RIFFfake-ref-audio",
+            "content_type": "audio/wav",
+        }
         prompt = "Hello from cloned speaker"
         res = client.post(
             f"/api/generate/audio?prompt={prompt.replace(' ', '+')}&type=voice_clone&reference={ref_file}&provider=local"
@@ -444,14 +448,28 @@ class TestCloudElevenLabsPreservation:
 
 
 class TestAudioModuleSafetyAndFilenames:
-    def test_audio_module_imports_without_torch(self):
-        """app.ml.audio must import cleanly in an environment without torch installed."""
+    def test_audio_module_imports_without_torch(self, monkeypatch):
+        """FIX 8: app.ml.audio must import cleanly in an environment without torch installed."""
+        import sys
         import importlib
-        mod = importlib.import_module("app.ml.audio")
-        assert hasattr(mod, "run_local_audio_generation")
-        assert hasattr(mod, "SUPPORTED_AUDIO_TYPES")
-        assert hasattr(mod, "build_audio_filename")
-        assert hasattr(mod, "make_audio_loader")
+
+        saved = sys.modules.pop("app.ml.audio", None)
+        saved_parent = getattr(sys.modules.get("app.ml"), "audio", None)
+        try:
+            monkeypatch.setitem(sys.modules, "torch", None)
+            monkeypatch.setitem(sys.modules, "transformers", None)
+            monkeypatch.setitem(sys.modules, "TTS", None)
+
+            mod = importlib.import_module("app.ml.audio")
+            assert hasattr(mod, "run_local_audio_generation")
+            assert hasattr(mod, "SUPPORTED_AUDIO_TYPES")
+            assert hasattr(mod, "build_audio_filename")
+            assert hasattr(mod, "make_audio_loader")
+        finally:
+            if saved is not None:
+                sys.modules["app.ml.audio"] = saved
+            if "app.ml" in sys.modules and saved_parent is not None:
+                setattr(sys.modules["app.ml"], "audio", saved_parent)
 
     def test_generated_audio_filenames_do_not_collide(self):
         """Nanosecond-resolution filenames ensure no collisions on concurrent requests."""
@@ -468,3 +486,381 @@ class TestAudioModuleSafetyAndFilenames:
         loader = make_audio_loader("unknown-audio-model")
         with pytest.raises(ValueError, match="No audio loader configured"):
             loader()
+
+
+class TestFix1ElevenlabsRouting:
+    """FIX 1: ElevenLabs only serves tts/voice/sfx. voice_clone and music go local."""
+
+    def test_voice_clone_and_music_bypass_elevenlabs_when_key_exists(
+        self, client, monkeypatch, stub_storage, db_session
+    ):
+        """When an ElevenLabs key is configured, voice_clone and music must NOT be sent to ElevenLabs."""
+        set_secret("elevenlabs", "test-eleven-key", db_session)
+
+        called_elevenlabs = []
+        monkeypatch.setattr(
+            "app.routers.generate.call_elevenlabs_tts",
+            lambda *a, **k: called_elevenlabs.append("tts"),
+        )
+        monkeypatch.setattr(
+            "app.routers.generate.call_elevenlabs_sfx",
+            lambda *a, **k: called_elevenlabs.append("sfx"),
+        )
+
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: lambda **kw: b"RIFFfake-audio-bytes",
+        )
+
+        ref_file = "uploads/speaker.wav"
+        stub_storage["uploaded"][ref_file] = {
+            "data": b"RIFFsample",
+            "content_type": "audio/wav",
+        }
+
+        # 1. voice_clone -> must go local pipeline, NOT ElevenLabs TTS
+        res_clone = client.post(
+            f"/api/generate/audio?prompt=Clone+speech&type=voice_clone&reference={ref_file}"
+        )
+        assert res_clone.status_code == 200
+        body_clone = res_clone.json()
+        assert body_clone["type"] == "voice_clone"
+        assert body_clone["status"] == "COMPLETED"
+        assert len(body_clone.get("markers", [])) == 1
+
+        # 2. music -> must go local pipeline, NOT ElevenLabs TTS
+        res_music = client.post(
+            "/api/generate/audio?prompt=Guitar+riff&type=music"
+        )
+        assert res_music.status_code == 200
+        body_music = res_music.json()
+        assert body_music["type"] == "music"
+        assert body_music["status"] == "COMPLETED"
+
+        assert called_elevenlabs == [], f"ElevenLabs was unexpectedly called: {called_elevenlabs}"
+
+    def test_tts_and_sfx_still_use_elevenlabs_when_key_exists(
+        self, client, monkeypatch, stub_storage, db_session
+    ):
+        """tts and sfx types continue to use ElevenLabs when key is configured."""
+        set_secret("elevenlabs", "test-eleven-key", db_session)
+
+        monkeypatch.setattr(
+            "app.routers.generate.call_elevenlabs_tts",
+            lambda *a, **k: b"eleven-tts-bytes",
+        )
+        monkeypatch.setattr(
+            "app.routers.generate.call_elevenlabs_sfx",
+            lambda *a, **k: b"eleven-sfx-bytes",
+        )
+
+        res_tts = client.post("/api/generate/audio?prompt=Hello&type=tts")
+        assert res_tts.status_code == 200
+        assert res_tts.json()["filename"].startswith("eleven_tts_")
+
+        res_sfx = client.post("/api/generate/audio?prompt=Bang&type=sfx")
+        assert res_sfx.status_code == 200
+        assert res_sfx.json()["filename"].startswith("eleven_sfx_")
+
+    def test_colab_keeps_priority_for_voice_clone_and_music(
+        self, client, monkeypatch, stub_storage, stub_redis, db_session
+    ):
+        """When Colab is connected, voice_clone and music dispatch to Colab."""
+        stub_redis.set("colab:connected", "true")
+        set_secret("elevenlabs", "test-eleven-key", db_session)
+
+        dispatched = []
+
+        def mock_dispatch(task_type, parameters, db, **kwargs):
+            dispatched.append((task_type, parameters))
+            return {
+                "status": "DISPATCHED",
+                "colab": True,
+                "task_id": "colab_gen_audio_123",
+            }
+
+        monkeypatch.setattr("app.routers.generate.dispatch_gen_to_colab", mock_dispatch)
+
+        res_clone = client.post(
+            "/api/generate/audio?prompt=Clone+speech&type=voice_clone&reference=uploads/speaker.wav"
+        )
+        assert res_clone.status_code == 200
+        body = res_clone.json()
+        assert body["status"] == "DISPATCHED"
+        assert len(dispatched) == 1
+        assert dispatched[0][0] == "audio_generation"
+        assert dispatched[0][1]["type"] == "voice_clone"
+
+        # Also test music
+        res_music = client.post(
+            "/api/generate/audio?prompt=Rock+track&type=music"
+        )
+        assert res_music.status_code == 200
+        assert len(dispatched) == 2
+        assert dispatched[1][1]["type"] == "music"
+
+
+class TestFix3ReferenceResolutionAndValidation:
+    """FIX 3: Reference is resolved to real file or returns 400; validation allows relative paths with '/'."""
+
+    def test_missing_reference_in_storage_returns_400(self, client, monkeypatch):
+        """Missing reference in storage returns 400 with actionable message."""
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        res = client.post(
+            "/api/generate/audio?prompt=Clone&type=voice_clone&reference=uploads/nonexistent.wav&provider=local"
+        )
+        assert res.status_code == 400
+        detail = res.json()["detail"].lower()
+        assert "not found" in detail or "unreadable" in detail
+
+    def test_reference_validation_rejects_traversal_and_accepts_slashes(
+        self, client, monkeypatch, stub_storage, db_session
+    ):
+        """Path traversal/absolute paths are rejected; valid slash paths are accepted."""
+        for bad in ("../etc/passwd", "/etc/passwd", "..\\evil.wav", "", "   "):
+            res = client.post(
+                f"/api/generate/audio?prompt=Clone&type=voice_clone&reference={bad}&provider=local"
+            )
+            assert res.status_code == 400, f"Expected 400 for bad reference: {bad!r}"
+
+        valid_ref = "uploads/speaker.wav"
+        stub_storage["uploaded"][valid_ref] = {
+            "data": b"RIFFsample-wav-data",
+            "content_type": "audio/wav",
+        }
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: lambda **kw: b"RIFFcloned-audio",
+        )
+
+        res = client.post(
+            f"/api/generate/audio?prompt=Clone&type=voice_clone&reference={valid_ref}&provider=local"
+        )
+        assert res.status_code == 200
+        assert res.json()["status"] == "COMPLETED"
+
+
+class TestFix4MusicgenLargePrecision:
+    """FIX 4: Model identity facebook/musicgen-large, fp16 on CUDA, torch.inference_mode()."""
+
+    def test_musicgen_loader_uses_large_model_and_fp16_on_cuda(self, monkeypatch):
+        import sys
+        import types
+        from unittest.mock import MagicMock
+        from app.ml.audio import make_audio_loader
+
+        mock_torch = MagicMock()
+        mock_torch.cuda.is_available.return_value = True
+        mock_torch.float16 = "fp16-marker"
+
+        mock_transformers = types.ModuleType("transformers")
+        mock_proc_cls = MagicMock()
+        mock_model_cls = MagicMock()
+        mock_transformers.AutoProcessor = mock_proc_cls
+        mock_transformers.MusicgenForConditionalGeneration = mock_model_cls
+
+        monkeypatch.setitem(sys.modules, "torch", mock_torch)
+        monkeypatch.setitem(sys.modules, "transformers", mock_transformers)
+
+        loader = make_audio_loader("musicgen")
+        pipeline = loader()
+
+        mock_proc_cls.from_pretrained.assert_called_once_with("facebook/musicgen-large")
+        mock_model_cls.from_pretrained.assert_called_once_with(
+            "facebook/musicgen-large", torch_dtype="fp16-marker"
+        )
+
+    def test_musicgen_pipeline_runs_in_inference_mode(self, monkeypatch):
+        import sys
+        from unittest.mock import MagicMock
+        from app.ml.audio import MusicgenPipeline
+
+        inference_mode_active = []
+
+        class FakeInferenceMode:
+            def __enter__(self):
+                inference_mode_active.append(True)
+                return self
+
+            def __exit__(self, *args):
+                inference_mode_active.append(False)
+
+        mock_torch = MagicMock()
+        mock_torch.inference_mode.side_effect = FakeInferenceMode
+        monkeypatch.setitem(sys.modules, "torch", mock_torch)
+
+        mock_model = MagicMock()
+        mock_values = MagicMock()
+        mock_values.__getitem__.return_value.cpu.return_value.numpy.return_value = MagicMock(ndim=1)
+        mock_model.generate.return_value = mock_values
+
+        mock_processor = MagicMock()
+        mock_processor.return_value = {"input_ids": MagicMock()}
+
+        pipeline = MusicgenPipeline(model=mock_model, processor=mock_processor, device="cpu")
+        monkeypatch.setattr("scipy.io.wavfile.write", lambda buf, rate, data: None)
+
+        pipeline("Test prompt", duration=2.0)
+        assert inference_mode_active == [True, False], "inference_mode context was not entered and exited"
+
+
+class TestFix6DurationValidation:
+    """FIX 6: Duration bounded between 0.5 and 30.0 seconds."""
+
+    def test_duration_boundary_validation(self, client, monkeypatch, stub_storage):
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: lambda **kw: b"RIFFaudio",
+        )
+
+        # 0.49 -> 400
+        res = client.post("/api/generate/audio?prompt=test&duration=0.49&provider=local")
+        assert res.status_code == 400
+        assert "duration" in res.json()["detail"].lower()
+
+        # 30.01 -> 400
+        res = client.post("/api/generate/audio?prompt=test&duration=30.01&provider=local")
+        assert res.status_code == 400
+        assert "duration" in res.json()["detail"].lower()
+
+        # 0.5 -> 200
+        res = client.post("/api/generate/audio?prompt=test&duration=0.5&provider=local")
+        assert res.status_code == 200
+
+        # 30.0 -> 200
+        res = client.post("/api/generate/audio?prompt=test&duration=30.0&provider=local")
+        assert res.status_code == 200
+
+
+class TestFix7XTTSCallingConvention:
+    """FIX 7: Real tts_to_file stub exercises speaker_wav resolution and cleanup."""
+
+    def test_xtts_calling_convention_with_real_tts_to_file_stub(
+        self, client, monkeypatch, stub_storage, db_session
+    ):
+        import os
+
+        captured_calls = []
+
+        class StubXTTSModel:
+            speakers = ["DefaultSpeaker"]
+
+            def tts_to_file(self, text, file_path, **kwargs):
+                captured_calls.append({"text": text, "file_path": file_path, "kwargs": kwargs})
+                if "speaker_wav" in kwargs:
+                    spk_path = kwargs["speaker_wav"]
+                    assert os.path.exists(spk_path), f"speaker_wav path {spk_path} must exist during call"
+                    with open(spk_path, "rb") as sf:
+                        assert sf.read() == b"RIFFreference-wav-bytes"
+                with open(file_path, "wb") as f:
+                    f.write(b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+
+        stub_model = StubXTTSModel()
+        monkeypatch.setattr(model_registry, "load_model", lambda mid, **k: stub_model)
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+
+        # 1. Voice clone with reference
+        ref_file = "uploads/speaker_voice.wav"
+        stub_storage["uploaded"][ref_file] = {
+            "data": b"RIFFreference-wav-bytes",
+            "content_type": "audio/wav",
+        }
+
+        res = client.post(
+            f"/api/generate/audio?prompt=Hello+world&type=voice_clone&reference={ref_file}&provider=local"
+        )
+        assert res.status_code == 200
+        assert len(captured_calls) == 1
+        clone_call = captured_calls[0]
+        assert "speaker_wav" in clone_call["kwargs"]
+        temp_speaker_wav = clone_call["kwargs"]["speaker_wav"]
+        assert temp_speaker_wav != ref_file
+        assert temp_speaker_wav.endswith(".wav")
+        # Ensure temp file was cleaned up afterwards
+        assert not os.path.exists(temp_speaker_wav)
+
+        # 2. Plain TTS without reference
+        captured_calls.clear()
+        res_tts = client.post(
+            "/api/generate/audio?prompt=Plain+TTS&type=tts&provider=local"
+        )
+        assert res_tts.status_code == 200
+        assert len(captured_calls) == 1
+        tts_call = captured_calls[0]
+        assert "speaker_wav" not in tts_call["kwargs"], "speaker_wav must NOT be passed when no reference is given"

@@ -737,3 +737,196 @@ class TestGPUHealthEndpoint:
         body = res.json()
         assert body["status"] == "unavailable"
         assert body["gpu"]["available"] is False
+
+
+class TestModelEviction:
+    @pytest.fixture(autouse=True)
+    def clean_registry(self):
+        reg = ModelRegistry()
+        yield reg
+        reg.unload_all()
+
+    def test_evict_except_unloads_other_models(self, clean_registry):
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-a", family="image", dtype_quant="fp8", approx_vram_gb=10.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-a",
+        )
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-b", family="audio", dtype_quant="fp16", approx_vram_gb=8.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-b",
+        )
+        clean_registry.load_model("model-a")
+        clean_registry.load_model("model-b")
+        assert clean_registry.is_loaded("model-a")
+        assert clean_registry.is_loaded("model-b")
+
+        # Evict except model-b
+        evicted = clean_registry.evict_except({"model-b"})
+        assert evicted == ["model-a"]
+        assert not clean_registry.is_loaded("model-a")
+        assert clean_registry.is_loaded("model-b")
+
+        # Calling again when nothing else resident is a no-op
+        evicted_again = clean_registry.evict_except({"model-b"})
+        assert evicted_again == []
+
+    def test_guard_eviction_when_resident_blocks_admission(self, clean_registry, monkeypatch):
+        """Test (a): with a resident model that blocks admission, a request for the other model evicts it and succeeds."""
+        guard = VRAMGuard(registry=clean_registry, default_overhead_gb=1.0)
+
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-a", family="image", dtype_quant="fp8", approx_vram_gb=13.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-a",
+        )
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-b", family="audio", dtype_quant="fp16", approx_vram_gb=10.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-b",
+        )
+        clean_registry.load_model("model-a")
+        assert clean_registry.is_loaded("model-a")
+
+        # 16 GB total GPU. While model-a is loaded, free VRAM is 2 GB (not enough for model-b which needs 11 GB).
+        # Once model-a is unloaded, free VRAM is 15 GB.
+        def mock_gpu_info(device=0):
+            if clean_registry.is_loaded("model-a"):
+                free_gb = 2.0
+            else:
+                free_gb = 15.0
+            return {
+                "available": True,
+                "device_name": "NVIDIA RTX 4080",
+                "total_bytes": int(16.0 * (1024 ** 3)),
+                "free_bytes": int(free_gb * (1024 ** 3)),
+                "used_bytes": int((16.0 - free_gb) * (1024 ** 3)),
+                "total_gb": 16.0,
+                "free_gb": free_gb,
+                "used_gb": 16.0 - free_gb,
+                "vram_percent": ((16.0 - free_gb) / 16.0) * 100,
+            }
+
+        monkeypatch.setattr(guard, "get_gpu_info", mock_gpu_info)
+
+        admission = guard.check_vram("model-b")
+        assert admission["admitted"] is True
+        assert admission["model_id"] == "model-b"
+        assert not clean_registry.is_loaded("model-a")
+
+    def test_nothing_evicted_when_requested_model_already_fits(self, clean_registry, monkeypatch):
+        """Test (b): nothing is evicted when the requested model already fits."""
+        guard = VRAMGuard(registry=clean_registry, default_overhead_gb=1.0)
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-a", family="image", dtype_quant="fp8", approx_vram_gb=4.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-a",
+        )
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-b", family="audio", dtype_quant="fp16", approx_vram_gb=4.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-b",
+        )
+        clean_registry.load_model("model-a")
+
+        # 24 GB GPU: 18 GB free. model-b needs 5 GB, so it fits without eviction!
+        monkeypatch.setattr(
+            guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 3090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(18.0 * (1024 ** 3)),
+                "used_bytes": int(6.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 18.0,
+                "used_gb": 6.0,
+                "vram_percent": 25.0,
+            },
+        )
+
+        admission = guard.check_vram("model-b")
+        assert admission["admitted"] is True
+        # model-a must still be loaded
+        assert clean_registry.is_loaded("model-a")
+
+    def test_evict_candidate_preserves_requested_resident_model(self, clean_registry, monkeypatch):
+        """Test (c): evicting the only resident model that IS the requested candidate never unloads it."""
+        guard = VRAMGuard(registry=clean_registry, default_overhead_gb=1.0)
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-a", family="image", dtype_quant="fp8", approx_vram_gb=13.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-a",
+        )
+        clean_registry.load_model("model-a")
+
+        # 2.0 GB free is enough for resident overhead (1.0 GB)
+        monkeypatch.setattr(
+            guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4080",
+                "total_bytes": int(16.0 * (1024 ** 3)),
+                "free_bytes": int(2.0 * (1024 ** 3)),
+                "used_bytes": int(14.0 * (1024 ** 3)),
+                "total_gb": 16.0,
+                "free_gb": 2.0,
+                "used_gb": 14.0,
+                "vram_percent": 87.5,
+            },
+        )
+
+        admission = guard.check_vram("model-a")
+        assert admission["admitted"] is True
+        assert clean_registry.is_loaded("model-a")
+
+    def test_no_gpu_path_never_evicts(self, clean_registry, monkeypatch):
+        """Test (d): NoGPUError path never evicts."""
+        guard = VRAMGuard(registry=clean_registry, default_overhead_gb=1.0)
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-a", family="image", dtype_quant="fp8", approx_vram_gb=13.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-a",
+        )
+        clean_registry.load_model("model-a")
+        assert clean_registry.is_loaded("model-a")
+
+        monkeypatch.setattr(
+            guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": False,
+                "device_name": None,
+                "total_bytes": 0,
+                "free_bytes": 0,
+                "used_bytes": 0,
+                "total_gb": 0.0,
+                "free_gb": 0.0,
+                "used_gb": 0.0,
+                "vram_percent": 0.0,
+            },
+        )
+
+        with pytest.raises(NoGPUError):
+            guard.check_vram("flux-schnell")
+
+        assert clean_registry.is_loaded("model-a")
+
+    def test_inference_lock_exported_from_app_ml(self):
+        """Inference lock must be an RLock exported from app.ml."""
+        import threading
+        from app.ml import INFERENCE_LOCK
+
+        assert isinstance(INFERENCE_LOCK, type(threading.RLock()))
+

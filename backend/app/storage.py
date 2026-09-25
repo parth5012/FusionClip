@@ -3,7 +3,7 @@ from botocore.client import Config
 from botocore.exceptions import ClientError
 from app.config import settings
 import logging
-from typing import Generator
+from typing import Generator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,25 @@ def upload_object(file_data, object_name: str, content_type: str = "application/
     except Exception as e:
         logger.error(f"Failed to upload object {object_name} to MinIO: {e}")
         return False
+
+def download_object(object_name: str) -> Optional[bytes]:
+    """Download object bytes from S3/MinIO bucket. Returns None if not found or on error."""
+    try:
+        response = s3_client.get_object(Bucket=settings.MINIO_BUCKET_NAME, Key=object_name)
+        body = response.get("Body")
+        if body:
+            return body.read()
+        return None
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code")
+        if error_code in ["404", "NoSuchKey"]:
+            logger.warning(f"Object {object_name} not found in MinIO")
+            return None
+        logger.error(f"Failed to download object {object_name} from MinIO: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to download object {object_name} from MinIO: {e}")
+        return None
 
 def generate_url(object_name: str, expires_in: int = 3600) -> str:
     """Generate pre-signed S3 URL for web playback/download."""

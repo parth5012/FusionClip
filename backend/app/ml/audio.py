@@ -1,7 +1,8 @@
 """Local PyTorch audio generation pipeline execution (#101).
 
 Implements local text-to-speech, zero-shot voice cloning (Coqui XTTS v2),
-and text-to-music / SFX (MusicGen) through the local ML scaffold.
+and text-to-music / SFX (MusicGen large: facebook/musicgen-large, 10.4 GB, FP16 on CUDA)
+through the local ML scaffold.
 
 Honors prompt, type, voice_id, duration, and reference audio sample.
 Strictly guards and lazy-loads torch, transformers, and TTS dependencies so the app
@@ -18,6 +19,7 @@ import time
 import wave
 from typing import Any, Dict, List, Optional
 
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.ml.contracts import (
@@ -25,10 +27,10 @@ from app.ml.contracts import (
     make_degraded_response,
 )
 from app.ml.guard import VRAMRefusalError, vram_guard
-from app.ml.registry import model_registry
+from app.ml.registry import INFERENCE_LOCK, model_registry
 from app.models import MediaAsset
 from app.services.embedding import get_embedding
-from app.storage import generate_url, upload_object
+from app.storage import download_object, generate_url, upload_object
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +60,17 @@ class MusicgenPipeline:
         max_new_tokens = int(dur * 50)
         inputs = self.processor(text=[prompt], padding=True, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        audio_values = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+        try:
+            import torch  # type: ignore
+
+            inference_ctx = torch.inference_mode()
+        except (ImportError, Exception):
+            import contextlib
+
+            inference_ctx = contextlib.nullcontext()
+
+        with inference_ctx:
+            audio_values = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
 
         encoder_cfg = getattr(getattr(self.model, "config", None), "audio_encoder", None)
         sampling_rate = getattr(encoder_cfg, "sampling_rate", 32000)
@@ -99,8 +111,13 @@ def make_audio_loader(model_id: str):
         elif model_id == "musicgen":
             from transformers import AutoProcessor, MusicgenForConditionalGeneration  # type: ignore
 
-            processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-            model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-small")
+            processor = AutoProcessor.from_pretrained("facebook/musicgen-large")
+            model_kwargs: Dict[str, Any] = {}
+            if cuda:
+                model_kwargs["torch_dtype"] = torch.float16
+            model = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-large", **model_kwargs
+            )
             model.to(device)
             return MusicgenPipeline(model=model, processor=processor, device=device)
         else:
@@ -160,157 +177,189 @@ def run_local_audio_generation(
             message=f"Unsupported audio type '{type}'. Supported types: {', '.join(sorted(SUPPORTED_AUDIO_TYPES))}",
         ).model_dump()
 
-    # 1. Admission check via VRAM guard
-    try:
-        selected_model_id = vram_guard.select_fitting_model(
-            candidate_ids=candidates,
-            working_overhead_gb=1.0,
-        )
-    except VRAMRefusalError as exc:
-        logger.warning(f"Local audio inference refused: {exc.reason} - {exc.message}")
-        return exc.to_degraded_response().model_dump()
-    except Exception as exc:
-        logger.error(f"Unexpected error during VRAM admission check: {exc}")
-        return make_degraded_response(
-            reason=DegradedReason.NO_GPU.value,
-            message=f"Failed to check GPU availability: {str(exc)}",
-        ).model_dump()
-
-    # 2. Lazy load via model_registry
-    try:
-        model_instance = model_registry.load_model(
-            selected_model_id,
-            loader_handle=make_audio_loader(selected_model_id),
-        )
-    except Exception as exc:
-        logger.error(f"Failed to load audio model '{selected_model_id}': {exc}")
-        return make_degraded_response(
-            reason=DegradedReason.LOAD_FAILED.value,
-            message=f"Failed to load local model '{selected_model_id}': {str(exc)}",
-            model_id=selected_model_id,
-        ).model_dump()
-
-    # 3. Execute inference
-    try:
-        if selected_model_id == "xtts-v2":
-            if hasattr(model_instance, "tts_to_file"):
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp_path = tmp.name
+    with INFERENCE_LOCK:
+        # Invariant: INFERENCE_LOCK serializes admission and inference so eviction
+        # cannot occur while another request is mid-inference.
+        ref_bytes = None
+        if reference:
+            ref_bytes = download_object(reference)
+            if ref_bytes is None and os.path.isfile(reference):
                 try:
-                    if reference:
-                        model_instance.tts_to_file(
-                            text=prompt,
-                            speaker_wav=reference,
-                            language="en",
-                            file_path=tmp_path,
-                        )
-                    else:
-                        speaker = None
-                        if hasattr(model_instance, "speakers") and model_instance.speakers:
-                            if voice_id and voice_id in model_instance.speakers:
-                                speaker = voice_id
-                            else:
-                                speaker = model_instance.speakers[0]
-                        if speaker:
+                    with open(reference, "rb") as f:
+                        ref_bytes = f.read()
+                except Exception:
+                    pass
+            if ref_bytes is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Reference audio '{reference}' not found or unreadable in storage",
+                )
+
+        # 1. Admission check via VRAM guard
+        try:
+            selected_model_id = vram_guard.select_fitting_model(
+                candidate_ids=candidates,
+                working_overhead_gb=1.0,
+            )
+        except VRAMRefusalError as exc:
+            logger.warning(f"Local audio inference refused: {exc.reason} - {exc.message}")
+            return exc.to_degraded_response().model_dump()
+        except Exception as exc:
+            logger.error(f"Unexpected error during VRAM admission check: {exc}")
+            return make_degraded_response(
+                reason=DegradedReason.NO_GPU.value,
+                message=f"Failed to check GPU availability: {str(exc)}",
+            ).model_dump()
+
+        # 2. Lazy load via model_registry
+        try:
+            model_instance = model_registry.load_model(
+                selected_model_id,
+                loader_handle=make_audio_loader(selected_model_id),
+            )
+        except Exception as exc:
+            logger.error(f"Failed to load audio model '{selected_model_id}': {exc}")
+            return make_degraded_response(
+                reason=DegradedReason.LOAD_FAILED.value,
+                message=f"Failed to load local model '{selected_model_id}': {str(exc)}",
+                model_id=selected_model_id,
+            ).model_dump()
+
+        # 3. Execute inference
+        ref_tmp_path = None
+        try:
+            if reference and ref_bytes is not None:
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as ref_tmp:
+                    ref_tmp.write(ref_bytes)
+                    ref_tmp_path = ref_tmp.name
+
+            if selected_model_id == "xtts-v2":
+                if hasattr(model_instance, "tts_to_file"):
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        tmp_path = tmp.name
+                    try:
+                        if ref_tmp_path:
                             model_instance.tts_to_file(
                                 text=prompt,
-                                speaker=speaker,
+                                speaker_wav=ref_tmp_path,
                                 language="en",
                                 file_path=tmp_path,
                             )
                         else:
-                            model_instance.tts_to_file(
-                                text=prompt,
-                                language="en",
-                                file_path=tmp_path,
-                            )
-                    with open(tmp_path, "rb") as f:
-                        wav_bytes = f.read()
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
-            elif callable(model_instance):
-                output = model_instance(
-                    prompt=prompt,
-                    type=type,
-                    voice_id=voice_id,
-                    duration=duration,
-                    reference=reference,
-                )
-                wav_bytes = _extract_wav_bytes(output)
+                            speaker = None
+                            if hasattr(model_instance, "speakers") and model_instance.speakers:
+                                if voice_id and voice_id in model_instance.speakers:
+                                    speaker = voice_id
+                                else:
+                                    speaker = model_instance.speakers[0]
+                            if speaker:
+                                model_instance.tts_to_file(
+                                    text=prompt,
+                                    speaker=speaker,
+                                    language="en",
+                                    file_path=tmp_path,
+                                )
+                            else:
+                                model_instance.tts_to_file(
+                                    text=prompt,
+                                    language="en",
+                                    file_path=tmp_path,
+                                )
+                        with open(tmp_path, "rb") as f:
+                            wav_bytes = f.read()
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                elif callable(model_instance):
+                    call_kwargs: Dict[str, Any] = {
+                        "prompt": prompt,
+                        "type": type,
+                        "voice_id": voice_id,
+                        "duration": duration,
+                        "reference": reference,
+                    }
+                    if ref_tmp_path:
+                        call_kwargs["speaker_wav"] = ref_tmp_path
+                    output = model_instance(**call_kwargs)
+                    wav_bytes = _extract_wav_bytes(output)
+                else:
+                    raise ValueError(f"Unrecognized XTTS model instance type: {model_instance.__class__.__name__}")
+            elif selected_model_id == "musicgen":
+                if callable(model_instance):
+                    output = model_instance(prompt=prompt, duration=duration)
+                    wav_bytes = _extract_wav_bytes(output)
+                else:
+                    raise ValueError(f"Unrecognized MusicGen model instance type: {model_instance.__class__.__name__}")
             else:
-                raise ValueError(f"Unrecognized XTTS model instance type: {model_instance.__class__.__name__}")
-        elif selected_model_id == "musicgen":
-            if callable(model_instance):
-                output = model_instance(prompt=prompt, duration=duration)
-                wav_bytes = _extract_wav_bytes(output)
-            else:
-                raise ValueError(f"Unrecognized MusicGen model instance type: {model_instance.__class__.__name__}")
-        else:
-            raise ValueError(f"Unknown model_id '{selected_model_id}'")
-    except Exception as exc:
-        logger.error(f"Audio execution failed for '{selected_model_id}': {exc}")
-        return make_degraded_response(
-            reason=DegradedReason.LOAD_FAILED.value,
-            message=f"Pipeline inference failed for '{selected_model_id}': {str(exc)}",
-            model_id=selected_model_id,
-        ).model_dump()
-
-    # 4. Upload real WAV bytes
-    filename = build_audio_filename()
-    upload_success = upload_object(wav_bytes, filename, content_type="audio/wav")
-
-    # 5. Determine duration
-    duration_val = 3.0
-    try:
-        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            if rate > 0:
-                duration_val = round(frames / float(rate), 2)
-    except Exception:
-        if duration is not None and duration > 0:
-            duration_val = float(duration)
-
-    # 6. Persist MediaAsset in DB
-    if upload_success and db is not None:
-        try:
-            if type == "voice_clone":
-                title = f"Voice Clone: {prompt[:30]}..."
-            elif type in ("sfx", "music"):
-                title = f"MusicGen Generated: {prompt[:30]}..."
-            else:
-                title = f"XTTS Generated: {prompt[:30]}..."
-
-            asset = MediaAsset(
-                title=title,
-                file_path=filename,
-                file_size=len(wav_bytes),
-                content_type="audio/wav",
-                duration=duration_val,
-                embedding=get_embedding(prompt or title),
-            )
-            db.add(asset)
-            db.commit()
+                raise ValueError(f"Unknown model_id '{selected_model_id}'")
+        except HTTPException:
+            raise
         except Exception as exc:
-            logger.error(f"Failed to save generated audio asset: {exc}")
-            db.rollback()
+            logger.error(f"Audio execution failed for '{selected_model_id}': {exc}")
+            return make_degraded_response(
+                reason=DegradedReason.LOAD_FAILED.value,
+                message=f"Pipeline inference failed for '{selected_model_id}': {str(exc)}",
+                model_id=selected_model_id,
+            ).model_dump()
+        finally:
+            if ref_tmp_path and os.path.exists(ref_tmp_path):
+                os.remove(ref_tmp_path)
 
-    # 7. Construct markers
-    markers: List[Dict[str, Any]] = []
-    if type == "voice_clone":
-        markers.append(
-            {
-                "time": 0.0,
-                "label": f"voice clone: {reference}",
-                "kind": "voice_clone",
-            }
-        )
+        # 4. Upload real WAV bytes
+        filename = build_audio_filename()
+        upload_success = upload_object(wav_bytes, filename, content_type="audio/wav")
 
-    return {
-        "status": "COMPLETED",
-        "type": type,
-        "filename": filename,
-        "url": generate_url(filename) if upload_success else "",
-        "markers": markers,
-    }
+        # 5. Determine duration
+        duration_val = 3.0
+        try:
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                if rate > 0:
+                    duration_val = round(frames / float(rate), 2)
+        except Exception:
+            if duration is not None and duration > 0:
+                duration_val = float(duration)
+
+        # 6. Persist MediaAsset in DB
+        if upload_success and db is not None:
+            try:
+                if type == "voice_clone":
+                    title = f"Voice Clone: {prompt[:30]}..."
+                elif type in ("sfx", "music"):
+                    title = f"MusicGen Generated: {prompt[:30]}..."
+                else:
+                    title = f"XTTS Generated: {prompt[:30]}..."
+
+                asset = MediaAsset(
+                    title=title,
+                    file_path=filename,
+                    file_size=len(wav_bytes),
+                    content_type="audio/wav",
+                    duration=duration_val,
+                    embedding=get_embedding(prompt or title),
+                )
+                db.add(asset)
+                db.commit()
+            except Exception as exc:
+                logger.error(f"Failed to save generated audio asset: {exc}")
+                db.rollback()
+
+        # 7. Construct markers
+        markers: List[Dict[str, Any]] = []
+        if type == "voice_clone":
+            markers.append(
+                {
+                    "time": 0.0,
+                    "label": f"voice clone: {reference}",
+                    "kind": "voice_clone",
+                }
+            )
+
+        return {
+            "status": "COMPLETED",
+            "type": type,
+            "filename": filename,
+            "url": generate_url(filename) if upload_success else "",
+            "markers": markers,
+        }

@@ -196,6 +196,7 @@ class VRAMGuard:
         model_id: str,
         working_overhead_gb: Optional[float] = None,
         device: int = 0,
+        candidate_ids: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Check whether model + overhead fits into GPU free VRAM.
 
@@ -249,6 +250,26 @@ class VRAMGuard:
                 mode = "offload"
 
         if free_bytes < required_bytes:
+            # An admission attempt would raise InsufficientVRAMError.
+            # Invariant: Because callers run under INFERENCE_LOCK, eviction can
+            # never run while another request is mid-inference.
+            keep_candidates = set(candidate_ids) if candidate_ids is not None else {model_id}
+            evicted = self.registry.evict_except(keep_candidates)
+            if evicted:
+                gpu = self.get_gpu_info(device=device)
+                free_bytes = gpu["free_bytes"]
+                total_bytes = gpu["total_bytes"]
+                if (
+                    mode == "full"
+                    and free_bytes < required_bytes
+                    and meta.offload_vram_bytes is not None
+                ):
+                    offload_bytes = meta.offload_vram_bytes + overhead_bytes
+                    if free_bytes >= offload_bytes:
+                        required_bytes = offload_bytes
+                        mode = "offload"
+
+        if free_bytes < required_bytes:
             raise InsufficientVRAMError(
                 model_id=model_id,
                 required_bytes=required_bytes,
@@ -295,6 +316,7 @@ class VRAMGuard:
                     mid,
                     working_overhead_gb=working_overhead_gb,
                     device=device,
+                    candidate_ids=set(candidate_ids),
                 )
                 return mid
             except ModelNotFoundError:
