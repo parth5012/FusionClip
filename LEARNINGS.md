@@ -68,5 +68,23 @@
 - Always patch where the name is **read**, not where it is thought to live, and assert the mock was actually invoked. Similarly, a function-local `import torch` can only be intercepted via `sys.modules`, never via `setattr(module, "torch", ...)`.
 - Red-flag heuristic: a test that asserts a property of a string it constructed itself proves nothing.
 
+### 17. E2E Output Filename Regex Rigidity
+- `frontend/e2e/05-generation-catalog.spec.ts` strictly validates generated filenames with `^gen_image_\d+\.png$`.
+- Appending alphanumeric uuid fragments (e.g. `gen_image_1700000000_a1b2c3.png`) breaks downstream E2E regex contracts - keep the suffix pure digits. Seconds (`int(time.time())`) collide when two requests finish in the same second, so use `time.time_ns()`: still all digits, effectively collision-free.
+
+### 18. Local Inference Diffusers Lazy Import Boundary
+- In environments without CUDA or PyTorch/diffusers dependencies, top-level diffusers imports will prevent the FastAPI application from booting.
+- Encapsulate diffusers pipeline loading (`FluxPipeline`, `StableDiffusionXLPipeline`) inside lazy loader factory callbacks executed only when `model_registry.load_model` is triggered on an admitted GPU job.
+
+### 19. GPU-Only Bugs Hide From CPU Test Suites
+- Two #100 defects were invisible to a 245-test green suite and only surfaced in review: `pipe.to("cuda")` loading ~34 GB of FLUX bfloat16 (instant OOM on the 16 GB floor), and `680`-pixel edges (not divisible by 16, fatal to FLUX's 2x2 latent patchification).
+- Neither raises on a machine without torch. Anything whose correctness depends on hardware geometry - VRAM totals, tensor shape divisibility, dtype size - needs a *numeric assertion in a plain unit test* (`edge % 16 == 0`, `roster_vram <= floor`), not an end-to-end run.
+- Rule of thumb: if the only way to fail is to execute the model, you do not have a test.
+
+### 20. Don't Accept a Parameter You Cannot Honor
+- `denoising_strength` was accepted on a text-to-image route with no source image. Diffusers raises `TypeError` on `strength` for txt2img; the try/except then reported it as `load_failed`, i.e. a bogus infrastructure error for a client input problem.
+- Two failure modes to avoid: forwarding it (crashes into an unrelated error bucket) and silently dropping it (the response echoes a parameter that did nothing). Reject with 400 and an actionable message until the feature that needs it exists.
+
+
 
 
