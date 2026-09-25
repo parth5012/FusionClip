@@ -55,5 +55,18 @@
 - When local ML execution cannot fit into GPU memory or when no GPU is detected, returning fake byte payloads ("Mock ... bytes") violates data integrity and corrupts downstream media decoders.
 - Surfacing a typed degraded envelope (`degraded: true` with machine-readable `reason` such as `insufficient_vram` or `no_gpu`) enables the API client and UI to present transparent fallback options (e.g., auto-downgrading from Flux to SDXL, routing to cloud APIs, or displaying actionable VRAM requirements) rather than masking failure with corrupted files.
 
+### 14. Registry Lookup Must Precede Hardware Detection
+- Resolving a resource *after* probing hardware misclassifies `model_not_found` as `no_gpu` on GPU-less CI hosts, so tests pass for the wrong reason and production reports a misleading reason code.
+- Order operations as: validate the request (is the model registered?) -> probe the environment (is there a GPU?) -> check capacity (does it fit?). Unknown-input errors must be independent of host capability.
+
+### 15. Lazy-Loaded Expensive Resources Need a Lock
+- A check-then-load sequence without synchronization is a double-allocation race: two workers both observe "not loaded" and both allocate a 13 GB model on a 16 GB GPU.
+- Hold a reentrant lock across the whole check+load+cache transition (RLock so nested helpers like `unload_model` from `register` stay safe). Accept that this serializes loads of *different* models too - on a GPU that is desirable, not a bottleneck.
+
+### 16. Monkeypatching the Wrong Seam Produces Pass-By-Luck Tests
+- A test patching `app.tasks.vram_guard` against a function that does `from app.ml.guard import vram_guard` *inside its body* patches a name nobody reads; it only passes because the real guard raises on a GPU-less machine.
+- Always patch where the name is **read**, not where it is thought to live, and assert the mock was actually invoked. Similarly, a function-local `import torch` can only be intercepted via `sys.modules`, never via `setattr(module, "torch", ...)`.
+- Red-flag heuristic: a test that asserts a property of a string it constructed itself proves nothing.
+
 
 

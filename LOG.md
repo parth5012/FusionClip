@@ -100,13 +100,15 @@
 ### Iteration Status: Done
 
 - **Phase 2 (AFK): #99 - Create the shared local-inference foundation (scaffold)**
-  - Implemented `app.ml.registry`: Model registry managing the pinned roster (Flux-schnell [image/FP8/13GB/Apache-2.0], SDXL [image/FP8/6.5GB/OpenRAIL++-M], XTTS v2 [voice/FP16/4GB/CPML], MusicGen [audio/FP16/10.4GB/MIT], SVD [video/FP16/16GB resident/8GB offload/OpenRAIL++-M]) with lazy loading, idempotent caching, and CUDA VRAM cleanup on unload.
-  - Implemented `app.ml.guard`: VRAM guard with distinct detection for `NoGPUError` vs `InsufficientVRAMError`, working overhead accounting, admission checks, and auto-downgrade selection (e.g. Flux-schnell -> SDXL).
-  - Implemented `app.ml.contracts`: Labeled honest fallback tier (`DegradedResponse`, `DegradedReason`, `FallbackTier`) satisfying Decision #3, explicitly forbidding byte-string mock payloads ("Mock ... bytes").
-  - Configured Celery queue isolation in `app/celery_app.py` with dedicated `media.gpu` queue and route for `app.tasks.process_gpu_task`, isolated from existing CPU queues `media.fast` and `media.heavy`.
-  - Added health and queue metrics in `app/routers/tasks.py` (`GET /api/tasks/gpu/health` and alias `/api/tasks/metrics`) reporting GPU availability, VRAM memory usage, model loaded states, and queue depth.
-  - Authored comprehensive test suite `backend/tests/test_localml_scaffold.py` covering registry lazy loading, idempotent load/unload, VRAM guard refusal, no-GPU detection, auto-downgrade model selection, queue isolation, degraded contract shape, and health endpoint.
-  - Verified: All 16 scaffold unit/integration tests passing; 221 total tests passing in backend test suite.
+  - Implemented `app.ml.registry`: Model registry managing the pinned roster (Flux-schnell [image/FP8/13GB/Apache-2.0], SDXL [image/FP8/6.5GB/RAIL++-M], XTTS v2 [voice/FP16/4GB/CPML], MusicGen [audio/FP16/10.4GB/CC-BY-NC-4.0 weights], SVD [video/FP16/16GB resident/8GB offload/Stability-AI-Community]) with lazy loading, idempotent caching, CUDA VRAM cleanup on unload, and a lock serializing load/unload/register so two workers cannot allocate the same model twice.
+  - Implemented `app.ml.guard`: VRAM guard resolving the registry *first* so unknown ids report `model_not_found` regardless of GPU presence; distinct `NoGPUError` vs `InsufficientVRAMError` vs `ModelNotFoundError`; working overhead accounting; CPU-offload footprint fallback so SVD admits on the 16 GB floor; auto-downgrade selection (Flux-schnell -> SDXL) that skips unregistered candidates.
+  - Implemented `app.ml.contracts`: Labeled honest fallback tier (`DegradedResponse`, `DegradedReason`, `FallbackTier`) satisfying Decision #3, with a runtime validator rejecting any "Mock ... bytes" payload.
+  - Configured Celery queue isolation in `app/celery_app.py` with dedicated `media.gpu` queue and route for `app.tasks.process_gpu_task`, isolated from existing CPU queues `media.fast` / `media.heavy`; `worker_prefetch_multiplier=1` + `task_acks_late=True` so a GPU worker never reserves several multi-GB models at once.
+  - Added health metrics at `GET /api/tasks/gpu/health` reporting GPU availability, VRAM usage, per-model loaded state, `media.gpu` depth, and `active_tasks_total` (all-queue in-flight count - Task rows carry no queue column).
+  - `process_gpu_task` converts guard refusals and unknown-model lookups into the degraded contract instead of letting `KeyError` flip the Celery task to FAILURE.
+  - Authored `backend/tests/test_localml_scaffold.py` covering roster pinning (incl. flux-dev exclusion), lazy load, idempotent load/unload, concurrent-load single-flight, VRAM refusal, no-GPU detection, model-not-found, offload admission, queue isolation, degraded contract (incl. mock-byte rejection), and health endpoint.
+  - Code review gate: 11 findings (4 major) applied - test seams, KeyError handling, misclassified reason, registry lock, offload path, dead `DegradedOut` schema, ambiguous `/api/tasks/metrics` alias, metric mislabel, license corrections, runtime mock-byte validator, Celery prefetch.
+  - Verified: 27 scaffold tests passing; 233 total tests passing in backend test suite.
 
 
 
