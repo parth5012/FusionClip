@@ -298,6 +298,33 @@ class TestSettingsRouter:
 
 
 class TestGenerateRouter:
+    @pytest.fixture(autouse=True)
+    def stub_local_image_pipeline(self, monkeypatch):
+        """Provide lightweight GPU admission and model execution for smoke tests."""
+        from app.ml.guard import vram_guard
+        from app.ml.registry import model_registry
+
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+        monkeypatch.setattr(
+            model_registry,
+            "load_model",
+            lambda mid, **k: lambda **kw: [b"\x89PNG\r\n\x1a\nsmoke-test-png-bytes"],
+        )
+
     def test_generate_text_shape(self, client):
         prompt = "A cinematic drone shot over a canyon"
         res = client.post(f"/api/generate/text?prompt={prompt.replace(' ', '+')}")

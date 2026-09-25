@@ -101,6 +101,9 @@ def stub_storage(monkeypatch):
     def _download_bytes(object_name):
         return downloaded.get(object_name, b"")
 
+    # Every module that binds these helpers into its own namespace needs an entry
+    # here, otherwise it calls the real storage client and the stub silently
+    # records nothing. Patch where the name is *read*, not where it is defined.
     for module in (
         "app.storage",
         "app.routers.storage",
@@ -112,6 +115,7 @@ def stub_storage(monkeypatch):
         "app.routers.upscale",
         "app.services.upscaler",
         "app.services.subtitles",
+        "app.ml.image",
     ):
         for name, impl in (
             ("upload_object", _upload_object),

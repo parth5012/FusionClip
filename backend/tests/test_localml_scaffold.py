@@ -640,7 +640,7 @@ class TestDegradedContract:
         with pytest.raises(ValueError):
             make_degraded_response(
                 reason=DegradedReason.NO_GPU.value,
-                message="Mock local flux generated image bytes",
+                message="Mock image payload bytes",
                 model_id="flux-schnell",
             )
         with pytest.raises(ValueError):

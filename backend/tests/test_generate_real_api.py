@@ -222,4 +222,7 @@ class TestUnconfiguredKeyMockFallback:
 
         res_image = client.post("/api/generate/image?prompt=Mock+image")
         assert res_image.status_code == 200
-        assert res_image.json()["status"] == "COMPLETED"
+        # Image mock replaced by local pipeline with honest degraded fallback (#100)
+        body_image = res_image.json()
+        assert body_image["degraded"] is True
+        assert body_image["reason"] == "no_gpu"
