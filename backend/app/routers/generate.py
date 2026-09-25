@@ -1,42 +1,54 @@
-"""Multimedia generation endpoints (real Gemini, ElevenLabs, local
-Flux/SDXL/XTTS/ChatTTS/MusicGen pipelines + Colab dispatch, mock fallback)."""
+"""Multimedia generation endpoints.
 
-"""Multimedia generation endpoints (real Gemini, Colab dispatch, mock fallback)."""
+Provider order per modality: Colab dispatch (when the tunnel is connected), the
+real cloud API (Gemini / ElevenLabs, when a key is configured), then the local
+PyTorch pipelines in `app.ml` behind the VRAM guard (#99-#102). There is no
+mock-bytes fallback on the local path: when inference cannot be admitted,
+`app.ml.contracts` returns a labeled degraded envelope instead (#81).
+"""
 
 import base64
-import logging
-import time
-import redis
+import io
 import json
-import uuid
-import httpx
+import logging
 import mimetypes
-
+import os
+import re
+import time
+import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Query, HTTPException, Request, File, UploadFile, Form
+import redis
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.deps import get_db
 from app.ml.audio import SUPPORTED_AUDIO_TYPES, run_local_audio_generation
 from app.ml.image import SUPPORTED_SCHEDULERS, run_local_image_generation
 from app.models import Configuration, MediaAsset, Task
-from app.services.embedding import get_embedding
-from app.services.secrets import get_secret
-from app.storage import generate_url, upload_object
-from app.config import settings
-from app.scratchpad import scratchpad
 from app.schemas import (
     GenerationGeminiImageOut,
     GenerationGeminiVideoOut,
     GenerationTtsOut,
     GenerationVoiceListOut,
 )
-from app.tasks import parse_duration
-from app.services import secrets as secret_store
 from app.services import elevenlabs as elevenlabs_service
 from app.services import gemini as gemini_service
+from app.services import secrets as secret_store
 from app.services.embedding import get_embedding
+from app.scratchpad import scratchpad
+from app.storage import generate_url, upload_object
+from app.tasks import parse_duration
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +56,8 @@ router = APIRouter(tags=["generate"])
 
 redis_client = redis.from_url(settings.REDIS_URL)
 
-#: Client header consulted only when no key is stored server-side.
-GEMINI_KEY_HEADER = "X-Gemini-Key"
-ELEVENLABS_KEY_HEADER = "X-ElevenLabs-Key"
+
+SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Aspect ratios are `W:H` with integer parts, e.g. '16:9'. The generic safe-identifier
 # pattern rejects ':', which made GenerationPanel's default '16:9' 400 before any
@@ -55,12 +66,59 @@ ELEVENLABS_KEY_HEADER = "X-ElevenLabs-Key"
 ASPECT_RATIO_PATTERN = re.compile(r"^\d{1,4}:\d{1,4}$")
 
 
-import io
-import os
-from typing import Optional
-from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
-from PIL import Image
-from app.models import MediaAsset, Task
+def _validate_safe_identifier(val: Optional[str], param_name: str) -> None:
+    if val is not None:
+        if len(val) > 64 or not SAFE_IDENTIFIER_PATTERN.match(val):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {param_name}: must contain only alphanumeric, dot, underscore, or dash characters and be <= 64 chars",
+            )
+
+
+def _validate_aspect_ratio(val: Optional[str]) -> None:
+    """Accept `W:H` integer ratios only; reject everything else with 400."""
+    if val is None:
+        return
+    if not ASPECT_RATIO_PATTERN.match(val):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid aspect_ratio: must be an integer ratio like '16:9' "
+                "(digits, one colon, each part <= 9999)"
+            ),
+        )
+    width, height = (int(p) for p in val.split(":"))
+    if width < 1 or height < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid aspect_ratio: both parts must be >= 1",
+        )
+
+
+SAFE_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
+def _validate_safe_reference(val: Optional[str], param_name: str = "reference") -> None:
+    if val is not None:
+        if (
+            not val
+            or not val.strip()
+            or ".." in val
+            or val.startswith("/")
+            or "\\" in val
+            or len(val) > 256
+            or not SAFE_REFERENCE_PATTERN.match(val)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {param_name}: must be non-empty relative path without '..', backslashes, or illegal characters",
+            )
+
+
+#: Client header consulted only when no key is stored server-side.
+GEMINI_KEY_HEADER = "X-Gemini-Key"
+ELEVENLABS_KEY_HEADER = "X-ElevenLabs-Key"
+
 
 def _resolve_gemini_key(db: Session, request: Optional[Request] = None) -> Optional[str]:
     """Return the Gemini API key: encrypted secret store first, then header.
@@ -120,45 +178,6 @@ def _save_asset(db: Session, title: str, filename: str, content_type: str, size:
         logger.error(f"Failed to save generated asset {filename}: {e}")
         db.rollback()
 
-
-def _validate_aspect_ratio(val: Optional[str]) -> None:
-    """Accept `W:H` integer ratios only; reject everything else with 400."""
-    if val is None:
-        return
-    if not ASPECT_RATIO_PATTERN.match(val):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid aspect_ratio: must be an integer ratio like '16:9' "
-                "(digits, one colon, each part <= 9999)"
-            ),
-        )
-    width, height = (int(p) for p in val.split(":"))
-    if width < 1 or height < 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid aspect_ratio: both parts must be >= 1",
-        )
-
-
-SAFE_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
-
-
-def _validate_safe_reference(val: Optional[str], param_name: str = "reference") -> None:
-    if val is not None:
-        if (
-            not val
-            or not val.strip()
-            or ".." in val
-            or val.startswith("/")
-            or "\\" in val
-            or len(val) > 256
-            or not SAFE_REFERENCE_PATTERN.match(val)
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid {param_name}: must be non-empty relative path without '..', backslashes, or illegal characters",
-            )
 
 
 def is_colab_connected():
@@ -412,6 +431,9 @@ def generate_gemini_video(
 
 
 
+
+
+
 @router.post("/api/generate/audio")
 def generate_audio(
     request: Request,
@@ -458,7 +480,6 @@ def generate_audio(
                 "voice_id": voice_id,
                 "duration": duration,
                 "reference": reference,
-
             },
             db=db,
             file_extension="mp3",
@@ -467,21 +488,22 @@ def generate_audio(
 
     ELEVENLABS_AUDIO_TYPES = frozenset({"tts", "voice", "sfx"})
     if provider != "local" and type in ELEVENLABS_AUDIO_TYPES:
-        eleven_key = get_secret("elevenlabs", db)
+        eleven_key = _resolve_elevenlabs_key(db, request)
         if eleven_key:
             if type == "sfx":
-                content = call_elevenlabs_sfx(
-                    api_key=eleven_key,
+                content = elevenlabs_service.generate_sound_effect(
+                    eleven_key,
                     text=prompt,
                     duration_seconds=duration if duration is not None else 5.0,
                 )
                 filename = f"eleven_sfx_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
             else:
-                content = call_elevenlabs_tts(
-                    api_key=eleven_key,
-                    text=prompt,
-                    voice_id=voice_id or "21m00Tcm4TlvDq8ikWAM",
+                content = elevenlabs_service.synthesize(
+                    eleven_key,
+                    prompt,
+                    voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
                 )
+                filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
                 filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
 
             upload_success = upload_object(content, filename, content_type="audio/mpeg")
@@ -519,100 +541,6 @@ def generate_audio(
         reference=reference,
         db=db,
     )
-
-
-# --- MusicGen music route (from origin/main; #101 routes sfx/audio via the
-# registry instead, so this legacy direct-transformers path is kept as-is) ---
-musicgen_pipeline = None
-
-
-def load_flux_pipeline():
-    """Load Flux.1 pipeline with caching."""
-    global flux_pipeline
-    if flux_pipeline is None:
-        try:
-            import torch
-            from diffusers import FluxPipeline
-            flux_pipeline = FluxPipeline.from_pretrained(
-                "black-forest-labs/FLUX.1-schnell",
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-            )
-            if torch.cuda.is_available():
-                flux_pipeline = flux_pipeline.to("cuda")
-        except Exception as e:
-            logger.error(f"Failed to load Flux pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load Flux pipeline: {e}")
-    return flux_pipeline
-
-
-def load_sdxl_pipeline():
-    """Load SDXL pipeline with caching."""
-    global sdxl_pipeline
-    if sdxl_pipeline is None:
-        try:
-            import torch
-            from diffusers import StableDiffusionXLPipeline
-            sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
-                "stabilityai/stable-diffusion-xl-base-1.0",
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                variant="fp16",
-                use_safetensors=True
-            )
-            if torch.cuda.is_available():
-                sdxl_pipeline = sdxl_pipeline.to("cuda")
-        except Exception as e:
-            logger.error(f"Failed to load SDXL pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load SDXL pipeline: {e}")
-    return sdxl_pipeline
-
-
-def load_xtts_pipeline():
-    """Load XTTS v2 pipeline with caching."""
-    global xtts_pipeline
-    if xtts_pipeline is None:
-        try:
-            import torch
-            from TTS.api import TTS
-            xtts_pipeline = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
-        except Exception as e:
-            logger.error(f"Failed to load XTTS pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load XTTS pipeline: {e}")
-    return xtts_pipeline
-
-
-def load_chattts_pipeline():
-    """Load ChatTTS pipeline with caching."""
-    global chattts_pipeline
-    if chattts_pipeline is None:
-        try:
-            import ChatTTS
-            chattts_pipeline = ChatTTS.Chat()
-            chattts_pipeline.load(compile=False)
-        except Exception as e:
-            logger.error(f"Failed to load ChatTTS pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load ChatTTS pipeline: {e}")
-    return chattts_pipeline
-
-
-def load_musicgen_pipeline():
-    """Load MusicGen pipeline with caching."""
-    global musicgen_pipeline
-    if musicgen_pipeline is None:
-        try:
-            import torch
-            from transformers import MusicgenForConditionalGeneration, AutoProcessor
-            musicgen_pipeline = MusicgenForConditionalGeneration.from_pretrained(
-                "facebook/musicgen-small",
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-            )
-            musicgen_processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
-            if torch.cuda.is_available():
-                musicgen_pipeline = musicgen_pipeline.to("cuda")
-        except Exception as e:
-            logger.error(f"Failed to load MusicGen pipeline: {e}")
-            raise HTTPException(status_code=500, detail=f"Failed to load MusicGen pipeline: {e}")
-    return musicgen_pipeline, musicgen_processor
-
 
 
 @router.post("/api/generate/tts", response_model=GenerationTtsOut)
@@ -856,7 +784,6 @@ def clone_elevenlabs_voice(
         scratchpad.remove_path(temp_path)
 
 
-
 @router.post("/api/generate/image")
 def generate_image(
     request: Request,
@@ -924,72 +851,77 @@ def generate_image(
             },
             db=db,
             file_extension="png",
-            content_type="image/png"
+            content_type="image/png",
         )
 
-    gemini_key = _resolve_gemini_key(db, request)
-    if gemini_key:
-        try:
-            data = gemini_service.call_gemini_generate_content(
-                api_key=gemini_key,
-                model="gemini-3.1-flash-image",
-                contents=[{"role": "user", "parts": [{"text": prompt}]}],
-                generation_config={"responseModalities": ["IMAGE"]},
-            )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Gemini image generation failed: {e}")
-            raise HTTPException(status_code=502, detail=f"Gemini image generation failed: {e}")
-
-        candidates = data.get("candidates", [])
-        if not candidates or not candidates[0].get("content"):
-            raise HTTPException(
-                status_code=502, detail="Gemini returned an empty candidate list"
-            )
-        parts = candidates[0]["content"].get("parts", [])
-        img_bytes = None
-        for part in parts:
-            inline_data = part.get("inlineData") or part.get("inline_data")
-            if inline_data and "data" in inline_data:
-                img_bytes = base64.b64decode(inline_data["data"])
-                break
-        if not img_bytes:
-            raise HTTPException(
-                status_code=502,
-                detail="Gemini did not return image data in candidate parts",
-            )
-
-        filename = f"gemini_img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
-        upload_success = upload_object(img_bytes, filename, content_type="image/png")
-        if upload_success:
+    # When provider is explicitly set to local, never fall through to Gemini cloud API
+    if provider != "local":
+        gemini_key = _resolve_gemini_key(db, request)
+        if gemini_key:
             try:
-                title = f"Gemini Image: {prompt[:30]}..."
-                asset = MediaAsset(
-                    title=title,
-                    file_path=filename,
-                    file_size=len(img_bytes),
-                    content_type="image/png",
-                    duration=0.0,
-                    embedding=get_embedding(prompt or title),
+                data = gemini_service.call_gemini_generate_content(
+                    api_key=gemini_key,
+                    model="gemini-3.1-flash-image",
+                    contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                    generation_config={
+                        "responseModalities": ["IMAGE"],
+                        **({"imageConfig": {"aspectRatio": aspect_ratio}} if aspect_ratio else {}),
+                    },
                 )
-                db.add(asset)
-                db.commit()
+            except HTTPException:
+                raise
             except Exception as e:
-                logger.error(f"Failed to save generated image asset: {e}")
-                db.rollback()
-        return {
-            "status": "COMPLETED",
-            "parameters": {"steps": steps, "scale": scale},
-            "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
-        }
+                logger.error(f"Gemini image generation failed: {e}")
+                raise HTTPException(status_code=502, detail=f"Gemini image generation failed: {e}")
 
-    # Local ML pipeline path (priority-1: flux-schnell with sdxl auto-downgrade).
-    # This replaces the legacy load_flux_pipeline/load_sdxl_pipeline block and its
-    # `b"Mock local flux generated image bytes."` fallback, both of which are gone:
-    # #100 routes local inference through the VRAM-guarded registry and #81 forbids
-    # ever returning fake image bytes (see app/ml/contracts.py).
+            candidates = data.get("candidates", [])
+            if not candidates or not candidates[0].get("content"):
+                raise HTTPException(
+                    status_code=502, detail="Gemini returned an empty candidate list"
+                )
+            parts = candidates[0]["content"].get("parts", [])
+
+            img_bytes = None
+            for part in parts:
+                inline_data = part.get("inlineData") or part.get("inline_data")
+                if inline_data and "data" in inline_data:
+                    img_bytes = base64.b64decode(inline_data["data"])
+                    break
+
+            if not img_bytes:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Gemini did not return image data in candidate parts",
+                )
+
+            filename = f"gemini_img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+            upload_success = upload_object(img_bytes, filename, content_type="image/png")
+
+            if upload_success:
+                try:
+                    title = f"Gemini Image: {prompt[:30]}..."
+                    asset = MediaAsset(
+                        title=title,
+                        file_path=filename,
+                        file_size=len(img_bytes),
+                        content_type="image/png",
+                        duration=0.0,
+                        embedding=get_embedding(prompt or title),
+                    )
+                    db.add(asset)
+                    db.commit()
+                except Exception as e:
+                    logger.error(f"Failed to save generated image asset: {e}")
+                    db.rollback()
+
+            return {
+                "status": "COMPLETED",
+                "parameters": {"steps": steps, "scale": scale},
+                "filename": filename,
+                "url": generate_url(filename) if upload_success else "",
+            }
+
+    # Local ML pipeline path (priority-1: flux-schnell with sdxl auto-downgrade)
     return run_local_image_generation(
         prompt=prompt,
         steps=steps,
@@ -999,6 +931,28 @@ def generate_image(
         db=db,
     )
 
+
+musicgen_pipeline = None
+
+
+def load_musicgen_pipeline():
+    """Load MusicGen pipeline with caching (legacy /api/generate/music path)."""
+    global musicgen_pipeline
+    if musicgen_pipeline is None:
+        try:
+            import torch
+            from transformers import MusicgenForConditionalGeneration, AutoProcessor
+            musicgen_pipeline = MusicgenForConditionalGeneration.from_pretrained(
+                "facebook/musicgen-small",
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+            )
+            musicgen_processor = AutoProcessor.from_pretrained("facebook/musicgen-small")
+            if torch.cuda.is_available():
+                musicgen_pipeline = musicgen_pipeline.to("cuda")
+        except Exception as e:
+            logger.error(f"Failed to load MusicGen pipeline: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to load MusicGen pipeline: {e}")
+    return musicgen_pipeline, musicgen_processor
 
 
 @router.post("/api/generate/music")
@@ -1098,3 +1052,84 @@ def generate_music(
         logger.error(f"Failed to generate music: {e}")
         raise HTTPException(status_code=500, detail=f"Music generation failed: {e}")
 
+
+@router.post("/api/generate/video")
+def generate_video(
+    source: str = Query(..., description="Conditioning image file path in catalog/storage"),
+    num_frames: int = Query(14, description="Number of video frames to generate (2..25)"),
+    fps: int = Query(7, description="Framerate of generated video (1..30)"),
+    db: Session = Depends(get_db),
+):
+    """Generate short video from conditioning image via Stable Video Diffusion (SVD) (#102)."""
+    _validate_safe_reference(source, "source")
+
+    if num_frames < 2 or num_frames > 25:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid num_frames: must be between 2 and 25, got {num_frames}",
+        )
+
+    if fps < 1 or fps > 30:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid fps: must be between 1 and 30, got {fps}",
+        )
+
+    from app.storage import download_object
+    source_bytes = download_object(source)
+    if source_bytes is None and os.path.isfile(source):
+        try:
+            with open(source, "rb") as f:
+                source_bytes = f.read()
+        except Exception:
+            pass
+
+    if source_bytes is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source image '{source}' not found or unreadable in storage",
+        )
+
+    from PIL import Image
+    try:
+        probe = Image.open(io.BytesIO(source_bytes))
+        probe.verify()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source image '{source}' is unreadable or corrupt: {exc}",
+        )
+
+    if is_colab_connected():
+        return dispatch_gen_to_colab(
+            task_type="video_generation",
+            parameters={
+                "op": "image_to_video",
+                "source": source,
+                "num_frames": num_frames,
+                "fps": fps,
+            },
+            db=db,
+            file_extension="mp4",
+            content_type="video/mp4",
+        )
+
+    from app.tasks import process_gpu_task
+    celery_task = process_gpu_task.delay(
+        "svd",
+        {
+            "op": "image_to_video",
+            "source": source,
+            "num_frames": num_frames,
+            "fps": fps,
+        },
+    )
+
+    return {
+        "task_id": celery_task.id,
+        "status": "PENDING",
+        "type": "video",
+        "source": source,
+        "num_frames": num_frames,
+        "fps": fps,
+    }
