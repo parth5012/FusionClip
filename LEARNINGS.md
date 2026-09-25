@@ -41,4 +41,19 @@
 ### 10. Constant-Time Secret Verification
 - API token authentication in FastAPI handlers should use `secrets.compare_digest` rather than `!=` to eliminate timing side channels, and must check that both candidate and secret are non-empty strings.
 
+## 2026-09-25: Local Torch Model Scaffold (Map #71)
+
+### 11. Import-Guarded PyTorch & CUDA Detection
+- Machines running backend unit tests or non-GPU nodes may not have `torch` or NVIDIA CUDA drivers installed.
+- Any GPU memory queries (`torch.cuda.mem_get_info`, `torch.cuda.is_available`) or cache clearing (`torch.cuda.empty_cache`) must be enclosed in guarded `try ... except (ImportError, Exception)` blocks so the server boots cleanly and tests pass deterministically in headless CI / CPU environments without raising unhandled import errors.
+
+### 12. Celery Queue Isolation for Mixed Hardware Workloads
+- Celery workers with concurrency > 1 on CPU queues (`media.fast`, `media.heavy`) can starve or conflict with GPU-intensive diffusion/transformers workloads if routed to common queues.
+- Creating an isolated `media.gpu` queue with dedicated task routes prevents CPU tasks (e.g. ffmpeg transcoding) from competing for worker slots with local VRAM-guarded inference tasks.
+
+### 13. Honest Degraded Tier Contract
+- When local ML execution cannot fit into GPU memory or when no GPU is detected, returning fake byte payloads ("Mock ... bytes") violates data integrity and corrupts downstream media decoders.
+- Surfacing a typed degraded envelope (`degraded: true` with machine-readable `reason` such as `insufficient_vram` or `no_gpu`) enables the API client and UI to present transparent fallback options (e.g., auto-downgrading from Flux to SDXL, routing to cloud APIs, or displaying actionable VRAM requirements) rather than masking failure with corrupted files.
+
+
 

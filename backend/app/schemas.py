@@ -45,6 +45,45 @@ class TaskOut(BaseModel):
     info: Any = None
 
 
+# --- Local ML / GPU Health & Guard Contracts (#99) -----------------------
+
+
+class ModelHealthInfo(BaseModel):
+    model_id: str
+    family: str
+    dtype_quant: str
+    approx_vram_gb: float
+    license: str
+    loaded: bool
+    description: Optional[str] = None
+
+
+class GPUVRAMMetrics(BaseModel):
+    available: bool
+    device_name: Optional[str] = None
+    total_gb: float = 0.0
+    free_gb: float = 0.0
+    used_gb: float = 0.0
+    vram_percent: float = 0.0
+
+
+class GPUQueueMetrics(BaseModel):
+    queue_name: str = "media.gpu"
+    depth: int = 0
+    # Task rows carry no queue column, so this counts in-flight tasks across every
+    # queue (CPU + GPU). Named for what it actually measures.
+    active_tasks_total: int = 0
+
+
+class GPUHealthResponse(BaseModel):
+    """Health metrics for local GPU compute, model states, and background queue."""
+
+    status: str
+    gpu: GPUVRAMMetrics
+    models: Dict[str, ModelHealthInfo]
+    queue: GPUQueueMetrics
+
+
 # --- Settings --------------------------------------------------------------
 
 
