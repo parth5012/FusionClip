@@ -1,6 +1,8 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
+import { useStore } from '../store/useStore';
+import type { AudioMarker } from '../utils/api';
 import { 
   Play, 
   Pause, 
@@ -36,6 +38,24 @@ import {
   fetchMediaCatalog,
 } from '../utils/api';
 
+/**
+ * Draw (or redraw) the backend-attested markers on the waveform. Markers are
+ * provenance overlays - e.g. a voice-clone reference - not user annotations, so
+ * they are rebuilt from scratch on every call rather than accumulated.
+ */
+function applyMarkers(ws: any, markers?: AudioMarker[]) {
+  if (!ws) return;
+  try {
+    ws.clearMarkers?.();
+    (markers ?? []).forEach((m) => {
+      if (typeof m?.time !== 'number') return;
+      ws.addMarker({ time: m.time, label: m.label, color: '#f43f5e' });
+    });
+  } catch (err) {
+    console.warn('Failed to render waveform markers:', err);
+  }
+}
+
 export default function PlayersPanel() {
   // Audio Wavefer states
   const [audioUrl, setAudioUrl] = useState<string>('https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3');
@@ -66,6 +86,21 @@ export default function PlayersPanel() {
       subtitleBlobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     };
   }, []);
+
+  // Latest clip published by the generation panel (with voice-clone markers).
+  const waveAudio = useStore((s) => s.waveAudio);
+  const waveAudioRef = useRef(waveAudio);
+
+  useEffect(() => {
+    waveAudioRef.current = waveAudio;
+  }, [waveAudio]);
+
+  // Load the generated clip instead of the demo URL once one exists.
+  useEffect(() => {
+    if (waveAudio?.url && waveAudio.url !== audioUrl) {
+      setAudioUrl(waveAudio.url);
+    }
+  }, [waveAudio, audioUrl]);
 
   // Video Custom Player states
   const [videoUrl, setVideoUrl] = useState<string>('https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4');
@@ -151,6 +186,7 @@ export default function PlayersPanel() {
           setAudioCurrentTime(ws.getCurrentTime());
           ws.setVolume(isAudioMuted ? 0 : audioVolume);
           ws.setPlaybackRate(audioPlaybackRate);
+          applyMarkers(ws, waveAudioRef.current?.markers);
         });
 
         ws.on('seek', () => {
@@ -180,6 +216,11 @@ export default function PlayersPanel() {
       wsRef.current.zoom(zoomLevel);
     }
   }, [zoomLevel]);
+
+  // Keep markers in sync when a new clip arrives for an already-created player.
+  useEffect(() => {
+    applyMarkers(wsRef.current, waveAudio?.markers);
+  }, [waveAudio, audioUrl]);
 
   // Sync audio volume
   useEffect(() => {
@@ -549,6 +590,27 @@ export default function PlayersPanel() {
               {audioDuration === 0 && !audioError && (
                 <div className="absolute inset-0 flex items-center justify-center bg-slate-950/50 py-10 z-0">
                   <span className="text-xs text-slate-550 animate-pulse">Loading audio waveform...</span>
+                </div>
+              )}
+
+              {/* Clone markers reported by the local audio pipeline */}
+              {waveAudio?.filename && (
+                <div className="text-[10px] font-mono text-slate-400 mt-2">
+                  Now profiling: {waveAudio.filename}
+                </div>
+              )}
+              {(waveAudio?.markers?.length ?? 0) > 0 && (
+                <div className="flex flex-wrap items-center gap-2 mt-2">
+                  {waveAudio!.markers!.map((m, i) => (
+                    <span
+                      key={`${m.kind}-${m.time}-${i}`}
+                      className="flex items-center gap-1.5 text-[10px] font-mono px-2 py-0.5 rounded-full border border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-200"
+                      title={`${m.label} @ ${m.time.toFixed(2)}s`}
+                    >
+                      <span className="w-1.5 h-1.5 rounded-full bg-fuchsia-400" />
+                      {m.label}
+                    </span>
+                  ))}
                 </div>
               )}
             </div>
