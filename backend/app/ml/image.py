@@ -25,7 +25,7 @@ from app.ml.contracts import (
     make_degraded_response,
 )
 from app.ml.guard import VRAMRefusalError, vram_guard
-from app.ml.registry import model_registry
+from app.ml.registry import INFERENCE_LOCK, model_registry
 from app.models import MediaAsset
 from app.services.embedding import get_embedding
 from app.storage import generate_url, upload_object
@@ -220,118 +220,121 @@ def run_local_image_generation(
     on txt2img pipelines. The route rejects `denoising_strength` until an
     image-to-image source input exists.
     """
-    # 1. Admission check and candidate selection (Decision #4: flux-schnell with sdxl auto-downgrade)
-    try:
-        selected_model_id = vram_guard.select_fitting_model(
-            candidate_ids=["flux-schnell", "sdxl"],
-            working_overhead_gb=1.0,
-        )
-    except VRAMRefusalError as exc:
-        logger.warning(f"Local image inference refused: {exc.reason} - {exc.message}")
-        return exc.to_degraded_response().model_dump()
-    except Exception as exc:
-        logger.error(f"Unexpected error during VRAM admission check: {exc}")
-        return make_degraded_response(
-            reason=DegradedReason.NO_GPU.value,
-            message=f"Failed to check GPU availability: {str(exc)}",
-        ).model_dump()
-
-    # 2. Lazy load via model_registry
-    try:
-        pipe = model_registry.load_model(
-            selected_model_id,
-            loader_handle=make_diffusers_loader(selected_model_id),
-        )
-    except Exception as exc:
-        logger.error(f"Failed to load image model '{selected_model_id}': {exc}")
-        return make_degraded_response(
-            reason=DegradedReason.LOAD_FAILED.value,
-            message=f"Failed to load local model '{selected_model_id}': {str(exc)}",
-            model_id=selected_model_id,
-        ).model_dump()
-
-    # 3. Configure scheduler if requested
-    if scheduler:
+    with INFERENCE_LOCK:
+        # Invariant: INFERENCE_LOCK serializes admission and inference so eviction
+        # cannot occur while another request is mid-inference.
+        # 1. Admission check and candidate selection (Decision #4: flux-schnell with sdxl auto-downgrade)
         try:
-            apply_scheduler_to_pipeline(pipe, scheduler, model_id=selected_model_id)
-        except Exception as exc:
-            logger.warning(f"Could not apply scheduler '{scheduler}': {exc}")
-
-    # 4. Execute pipeline
-    width, height = get_dimensions_for_aspect_ratio(aspect_ratio)
-    inference_kwargs: Dict[str, Any] = {
-        "prompt": prompt,
-        "num_inference_steps": steps,
-        "guidance_scale": scale,
-        "width": width,
-        "height": height,
-    }
-    # NB: no `strength` key. It is img2img-only and txt2img pipelines raise TypeError
-    # on it; the route rejects denoising_strength until a source image input exists.
-
-    try:
-        output = pipe(**inference_kwargs)
-    except Exception as exc:
-        logger.error(f"Diffusion execution failed for '{selected_model_id}': {exc}")
-        return make_degraded_response(
-            reason=DegradedReason.LOAD_FAILED.value,
-            message=f"Pipeline inference failed for '{selected_model_id}': {str(exc)}",
-            model_id=selected_model_id,
-        ).model_dump()
-
-    # 5. Extract generated image bytes
-    try:
-        images = getattr(output, "images", None)
-        if images is None:
-            images = output if isinstance(output, list) else [output]
-
-        first_img = images[0]
-        if isinstance(first_img, (bytes, bytearray)):
-            png_bytes = bytes(first_img)
-        elif hasattr(first_img, "save"):
-            buf = io.BytesIO()
-            first_img.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
-        else:
-            raise ValueError(f"Unrecognized pipeline output type: {type(first_img)}")
-    except Exception as exc:
-        logger.error(f"Failed to encode generated image to PNG: {exc}")
-        return make_degraded_response(
-            reason=DegradedReason.LOAD_FAILED.value,
-            message=f"Failed to encode generated image: {str(exc)}",
-            model_id=selected_model_id,
-        ).model_dump()
-
-    # 6. Upload real bytes and persist MediaAsset
-    filename = build_image_filename()
-    upload_success = upload_object(png_bytes, filename, content_type="image/png")
-
-    if upload_success and db is not None:
-        try:
-            model_family_name = "Flux" if selected_model_id == "flux-schnell" else "SDXL"
-            title = f"{model_family_name} Generated: {prompt[:30]}..."
-            asset = MediaAsset(
-                title=title,
-                file_path=filename,
-                file_size=len(png_bytes),
-                content_type="image/png",
-                duration=0.0,
-                embedding=get_embedding(prompt or title),
+            selected_model_id = vram_guard.select_fitting_model(
+                candidate_ids=["flux-schnell", "sdxl"],
+                working_overhead_gb=1.0,
             )
-            db.add(asset)
-            db.commit()
+        except VRAMRefusalError as exc:
+            logger.warning(f"Local image inference refused: {exc.reason} - {exc.message}")
+            return exc.to_degraded_response().model_dump()
         except Exception as exc:
-            logger.error(f"Failed to save generated image asset: {exc}")
-            db.rollback()
+            logger.error(f"Unexpected error during VRAM admission check: {exc}")
+            return make_degraded_response(
+                reason=DegradedReason.NO_GPU.value,
+                message=f"Failed to check GPU availability: {str(exc)}",
+            ).model_dump()
 
-    # 7. Response matching Gemini shape
-    params_dict: Dict[str, Any] = {"steps": steps, "scale": scale}
-    if scheduler is not None:
-        params_dict["scheduler"] = scheduler
+        # 2. Lazy load via model_registry
+        try:
+            pipe = model_registry.load_model(
+                selected_model_id,
+                loader_handle=make_diffusers_loader(selected_model_id),
+            )
+        except Exception as exc:
+            logger.error(f"Failed to load image model '{selected_model_id}': {exc}")
+            return make_degraded_response(
+                reason=DegradedReason.LOAD_FAILED.value,
+                message=f"Failed to load local model '{selected_model_id}': {str(exc)}",
+                model_id=selected_model_id,
+            ).model_dump()
 
-    return {
-        "status": "COMPLETED",
-        "parameters": params_dict,
-        "filename": filename,
-        "url": generate_url(filename) if upload_success else "",
-    }
+        # 3. Configure scheduler if requested
+        if scheduler:
+            try:
+                apply_scheduler_to_pipeline(pipe, scheduler, model_id=selected_model_id)
+            except Exception as exc:
+                logger.warning(f"Could not apply scheduler '{scheduler}': {exc}")
+
+        # 4. Execute pipeline
+        width, height = get_dimensions_for_aspect_ratio(aspect_ratio)
+        inference_kwargs: Dict[str, Any] = {
+            "prompt": prompt,
+            "num_inference_steps": steps,
+            "guidance_scale": scale,
+            "width": width,
+            "height": height,
+        }
+        # NB: no `strength` key. It is img2img-only and txt2img pipelines raise TypeError
+        # on it; the route rejects denoising_strength until a source image input exists.
+
+        try:
+            output = pipe(**inference_kwargs)
+        except Exception as exc:
+            logger.error(f"Diffusion execution failed for '{selected_model_id}': {exc}")
+            return make_degraded_response(
+                reason=DegradedReason.LOAD_FAILED.value,
+                message=f"Pipeline inference failed for '{selected_model_id}': {str(exc)}",
+                model_id=selected_model_id,
+            ).model_dump()
+
+        # 5. Extract generated image bytes
+        try:
+            images = getattr(output, "images", None)
+            if images is None:
+                images = output if isinstance(output, list) else [output]
+
+            first_img = images[0]
+            if isinstance(first_img, (bytes, bytearray)):
+                png_bytes = bytes(first_img)
+            elif hasattr(first_img, "save"):
+                buf = io.BytesIO()
+                first_img.save(buf, format="PNG")
+                png_bytes = buf.getvalue()
+            else:
+                raise ValueError(f"Unrecognized pipeline output type: {type(first_img)}")
+        except Exception as exc:
+            logger.error(f"Failed to encode generated image to PNG: {exc}")
+            return make_degraded_response(
+                reason=DegradedReason.LOAD_FAILED.value,
+                message=f"Failed to encode generated image: {str(exc)}",
+                model_id=selected_model_id,
+            ).model_dump()
+
+        # 6. Upload real bytes and persist MediaAsset
+        filename = build_image_filename()
+        upload_success = upload_object(png_bytes, filename, content_type="image/png")
+
+        if upload_success and db is not None:
+            try:
+                model_family_name = "Flux" if selected_model_id == "flux-schnell" else "SDXL"
+                title = f"{model_family_name} Generated: {prompt[:30]}..."
+                asset = MediaAsset(
+                    title=title,
+                    file_path=filename,
+                    file_size=len(png_bytes),
+                    content_type="image/png",
+                    duration=0.0,
+                    embedding=get_embedding(prompt or title),
+                )
+                db.add(asset)
+                db.commit()
+            except Exception as exc:
+                logger.error(f"Failed to save generated image asset: {exc}")
+                db.rollback()
+
+        # 7. Response matching Gemini shape
+        params_dict: Dict[str, Any] = {"steps": steps, "scale": scale}
+        if scheduler is not None:
+            params_dict["scheduler"] = scheduler
+
+        return {
+            "status": "COMPLETED",
+            "parameters": params_dict,
+            "filename": filename,
+            "url": generate_url(filename) if upload_success else "",
+        }
