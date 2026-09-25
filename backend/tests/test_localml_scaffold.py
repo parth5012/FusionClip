@@ -890,6 +890,52 @@ class TestModelEviction:
         assert admission["admitted"] is True
         assert clean_registry.is_loaded("model-a")
 
+    def test_priority_model_admitted_by_evicting_resident_downgrade(self, clean_registry, monkeypatch):
+        """Decision #4: a resident downgrade candidate must not block the priority model.
+
+        flux-schnell (13 GB) cannot coexist with a resident SDXL (6.5 GB) on a
+        16 GB card. Keeping SDXL resident forces an avoidable downgrade to the
+        model that is already loaded; the guard must evict it to admit the
+        priority candidate instead.
+        """
+        guard = VRAMGuard(registry=clean_registry, default_overhead_gb=1.0)
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-primary", family="image", dtype_quant="fp8",
+                approx_vram_gb=13.0, license="MIT"
+            ),
+            loader_handle=lambda: "inst-primary",
+        )
+        clean_registry.register(
+            ModelMetadata(
+                model_id="model-secondary", family="image", dtype_quant="fp8",
+                approx_vram_gb=6.5, license="MIT"
+            ),
+            loader_handle=lambda: "inst-secondary",
+        )
+        clean_registry.load_model("model-secondary")
+        assert clean_registry.is_loaded("model-secondary")
+
+        def mock_gpu_info(device=0):
+            free_gb = 9.5 if clean_registry.is_loaded("model-secondary") else 16.0
+            return {
+                "available": True,
+                "device_name": "NVIDIA RTX 4080",
+                "total_bytes": int(16.0 * (1024 ** 3)),
+                "free_bytes": int(free_gb * (1024 ** 3)),
+                "used_bytes": int((16.0 - free_gb) * (1024 ** 3)),
+                "total_gb": 16.0,
+                "free_gb": free_gb,
+                "used_gb": 16.0 - free_gb,
+                "vram_percent": ((16.0 - free_gb) / 16.0) * 100,
+            }
+
+        monkeypatch.setattr(guard, "get_gpu_info", mock_gpu_info)
+
+        selected = guard.select_fitting_model(["model-primary", "model-secondary"])
+        assert selected == "model-primary"
+        assert not clean_registry.is_loaded("model-secondary")
+
     def test_no_gpu_path_never_evicts(self, clean_registry, monkeypatch):
         """Test (d): NoGPUError path never evicts."""
         guard = VRAMGuard(registry=clean_registry, default_overhead_gb=1.0)
