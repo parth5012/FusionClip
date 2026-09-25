@@ -112,6 +112,45 @@
   - Code review gate: 11 findings (4 major) applied - test seams, KeyError handling, misclassified reason, registry lock, offload path, dead `DegradedOut` schema, ambiguous `/api/tasks/metrics` alias, metric mislabel, license corrections, runtime mock-byte validator, Celery prefetch.
   - Verified: 27 scaffold tests passing; 233 total tests passing in backend test suite.
 
+## 2026-09-25: Wayfinder Map #71 - Local Torch Models (Priority-1 Image Pipeline)
+
+### Iteration Status: Done
+
+- **Phase 2 (AFK): #100 - Wire POST /api/generate/image to priority-1 image model and honest degraded fallback**
+  - Deleted the unconditional mock branch and eliminated the legacy placeholder string `"Mock local flux generated image bytes"` completely from the codebase.
+  - Implemented `app.ml.image`:
+    - `run_local_image_generation`: Consults `vram_guard.select_fitting_model(["flux-schnell", "sdxl"], working_overhead_gb=1.0)` first.
+    - Surfaces Decision #3 honest degraded envelope (`degraded: true` with typed machine-readable reason such as `no_gpu` or `insufficient_vram`) on refusal.
+    - Implemented auto-downgrade to `sdxl` when VRAM is insufficient for `flux-schnell` (Decision #4).
+    - Added lazy diffusers loader factory (`make_diffusers_loader`) guarding torch and diffusers imports so the backend cleanly boots and operates without GPU or diffusers installed.
+    - Honored `steps`, `scale` (guidance), `aspect_ratio` dimension mapping, and `scheduler` configuration (`EulerDiscreteScheduler`, `DPMSolverMultistepScheduler`, `DDIMScheduler`, `FlowMatchEulerDiscreteScheduler`, etc.) as promised in `features.md` §3.
+    - Uploads generated PNG bytes to object storage and persists `MediaAsset` catalog record.
+  - Updated `backend/app/routers/generate.py`:
+    - Added a narrow `_validate_aspect_ratio` (`^\d{1,4}:\d{1,4}$`, parts >= 1) so `16:9` is accepted; `provider`/`scheduler` keep the stricter safe-identifier pattern. This fixes a pre-existing 400 on the image tab's default request (`GenerationPanel.tsx` defaults `aspectRatio` to `16:9` and `api.ts` always sends it).
+    - `denoising_strength` now returns 400 with an actionable message: `strength` is img2img-only and diffusers txt2img pipelines raise TypeError on it, and this route has no source-image input yet.
+    - Preserved existing Colab worker dispatch and Gemini cloud API routing when `provider != "local"`.
+    - Routes local inference through `run_local_image_generation`.
+  - Code review gate: 8 findings (2 blocker, 1 major) applied:
+    - FLUX loader switched from `pipe.to("cuda")` (~34 GB resident, OOM at the 16 GB floor) to `enable_model_cpu_offload()`.
+    - `strength` never forwarded to txt2img; `denoising_strength` rejected up front instead.
+    - `ASPECT_RATIO_DIMENSIONS` `3:2`/`2:3` moved 680 -> 672 (multiples of 16 for FLUX 2x2 patchification); unmapped ratios now derive a ~1024^2 area rounded to 16 instead of silently becoming square.
+    - FLUX skips incompatible classical schedulers (warns and keeps default); `euler` maps to `FlowMatchEulerDiscreteScheduler`.
+    - Filenames use `time.time_ns()` via `build_image_filename()` to avoid same-second collisions while staying `gen_image_\d+\.png`; unused `uuid` import removed.
+  - Authored comprehensive test suite `backend/tests/test_localml_image.py`:
+    - Verified complete elimination of `"Mock local flux generated image bytes"` across production code.
+    - Tested degraded refusal on `no_gpu` and `insufficient_vram`.
+    - Tested auto-downgrade from `flux-schnell` to `sdxl` with 8 GB free VRAM.
+    - Tested primary selection of `flux-schnell` with 20 GB free VRAM.
+    - Tested validation and forwarding of `steps`, `scale`, `aspect_ratio`, `scheduler`; asserted `strength` is absent from txt2img kwargs.
+    - Tested persistence of `MediaAsset` and real byte upload.
+    - Tested runtime load failure handling (`load_failed`).
+    - Tested VAE-compatible dimensions for all ratios, flux offload loader, scheduler compatibility, and filename uniqueness.
+    - Verified Gemini and Colab branches remain intact.
+  - Test fixture fix: `conftest.stub_storage` gained `app.ml.image` — the new module binds `upload_object` into its own namespace, so it was never stubbed and real storage was hit.
+  - Updated `test_routers_smoke.py`, `test_refactor_equivalence.py`, and `test_generate_real_api.py` to align with the new honest degraded fallback and local execution architecture.
+  - Verified: 260 backend tests passing (`pytest backend/` 260 passed in 45.91s).
+
+**Deviation / not yet specified:** `features.md` §3 promises denoising strength and image-to-image templates. This ticket's Question only asks for steps/guidance/scheduler, and there is no source-image input on `POST /api/generate/image`, so img2img (and therefore real denoising strength) is rejected rather than silently ignored. Needs its own ticket.
 
 
 ### Iteration Status: Done
