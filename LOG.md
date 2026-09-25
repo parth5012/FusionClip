@@ -133,3 +133,14 @@
   - Unit: `bun test frontend/src/utils/` → 10 pass.
   - E2E: `09-upscaler.spec.ts` → **3 passed** (first cold-run attempt failed a 20s upload-visibility timeout during Next/moto warm-up; warm re-run green, isolated re-run green).
 - **Flags for review:** main's CLIP hybrid search not ported (fastembed/384 kept); both upscale tabs in Sidebar (product cleanup); `aspect_ratio`/`provider` query params dropped from `generateImage` (frontend still sends them, FastAPI ignores); image-gemini/audio-key responses carry no `colab` key (matches both sides' existing key-sets); main's `09-upscaler-before-after.spec.ts` needs Redis+Celery worker — no redis binary/sudo in this env (docker stack covers it; API-level upscale paths covered by pytest).
+
+
+## 2026-09-25: CodeRabbit review response on PR #129
+
+### Iteration Status: Review
+
+- CodeRabbit posted **9 actionable findings**. All replied to on the PR:
+  - **6 fixed** (`0c30761`): backfill `max_rows` cap (CWE-400; admin-auth half parked — no auth framework exists), upscale status exact-suffix + `upscale_` id guard, embedding failed-load sentinel + lock, upscaler `db.rollback()` before failure/progress commits, conftest patch target `app.services.upscaler.SessionLocal`, semantic tests skip when model unavailable. New tests: backfill cap (+400 invalid), status near-miss guard.
+  - **3 parked verbatim for maintainers**: hash-fallback embedding persistence (data integrity, heavy), upscale job memory bounds >1.3 GB/job (architecture, heavy), Colab tunnel intent-vs-status separation (frontend redesign, heavy).
+- **GitGuardian check red (parked for human)**: scans all 22 PR commits; flags commit `6eb6f9d` for test placeholder `xi-stored-key-0001` in `"api_key":` context (incident 35968525, occurrences 299506848-50). Placeholders were renamed to `unit-test-placeholder-value*` at head (`0c30761`), but per-commit scanning keeps the historical finding — clearing requires marking the incident a false positive in the GitGuardian dashboard (needs repo owner access). `main` is branch-unprotected, so the red check does not block merge.
+- **Verification:** `pytest backend/tests/ -q` → **306 passed** (304 + 2 new); tsc/bun/e2e unaffected (backend-only changes; e2e green earlier this session at head `69411cd` frontend state).
