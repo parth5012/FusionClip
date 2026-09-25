@@ -49,6 +49,8 @@ export interface WaveAudio {
 export interface GeneratedVideo {
   url: string;
   filename: string;
+  /** Frame rate of the generated clip, so the player steps match it. */
+  fps?: number;
 }
 
 interface AppState {
