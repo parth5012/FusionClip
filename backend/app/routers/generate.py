@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.deps import get_db
+from app.ml.audio import SUPPORTED_AUDIO_TYPES, run_local_audio_generation
 from app.ml.image import SUPPORTED_SCHEDULERS, run_local_image_generation
 from app.models import MediaAsset, Task
 from app.services.embedding import get_embedding
@@ -63,6 +64,15 @@ def _validate_aspect_ratio(val: Optional[str]) -> None:
             status_code=400,
             detail="Invalid aspect_ratio: both parts must be >= 1",
         )
+
+
+def _validate_safe_reference(val: Optional[str], param_name: str = "reference") -> None:
+    if val is not None:
+        if not val or ".." in val or len(val) > 128 or not SAFE_IDENTIFIER_PATTERN.match(val):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid {param_name}: must be non-empty, cannot contain '..', and must match safe identifier pattern",
+            )
 
 
 def is_colab_connected():
@@ -360,89 +370,97 @@ def generate_audio(
     type: str = Query("tts"),
     voice_id: Optional[str] = Query(None),
     duration: Optional[float] = Query(None),
+    reference: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
     db: Session = Depends(get_db),
 ):
-    """Generate audio via ElevenLabs API, Colab worker, or mock fallback."""
+    """Generate audio via ElevenLabs API, Colab worker, or local PyTorch pipeline."""
     _validate_safe_identifier(voice_id, "voice_id")
+    _validate_safe_identifier(type, "type")
+    _validate_safe_identifier(provider, "provider")
+    _validate_safe_reference(reference, "reference")
+
+    if type not in SUPPORTED_AUDIO_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported audio type '{type}'. Supported types: {', '.join(sorted(SUPPORTED_AUDIO_TYPES))}",
+        )
+
+    if type == "voice_clone":
+        if not reference or not reference.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="voice_clone requires a 'reference' parameter specifying an existing audio file path",
+            )
+
     if is_colab_connected():
         return dispatch_gen_to_colab(
             task_type="audio_generation",
-            parameters={"prompt": prompt, "type": type, "voice_id": voice_id, "duration": duration},
+            parameters={
+                "prompt": prompt,
+                "type": type,
+                "voice_id": voice_id,
+                "duration": duration,
+                "reference": reference,
+            },
             db=db,
             file_extension="mp3",
             content_type="audio/mpeg",
         )
 
-    eleven_key = get_secret("elevenlabs", db)
-    if eleven_key:
-        if type == "sfx":
-            content = call_elevenlabs_sfx(
-                api_key=eleven_key,
-                text=prompt,
-                duration_seconds=duration if duration is not None else 5.0,
-            )
-            filename = f"eleven_sfx_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-        else:
-            content = call_elevenlabs_tts(
-                api_key=eleven_key,
-                text=prompt,
-                voice_id=voice_id or "21m00Tcm4TlvDq8ikWAM",
-            )
-            filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-
-        upload_success = upload_object(content, filename, content_type="audio/mpeg")
-
-        if upload_success:
-            try:
-                title = f"ElevenLabs {'SFX' if type == 'sfx' else 'TTS'}: {prompt[:30]}..."
-                asset = MediaAsset(
-                    title=title,
-                    file_path=filename,
-                    file_size=len(content),
-                    content_type="audio/mpeg",
-                    duration=3.0,
-                    embedding=get_embedding(prompt or title),
+    if provider != "local":
+        eleven_key = get_secret("elevenlabs", db)
+        if eleven_key:
+            if type == "sfx":
+                content = call_elevenlabs_sfx(
+                    api_key=eleven_key,
+                    text=prompt,
+                    duration_seconds=duration if duration is not None else 5.0,
                 )
-                db.add(asset)
-                db.commit()
-            except Exception as e:
-                logger.error(f"Failed to save generated audio asset: {e}")
-                db.rollback()
+                filename = f"eleven_sfx_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
+            else:
+                content = call_elevenlabs_tts(
+                    api_key=eleven_key,
+                    text=prompt,
+                    voice_id=voice_id or "21m00Tcm4TlvDq8ikWAM",
+                )
+                filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
 
-        return {
-            "status": "COMPLETED",
-            "type": type,
-            "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
-        }
+            upload_success = upload_object(content, filename, content_type="audio/mpeg")
 
-    filename = f"gen_audio_{int(time.time())}.mp3"
-    content = b"Mock elevenlabs generated audio bytes."
-    upload_success = upload_object(content, filename, content_type="audio/mpeg")
+            if upload_success:
+                try:
+                    title = f"ElevenLabs {'SFX' if type == 'sfx' else 'TTS'}: {prompt[:30]}..."
+                    asset = MediaAsset(
+                        title=title,
+                        file_path=filename,
+                        file_size=len(content),
+                        content_type="audio/mpeg",
+                        duration=3.0,
+                        embedding=get_embedding(prompt or title),
+                    )
+                    db.add(asset)
+                    db.commit()
+                except Exception as e:
+                    logger.error(f"Failed to save generated audio asset: {e}")
+                    db.rollback()
 
-    # Save media assets
-    try:
-        title = f"ElevenLabs Synthesized: {prompt[:30]}..."
-        asset = MediaAsset(
-            title=title,
-            file_path=filename,
-            file_size=len(content),
-            content_type="audio/mpeg",
-            duration=3.0,
-            embedding=get_embedding(prompt or title),
-        )
-        db.add(asset)
-        db.commit()
-    except Exception as e:
-        logger.error(f"Failed to save generated audio asset: {e}")
-        db.rollback()
+            return {
+                "status": "COMPLETED",
+                "type": type,
+                "filename": filename,
+                "url": generate_url(filename) if upload_success else "",
+            }
 
-    return {
-        "status": "COMPLETED",
-        "type": type,
-        "filename": filename,
-        "url": generate_url(filename) if upload_success else "",
-    }
+    # Local ML pipeline path (XTTS v2 voice / voice clone + MusicGen audio / sfx)
+    return run_local_audio_generation(
+        prompt=prompt,
+        type=type,
+        voice_id=voice_id,
+        duration=duration,
+        reference=reference,
+        db=db,
+    )
 
 
 @router.post("/api/generate/image")

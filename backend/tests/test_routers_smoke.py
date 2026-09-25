@@ -294,11 +294,11 @@ class TestGenerateRouter:
         res = client.post("/api/generate/audio?prompt=Smoke+test+voice&type=tts")
         assert res.status_code == 200
         body = res.json()
-        assert set(body) == {"status", "type", "filename", "url"}
+        assert set(body) == {"status", "type", "filename", "url", "markers"}
         assert body["status"] == "COMPLETED"
         assert body["type"] == "tts"
         assert body["filename"].startswith("gen_audio_")
-        assert body["filename"].endswith(".mp3")
+        assert body["filename"].endswith(".wav")
         assert body["url"]
         assert body["filename"] in stub_storage["uploaded"]
 
@@ -307,7 +307,7 @@ class TestGenerateRouter:
             .filter(MediaAsset.file_path == body["filename"])
             .one()
         )
-        assert asset.content_type == "audio/mpeg"
+        assert asset.content_type == "audio/wav"
 
     def test_generate_image_no_longer_raises_nameerror(self, client, stub_storage, db_session):
         res = client.post("/api/generate/image?prompt=Smoke+test+art&steps=10&scale=7.0")

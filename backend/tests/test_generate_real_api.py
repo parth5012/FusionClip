@@ -218,7 +218,10 @@ class TestUnconfiguredKeyMockFallback:
 
         res_audio = client.post("/api/generate/audio?prompt=Mock+audio&type=tts")
         assert res_audio.status_code == 200
-        assert res_audio.json()["status"] == "COMPLETED"
+        # Audio mock replaced by local pipeline with honest degraded fallback (#101)
+        body_audio = res_audio.json()
+        assert body_audio["degraded"] is True
+        assert body_audio["reason"] == "no_gpu"
 
         res_image = client.post("/api/generate/image?prompt=Mock+image")
         assert res_image.status_code == 200

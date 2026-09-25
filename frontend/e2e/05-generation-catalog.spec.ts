@@ -55,7 +55,7 @@ test.describe('Generation & Catalog', () => {
 
     expect(body.status).toBe('COMPLETED');
     expect(body.type).toBe('sfx');
-    expect(body.filename).toMatch(/^gen_audio_\d+\.mp3$/);
+    expect(body.filename).toMatch(/^gen_audio_\d+\.(mp3|wav)$/);
     expect(body.url).toBeTruthy();
 
     generatedFiles.push(body.filename);
@@ -64,7 +64,7 @@ test.describe('Generation & Catalog', () => {
     const catalog = await apiFetchMediaCatalog();
     const found = catalog.find((a: any) => a.file_path === body.filename);
     expect(found).toBeTruthy();
-    expect(found.content_type).toBe('audio/mpeg');
+    expect(['audio/mpeg', 'audio/wav']).toContain(found.content_type);
   });
 
   test('image generation endpoint with params creates file in MinIO and DB', async () => {
