@@ -648,13 +648,6 @@ def generate_video(
 
     from app.storage import download_object
     source_bytes = download_object(source)
-    if source_bytes is None and os.path.isfile(source):
-        try:
-            with open(source, "rb") as f:
-                source_bytes = f.read()
-        except Exception:
-            pass
-
     if source_bytes is None:
         raise HTTPException(
             status_code=400,
