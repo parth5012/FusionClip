@@ -123,6 +123,7 @@ def stub_storage(monkeypatch):
         "app.services.subtitles",
         "app.ml.image",
         "app.ml.audio",
+        "app.ml.video",
     ):
         for name, impl in (
             ("upload_object", _upload_object),
