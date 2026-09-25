@@ -99,7 +99,7 @@
 
 ### 24. Resident Model Eviction and Inference Serialization
 - When loading multi-gigabyte models (e.g. FLUX.1 schnell ~13GB and MusicGen large ~10.4GB) on a 16GB GPU, resident models must be evicted when switching pipelines (`evict_except(keep_ids)`) to prevent `insufficient_vram` deadlocks.
-- Admission, model load, and inference must be serialized behind a global `INFERENCE_LOCK = threading.RLock()` across both image and audio pipelines to ensure eviction never runs while another request is mid-inference.
+- Admission, model load, and inference are serialized within a single process behind `INFERENCE_LOCK = threading.RLock()` across both image and audio pipelines to ensure eviction never runs while another thread is mid-inference. Note that `threading.RLock` serializes only within one process; cross-process coordination (API process vs. Celery prefork child workers) is not covered and is tracked as an open item on the map.
 - Audio references for zero-shot voice cloning must be resolved from S3/MinIO storage into secure temporary files (`tempfile.NamedTemporaryFile`) and passed as `speaker_wav` to XTTS with guaranteed cleanup.
 
 ### 25. SVD Video Pipeline Progress Mapping & FFmpeg Carriage Return Scrapes

@@ -249,6 +249,7 @@
   - **F4 MAJOR**: Enforced child process cleanup in `encode_frames_to_mp4` via `try/finally` (killing child and closing stderr on exit/error) and added bounded timeout (default 60s) raising `VideoEncodingError`.
   - **F7 MINOR**: Removed local host disk fallback reads in `app/routers/generate.py` and `app/tasks.py` to maintain strict object-storage isolation.
   - **F9 NIT**: Enhanced `VideoEncodingError` with `returncode` and `stderr` fields and added focused test exercising genuine ffmpeg failure with non-zero exit code.
+  - Note: `INFERENCE_LOCK` and `ModelRegistry._lock` are single-process `threading.RLock` primitives; cross-process coordination across API and Celery workers is tracked as an open item on map #71.
   - Verified: 320 passed in pytest suite (7 new tests added, 320 passed in 57.19s); lazy import check verified with no torch installed.
 
 - **Phase 2 (AFK): #102 Frontend Implementation + Review Gate Fixes**
