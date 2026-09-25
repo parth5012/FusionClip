@@ -188,5 +188,18 @@
   - Updated `frontend/e2e/05-generation-catalog.spec.ts`: Relaxed filename regex to `/^gen_audio_\d+\.(mp3|wav)$/` and content_type to either `audio/mpeg` or `audio/wav`.
   - Verified: 279 backend tests passing (19 added, 279 passed in 50.65s).
 
+### Iteration Status: Done (Code Review Fixes for #101)
+
+- **Review Fixes Applied (#101)**:
+  - FIX 1: Restricted ElevenLabs routing in `generate_audio` to `{"tts", "voice", "sfx"}`; `voice_clone` and `music` route to local ML pipeline even when ElevenLabs key is configured (preserving Colab priority).
+  - FIX 2 & 5: Added `INFERENCE_LOCK = threading.RLock()` in `app.ml.registry` and wrapped `run_local_image_generation` and `run_local_audio_generation` to serialize admission and inference. Added `ModelRegistry.evict_except(keep_ids)` and integrated into `VRAMGuard` when free VRAM is insufficient.
+  - FIX 3: Added `download_object` to `app.storage` and resolved `reference` to temporary files in `app.ml.audio` for XTTS voice cloning with `try/finally` cleanup. Loosened reference validation in `generate.py` to allow relative paths with slashes (`uploads/speaker.wav`) while rejecting traversals/absolute paths with 400.
+  - FIX 4: Aligned MusicGen model identity and precision with pinned roster: loaded `facebook/musicgen-large` with `torch_dtype=torch.float16` on CUDA, and wrapped generation in `torch.inference_mode()`.
+  - FIX 6: Added duration validation to `generate_audio` rejecting values outside `0.5 .. 30.0` seconds with HTTP 400.
+  - FIX 7: Added unit test with real `tts_to_file` signature asserting `speaker_wav` receives resolved temporary file path and is cleaned up, and omitted for plain TTS.
+  - FIX 8: Fixed `test_audio_module_imports_without_torch` to safely pop `app.ml.audio`, mask torch/transformers/TTS, test clean imports, and restore module state.
+  - Verified: 294 backend tests passing (15 added, 294 passed in 54.53s).
+
+
 
 
