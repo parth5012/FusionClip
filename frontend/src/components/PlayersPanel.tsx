@@ -89,7 +89,11 @@ export default function PlayersPanel() {
     if (genVideo?.url && genVideo.url !== videoUrl) {
       setVideoUrl(genVideo.url);
     }
-  }, [genVideo, videoUrl]);
+    // Step buttons and the frame readout must use the clip's real frame rate.
+    if (genVideo?.fps && genVideo.fps !== videoFps) {
+      setVideoFps(genVideo.fps);
+    }
+  }, [genVideo, videoUrl, videoFps]);
 
   // Load and destroy Wavesurfer instance
   useEffect(() => {
