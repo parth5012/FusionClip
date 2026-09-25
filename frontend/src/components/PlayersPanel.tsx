@@ -83,6 +83,14 @@ export default function PlayersPanel() {
 
   const videoRef = useRef<HTMLVideoElement>(null);
 
+  // Hand-off from the generation panel for locally generated video (#102).
+  const genVideo = useStore((s) => s.genVideo);
+  useEffect(() => {
+    if (genVideo?.url && genVideo.url !== videoUrl) {
+      setVideoUrl(genVideo.url);
+    }
+  }, [genVideo, videoUrl]);
+
   // Load and destroy Wavesurfer instance
   useEffect(() => {
     let ws: any = null;
@@ -530,6 +538,12 @@ export default function PlayersPanel() {
             {videoError && (
               <div className="p-3 bg-red-950/20 border border-red-900/40 text-red-400 rounded text-xs mb-2">
                 {videoError}
+              </div>
+            )}
+
+            {genVideo?.filename && (
+              <div className="text-[10px] font-mono text-slate-400 mb-2">
+                Now playing: {genVideo.filename}
               </div>
             )}
 

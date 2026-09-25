@@ -390,3 +390,45 @@ export async function generateImage(
   return postGenerate<GenerateImageResponse>(url, 'Image generation failed');
 }
 
+/** Dispatch handle returned by POST /api/generate/video (poll with getTaskStatus). */
+export interface GenerateVideoResponse {
+  task_id: string;
+  status: string;
+  type: string;
+  source: string;
+  num_frames: number;
+  fps: number;
+}
+
+/** Final payload of a finished video job (Celery SUCCESS result). */
+export interface VideoGenerationResult {
+  status?: string;
+  type?: string;
+  filename?: string;
+  url?: string;
+  num_frames?: number;
+  fps?: number;
+  degraded?: boolean;
+  reason?: string;
+  message?: string;
+}
+
+/**
+ * Start local SVD image-to-video. Returns immediately with a Celery task id;
+ * frame-level progress is read through getTaskStatus() using the same
+ * `info.percent` / `info.status` contract the file manager's job panel uses.
+ */
+export async function startVideoGeneration(
+  source: string,
+  numFrames: number,
+  fps: number,
+): Promise<GenerateVideoResponse> {
+  const params = new URLSearchParams({
+    source,
+    num_frames: numFrames.toString(),
+    fps: fps.toString(),
+  });
+  const url = `${API_BASE_URL}/api/generate/video?${params.toString()}`;
+  return postGenerate<GenerateVideoResponse>(url, 'Video generation failed');
+}
+
