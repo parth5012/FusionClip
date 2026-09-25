@@ -1,8 +1,10 @@
 """Multimedia generation endpoints (real Gemini & ElevenLabs APIs with mock fallback)."""
 
 import base64
+import io
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -620,4 +622,86 @@ def generate_image(
         scheduler=scheduler,
         db=db,
     )
+
+
+@router.post("/api/generate/video")
+def generate_video(
+    source: str = Query(..., description="Conditioning image file path in catalog/storage"),
+    num_frames: int = Query(14, description="Number of video frames to generate (2..25)"),
+    fps: int = Query(7, description="Framerate of generated video (1..30)"),
+    db: Session = Depends(get_db),
+):
+    """Generate short video from conditioning image via Stable Video Diffusion (SVD) (#102)."""
+    _validate_safe_reference(source, "source")
+
+    if num_frames < 2 or num_frames > 25:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid num_frames: must be between 2 and 25, got {num_frames}",
+        )
+
+    if fps < 1 or fps > 30:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid fps: must be between 1 and 30, got {fps}",
+        )
+
+    from app.storage import download_object
+    source_bytes = download_object(source)
+    if source_bytes is None and os.path.isfile(source):
+        try:
+            with open(source, "rb") as f:
+                source_bytes = f.read()
+        except Exception:
+            pass
+
+    if source_bytes is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source image '{source}' not found or unreadable in storage",
+        )
+
+    from PIL import Image
+    try:
+        probe = Image.open(io.BytesIO(source_bytes))
+        probe.verify()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Source image '{source}' is unreadable or corrupt: {exc}",
+        )
+
+    if is_colab_connected():
+        return dispatch_gen_to_colab(
+            task_type="video_generation",
+            parameters={
+                "op": "image_to_video",
+                "source": source,
+                "num_frames": num_frames,
+                "fps": fps,
+            },
+            db=db,
+            file_extension="mp4",
+            content_type="video/mp4",
+        )
+
+    from app.tasks import process_gpu_task
+    celery_task = process_gpu_task.delay(
+        "svd",
+        {
+            "op": "image_to_video",
+            "source": source,
+            "num_frames": num_frames,
+            "fps": fps,
+        },
+    )
+
+    return {
+        "task_id": celery_task.id,
+        "status": "PENDING",
+        "type": "video",
+        "source": source,
+        "num_frames": num_frames,
+        "fps": fps,
+    }
 

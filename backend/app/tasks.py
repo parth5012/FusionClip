@@ -350,7 +350,7 @@ def process_multimedia_task(self, object_name: str, task_type: str = "transcode"
         return process_media_heavy(object_name, task_type)
 
 
-# Isolated GPU task endpoint (#99)
+# Isolated GPU task endpoint (#99, #102)
 @celery.task(bind=True, name="app.tasks.process_gpu_task")
 def process_gpu_task(self, model_id: str, payload: Optional[dict] = None):
     """Execute a local ML inference task on the isolated media.gpu queue."""
@@ -360,6 +360,101 @@ def process_gpu_task(self, model_id: str, payload: Optional[dict] = None):
 
     from app.ml.contracts import DegradedReason, make_degraded_response
     from app.ml.guard import vram_guard, VRAMRefusalError
+
+    payload = payload or {}
+    op = payload.get("op")
+
+    if op == "image_to_video":
+        from app.ml.video import run_local_image_to_video
+        from app.storage import download_object
+
+        source = payload.get("source")
+        num_frames = payload.get("num_frames", 14)
+        fps = payload.get("fps", 7)
+
+        source_bytes = download_object(source) if source else None
+        if source_bytes is None and source and os.path.isfile(source):
+            try:
+                with open(source, "rb") as f:
+                    source_bytes = f.read()
+            except Exception:
+                pass
+
+        if not source_bytes:
+            raise ValueError(f"Source image '{source}' not found or unreadable in storage")
+
+        def progress_cb(percent: int, status_text: str):
+            # 1. Update Celery state
+            if hasattr(self, "update_state"):
+                self.update_state(
+                    state="PROGRESS",
+                    meta={"percent": int(percent), "status": str(status_text)},
+                )
+
+            # 2. Publish to Redis Pub/Sub
+            update_payload = {
+                "task_id": task_id,
+                "status": "PROCESSING",
+                "progress": int(percent),
+                "error": None,
+            }
+            redis_client.publish("task_updates", json.dumps(update_payload))
+
+            # 3. Upsert Task row in Database
+            db = SessionLocal()
+            try:
+                db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                if db_task:
+                    db_task.status = "PROCESSING"
+                    db_task.progress = int(percent)
+                else:
+                    db_task = Task(
+                        task_id=task_id,
+                        name="image_to_video",
+                        status="PROCESSING",
+                        progress=int(percent),
+                    )
+                    db.add(db_task)
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to update task progress in DB for {task_id}: {e}")
+                db.rollback()
+            finally:
+                db.close()
+
+        db = SessionLocal()
+        try:
+            result = run_local_image_to_video(
+                source=source_bytes,
+                num_frames=num_frames,
+                fps=fps,
+                progress_cb=progress_cb,
+                db=db,
+                source_name=source,
+            )
+            # Final state update in DB
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                if result.get("status") == "COMPLETED":
+                    db_task.status = "COMPLETED"
+                    db_task.progress = 100
+                elif result.get("degraded"):
+                    db_task.status = "COMPLETED"
+                db.commit()
+
+            if result.get("status") == "COMPLETED":
+                redis_client.publish(
+                    "task_updates",
+                    json.dumps({
+                        "task_id": task_id,
+                        "status": "COMPLETED",
+                        "progress": 100,
+                        "error": None,
+                    }),
+                )
+            return result
+        finally:
+            db.close()
 
     try:
         admission = vram_guard.check_vram(model_id)
