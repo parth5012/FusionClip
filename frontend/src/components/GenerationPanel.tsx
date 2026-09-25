@@ -35,6 +35,25 @@ import {
 
 type Modality = 'text' | 'image' | 'tts' | 'sfx' | 'voice' | 'local' | 'video';
 
+// SVD on a 16 GB card runs 25 denoise steps + ffmpeg encode; anything longer
+// than this means the worker is gone rather than busy.
+const VIDEO_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
+function formatTaskFailure(info: unknown): string {
+  if (typeof info === 'string') return info;
+  if (info && typeof info === 'object') {
+    const payload = info as Record<string, unknown>;
+    if (typeof payload.error === 'string') return payload.error;
+    if (typeof payload.message === 'string') return payload.message;
+    try {
+      return JSON.stringify(info);
+    } catch {
+      return 'unknown error';
+    }
+  }
+  return String(info);
+}
+
 export default function GenerationPanel() {
   const { keyStatus, setActiveTab, colabTunnel, setWaveAudio, setGenVideo } = useStore();
   const [activeModality, setActiveModality] = useState<Modality>('text');
@@ -154,8 +173,17 @@ export default function GenerationPanel() {
   useEffect(() => {
     if (!videoTask) return;
     let cancelled = false;
+    // A stalled or absent media.gpu worker must not leave this polling forever.
+    const deadline = Date.now() + VIDEO_POLL_TIMEOUT_MS;
 
     const interval = setInterval(async () => {
+      if (Date.now() > deadline) {
+        clearInterval(interval);
+        setVideoProgress(null);
+        setError('Timed out waiting for the video job. The media.gpu worker may be offline.');
+        return;
+      }
+
       try {
         const status = await getTaskStatus(videoTask.task_id);
         if (cancelled) return;
@@ -168,20 +196,21 @@ export default function GenerationPanel() {
         } else if (status.state === 'SUCCESS') {
           clearInterval(interval);
           const info = (status.info ?? {}) as VideoGenerationResult;
+          // Always record the result first: the degraded card renders from it.
+          setVideoResult(info);
           if (info.degraded) {
             setVideoProgress(null);
             setError(info.message || info.reason || 'Local GPU refused the video job.');
             return;
           }
           setVideoProgress({ percent: 100, statusText: 'Completed' });
-          setVideoResult(info);
           if (info.url) {
-            setGenVideo({ url: info.url, filename: info.filename ?? '' });
+            setGenVideo({ url: info.url, filename: info.filename ?? '', fps: info.fps });
           }
         } else if (status.state === 'FAILURE') {
           clearInterval(interval);
           setVideoProgress(null);
-          setError(`Video generation failed: ${status.info}`);
+          setError(`Video generation failed: ${formatTaskFailure(status.info)}`);
         }
       } catch (err) {
         console.error('Video task polling error:', err);
@@ -203,6 +232,7 @@ export default function GenerationPanel() {
   const getStageStatus = () => {
     if (isGenerating) return 'Status: GENERATING';
     if (activeModality === 'video' && videoProgress && !videoResult) return 'Status: PROCESSING';
+    if (activeModality === 'video' && videoResult?.degraded) return 'Status: DEGRADED (200 OK)';
     if (hasResult) return 'Status: COMPLETED (200 OK)';
     return 'Status: IDLE';
   };
@@ -635,7 +665,11 @@ export default function GenerationPanel() {
                   {/* Audio Result */}
                   {(activeModality === 'tts' || activeModality === 'sfx' || activeModality === 'voice') &&
                     audioResult && (
-                      <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-3">
+                    <div
+                      className={`bg-slate-950 border rounded-lg p-4 space-y-3 ${
+                        videoResult?.degraded ? 'border-amber-900/60' : 'border-slate-800'
+                      }`}
+                    >
                         {audioResult.degraded ? (
                           <div className="space-y-1.5">
                             <div className="flex items-center justify-between text-xs">
@@ -698,7 +732,7 @@ export default function GenerationPanel() {
                           </div>
                         </div>
                       )}
-                      {videoResult?.degraded ? (
+                      {videoResult?.degraded && (
                         <div className="space-y-1.5">
                           <div className="flex items-center justify-between text-xs">
                             <span className="font-bold text-slate-200">Local GPU refused the video job</span>
@@ -706,8 +740,9 @@ export default function GenerationPanel() {
                           </div>
                           <p className="text-[11px] text-slate-400">{videoResult.message}</p>
                         </div>
-                      ) : videoResult ? (
-                        <>
+                      )}
+                      {videoResult && !videoResult.degraded && (
+                        <div className="space-y-2">
                           <div className="flex items-center justify-between text-xs">
                             <span className="font-bold text-slate-200">{videoResult.filename}</span>
                             <span className="text-[10px] font-mono text-slate-500">
@@ -721,8 +756,8 @@ export default function GenerationPanel() {
                               Video uploaded: {videoResult.filename}
                             </div>
                           )}
-                        </>
-                      ) : null}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
