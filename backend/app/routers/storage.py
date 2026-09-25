@@ -5,9 +5,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.deps import get_db
 from app.models import MediaAsset
+from app.services.embedding import get_embedding
 from app.schemas import BatchExportIn, BatchExportOut
 from app.storage import (
     delete_object,
@@ -47,12 +49,14 @@ async def upload_file(
 
     # Record in database
     try:
+        embedding = await run_in_threadpool(get_embedding, file.filename)
         asset = MediaAsset(
             title=file.filename,
             file_path=object_name,
             file_size=len(file_bytes),
             content_type=file.content_type,
             duration=0.0,
+            embedding=embedding,
         )
         db.add(asset)
         db.commit()

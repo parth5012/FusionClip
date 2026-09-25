@@ -1,6 +1,7 @@
 ﻿"""Celery task dispatch, status polling task-update WebSocket feed."""
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional, List
@@ -9,7 +10,7 @@ from typing import Optional, List
 import redis
 import uuid
 from celery.result import AsyncResult
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 from pydantic import BaseModel
@@ -25,12 +26,17 @@ logger = logging.getLogger(__name__)
 redis_client = redis.from_url(settings.REDIS_URL)
 router = APIRouter(tags=["tasks"])
 
+ALLOWED_TASK_TYPES = frozenset(
+    {"transcode", "thumbnail", "waveform", "audio_extract", "upscale", "video_upscale"}
+)
+
 
 @router.post("/api/tasks/process")
 def run_processing_pipeline(
     path: str = Query(..., description="Key of the object to process"),
     task_type: str = Query(
-        "transcode", description="Generation pipeline: transcode, audio_extract, upscale, video_upscale"
+        "transcode",
+        description="Pipeline type: transcode, audio_extract, thumbnail, waveform, upscale, video_upscale",
     ),
     denoise: Optional[float] = Query(
         None, description="Upscale: Denoising Strength (Creativity)"
@@ -46,10 +52,15 @@ def run_processing_pipeline(
         None, description="Upscale: optional img2img positive prompt"
     ),
     temporal_strength: Optional[float] = Query(
-        None, description="video_upscale: motion-aware temporal blend strength 0..1 (0 = off)"
+        None, description="video_upscale: motion-aware temporal blend 0..1 (0 = off)"
     ),
 ):
     """Dispatch long-running celery worker multimedia task processing pipeline."""
+    if task_type not in ALLOWED_TASK_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid task_type '{task_type}'. Allowed types: {sorted(ALLOWED_TASK_TYPES)}",
+        )
     kwargs = {}
     if denoise is not None:
         kwargs["denoise"] = denoise
@@ -203,37 +214,6 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
     finally:
         pubsub.unsubscribe("task_updates")
         pubsub.close()
-
-
-class UpscaleRequest(BaseModel):
-    denoising_strength: float = 0.35
-    controlnet_weight: float = 1.25
-    preset: str = "Portraits"
-    preview: bool = False
-
-
-@router.post("/api/upscale")
-def run_upscale_pipeline(
-    path: str = Query(..., description="Key of the image object to upscale"),
-    request: UpscaleRequest = None,
-    db: Session = Depends(get_db)
-):
-    """Orchestrate upscale task: creates database entry and dispatches Celery task."""
-    task_id = f"upscale_{uuid.uuid4().hex[:8]}"
-
-    # Create database task record
-    db_task = Task(task_id=task_id, name="upscale", status="PROCESSING", progress=0)
-    db.add(db_task)
-    db.commit()
-
-    params = request.dict() if request else {}
-    process_upscale_task.delay(task_id, path, params)
-
-    return {
-        "message": "Upscale task initiated successfully",
-        "task_id": task_id,
-        "status": "PROCESSING",
-    }
 
 
 class TaskListItem(BaseModel):

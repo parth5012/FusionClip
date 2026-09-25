@@ -13,7 +13,7 @@ except ImportError:
         impl = JSON
         cache_ok = True
 
-        def __init__(self, dim=1536):
+        def __init__(self, dim=384):
             super().__init__()
             self.dim = dim
 
@@ -33,7 +33,7 @@ class MediaAsset(Base):
     file_size = Column(Integer, nullable=False)
     content_type = Column(String, nullable=False)
     duration = Column(Float, nullable=True)
-    embedding = Column(Vector(1536), nullable=True)
+    embedding = Column(Vector(384), nullable=True)
     # Optional link to the source asset this one was derived from (e.g. an
     # upscaled output pointing at the original it was generated from).
     # Used by the before/after comparison UI to pair originals with results.

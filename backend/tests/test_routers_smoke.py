@@ -507,7 +507,7 @@ class TestMediaRouter:
         db_session.commit()
         asset_id = asset.id
 
-        mock_embedding = [0.1] * 512
+        mock_embedding = [0.1] * 256
         monkeypatch.setattr(CLIPEmbedder, "embed_image", lambda x: CLIPEmbedder.pad_embedding(mock_embedding))
         monkeypatch.setattr(CLIPEmbedder, "embed_text", lambda x: CLIPEmbedder.pad_embedding(mock_embedding))
 
@@ -515,9 +515,9 @@ class TestMediaRouter:
         
         db_asset = db_session.query(MediaAsset).filter(MediaAsset.id == asset_id).one()
         assert db_asset.embedding is not None
-        assert len(db_asset.embedding) == 1536
+        assert len(db_asset.embedding) == 384
         assert db_asset.embedding[0] == 0.1
-        assert db_asset.embedding[512] == 0.0
+        assert db_asset.embedding[256] == 0.0
 
     def test_search_score_and_threshold(self, client, db_session):
         self._seed(db_session)

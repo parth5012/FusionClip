@@ -8,16 +8,19 @@ export const API_BASE = process.env.E2E_API_URL || 'http://localhost:8000';
 export const FRONTEND_BASE = process.env.E2E_BASE_URL || 'http://localhost:3000';
 export const WS_URL = `ws://localhost:8000/api/ws/tasks`;
 
-/* A minimal valid PNG (1×1 red pixel) used as an upload fixture */
+/* A minimal valid PNG (1×1 red pixel) used as an upload fixture.
+ * Bytes are a PIL-encoded image — earlier hand-rolled bytes had a corrupt
+ * IDAT stream that upload round-trips accepted but any pixel decode
+ * (e.g. the Magnific upscale pipeline) rejected with "broken data stream". */
 const PNG_HEADER = Buffer.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
   0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
   0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
   0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-  0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41,
-  0x54, 0x08, 0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
-  0x00, 0x00, 0x02, 0x00, 0x01, 0xe2, 0x21, 0xbc,
-  0x33, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e,
+  0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, // IDAT chunk
+  0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00,
+  0x00, 0x03, 0x01, 0x01, 0x00, 0xc9, 0xfe, 0x92,
+  0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, // IEND chunk
   0x44, 0xae, 0x42, 0x60, 0x82,
 ]);
 
@@ -159,6 +162,20 @@ export async function apiResetSecrets(): Promise<void> {
   for (const provider of ['gemini', 'elevenlabs']) {
     await fetch(`${API_BASE}/api/settings/secrets/${provider}`, { method: 'DELETE' });
   }
+}
+
+/** Configure the Colab tunnel intent via the backend API (setup/teardown).
+ *  Writes colab_tunnel_url / colab_tunnel_status through POST /api/colab/tunnel. */
+export async function apiConfigureTunnel(
+  url: string,
+  status = 'running',
+): Promise<{ status: string; colab_url: string; colab_status: string }> {
+  const res = await fetch(
+    `${API_BASE}/api/colab/tunnel?url=${encodeURIComponent(url)}&status=${encodeURIComponent(status)}`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`API configure tunnel failed: ${res.status}`);
+  return res.json();
 }
 
 /** Fetch media catalog */

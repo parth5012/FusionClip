@@ -2,11 +2,16 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
 from app.models import MediaAsset
+from app.services.embedding import (
+    backfill_media_embeddings,
+    compute_cosine_distance,
+    get_embedding,
+)
 from app.storage import generate_url
 
 logger = logging.getLogger(__name__)
@@ -15,7 +20,7 @@ router = APIRouter(tags=["media"])
 
 
 def _serialize_asset(asset: MediaAsset, upscaled_children: list = None, score: float = None) -> dict:
-    return {
+    res = {
         "id": asset.id,
         "title": asset.title,
         "file_path": asset.file_path,
@@ -57,6 +62,20 @@ def _serialize_catalog(db, assets) -> list:
     ]
 
 
+def _serialize_search(db, ranked) -> list:
+    """Serialize ranked (asset, score) pairs with upscaled-output children."""
+    if not ranked:
+        return []
+    paths = [asset.file_path for asset, _ in ranked]
+    children: dict = {}
+    for child in db.query(MediaAsset).filter(MediaAsset.source_path.in_(paths)).all():
+        children.setdefault(child.source_path, []).append(child)
+    return [
+        _serialize_asset(asset, children.get(asset.file_path, []), score=score)
+        for asset, score in ranked
+    ]
+
+
 @router.get("/api/media")
 def list_media(db: Session = Depends(get_db)):
     assets = db.query(MediaAsset).all()
@@ -70,62 +89,58 @@ def search_media(
     threshold: float = Query(0.2, description="Minimum relevance score threshold"),
     db: Session = Depends(get_db),
 ):
-    # Vector semantic search with fallback to standard text search
+    """Semantic vector search across media assets with ILIKE text search fallback.
+
+    Uses real 384-dimensional sentence-transformers embeddings (all-MiniLM-L6-v2).
+    On PostgreSQL + pgvector, uses native vector distance ordering.
+    On non-pgvector environments (e.g. SQLite tests), calculates semantic distance in Python.
+    Falls back to case-insensitive title pattern matching (ILIKE) if no embeddings match or vector search fails.
+    """
     try:
-        from app.tasks import CLIPEmbedder
-        query_embedding = CLIPEmbedder.embed_text(query)
+        query_embedding = get_embedding(query)
 
-        cosine_dist = MediaAsset.embedding.cosine_distance(query_embedding)
-        vector_results = (
-            db.query(MediaAsset, cosine_dist.label("dist"))
-            .filter(MediaAsset.embedding != None)
-            .order_by(cosine_dist)
-            .limit(limit * 2)
-            .all()
-        )
+        dialect_name = db.bind.dialect.name if db.bind else ""
+        if dialect_name == "postgresql":
+            cosine_dist = MediaAsset.embedding.cosine_distance(query_embedding)
+            rows = (
+                db.query(MediaAsset, cosine_dist.label("dist"))
+                .filter(MediaAsset.embedding.isnot(None))
+                .order_by(cosine_dist)
+                .limit(limit)
+                .all()
+            )
+            ranked = [(asset, 1.0 - float(dist)) for asset, dist in rows]
+        else:
+            # SQLite / test fallback: calculate distance over assets with embeddings
+            candidates = (
+                db.query(MediaAsset).filter(MediaAsset.embedding.isnot(None)).all()
+            )
+            ranked = sorted(
+                (
+                    (asset, 1.0 - compute_cosine_distance(asset.embedding, query_embedding))
+                    for asset in candidates
+                ),
+                key=lambda pair: pair[1],
+                reverse=True,
+            )[:limit]
 
+        # Always include literal title matches (covers rows not yet backfilled).
         text_matches = (
             db.query(MediaAsset)
             .filter(MediaAsset.title.ilike(f"%{query}%"))
-            .limit(limit * 2)
+            .limit(limit)
             .all()
         )
-
-        candidates = {}
-        for asset, dist in vector_results:
-            sim = 1.0 - float(dist)
-            candidates[asset.id] = {
-                "asset": asset,
-                "semantic_score": sim,
-                "text_score": 0.0
-            }
-
+        merged = {asset.id: (asset, score) for asset, score in ranked}
         for asset in text_matches:
-            if asset.id not in candidates:
-                sim = 0.0
-                if asset.embedding is not None:
-                    sim = 0.5
-                candidates[asset.id] = {
-                    "asset": asset,
-                    "semantic_score": sim,
-                    "text_score": 1.0
-                }
+            if asset.id in merged:
+                prev_asset, prev_score = merged[asset.id]
+                merged[asset.id] = (prev_asset, max(prev_score, 1.0))
             else:
-                candidates[asset.id]["text_score"] = 1.0
-
-        hybrid_results = []
-        for info in candidates.values():
-            score = 0.7 * info["semantic_score"] + 0.3 * info["text_score"]
-            hybrid_results.append((info["asset"], score))
-
-        filtered_results = [
-            (asset, score) for asset, score in hybrid_results
-            if score >= threshold
-        ]
-        filtered_results.sort(key=lambda x: x[1], reverse=True)
-        
-        return [_serialize_asset(asset, score=score) for asset, score in filtered_results[:limit]]
-
+                merged[asset.id] = (asset, 1.0)
+        results = [pair for pair in merged.values() if pair[1] >= threshold]
+        results.sort(key=lambda pair: pair[1], reverse=True)
+        return _serialize_search(db, results[:limit])
     except Exception as db_err:
         logger.warning(f"Vector search failed, falling back to text search: {db_err}")
         db.rollback()
@@ -136,5 +151,23 @@ def search_media(
             .all()
         )
 
-    return _serialize_catalog(db, assets)
+        return _serialize_search(
+            db, [(asset, 1.0) for asset in assets if 1.0 >= threshold]
+        )
 
+
+@router.post("/api/media/backfill-embeddings")
+def backfill_embeddings_endpoint(
+    max_rows: int = 1000, db: Session = Depends(get_db)
+):
+    """Backfill missing 384-dimensional embeddings for MediaAsset rows.
+
+    ``max_rows`` caps how many rows a single request may process so an
+    unauthenticated call cannot synchronously re-embed the whole table.
+    """
+    if max_rows < 1 or max_rows > 10000:
+        raise HTTPException(
+            status_code=400, detail="max_rows must be between 1 and 10000"
+        )
+    count = backfill_media_embeddings(db, max_rows=max_rows)
+    return {"status": "ok", "backfilled": count}

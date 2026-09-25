@@ -5,9 +5,11 @@ import redis
 import json
 import asyncio
 import time
+import secrets
+from typing import Optional
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
@@ -144,8 +146,8 @@ class ColabTaskUpdate(BaseModel):
     task_id: str
     status: str
     progress: int
-    output: dict = None
-    error: str = None
+    output: Optional[dict] = None
+    error: Optional[str] = None
 
 class ColabMetrics(BaseModel):
     vram_used: float
@@ -153,12 +155,26 @@ class ColabMetrics(BaseModel):
     ram_used: float
     ram_total: float
     cpu_load: float
-    active_task: str = None
+    active_task: Optional[str] = None
+
+
+def verify_colab_token(token: Optional[str] = None, authorization: Optional[str] = None) -> bool:
+    candidate = token
+    if not candidate and authorization:
+        if authorization.startswith("Bearer "):
+            candidate = authorization[7:]
+        else:
+            candidate = authorization
+    expected = settings.FUSIONCLIP_SECRET_KEY
+    if not candidate or not expected:
+        return False
+    return secrets.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
 
 @router.websocket("/api/ws/colab")
 async def websocket_colab_endpoint(websocket: WebSocket, token: str = Query(None), db: Session = Depends(get_db)):
     # Validate authorization token
-    if token != settings.FUSIONCLIP_SECRET_KEY:
+    if not verify_colab_token(token=token):
         await websocket.close(code=4003) # Forbidden
         logger.warning("Unauthenticated Colab connection attempt rejected")
         return
@@ -251,7 +267,7 @@ async def websocket_colab_endpoint(websocket: WebSocket, token: str = Query(None
                     db_task.progress = 100
                     db.commit()
 
-                redis_client.set(f"colab_task_result:{task_id}", json.dumps({"status": "SUCCESS", "output": output}))
+                redis_client.set(f"colab_task_result:{task_id}", json.dumps({"status": "SUCCESS", "output": output}), ex=3600)
                 
                 update_payload = {
                     "task_id": task_id,
@@ -268,10 +284,11 @@ async def websocket_colab_endpoint(websocket: WebSocket, token: str = Query(None
                 db_task = db.query(Task).filter(Task.task_id == task_id).first()
                 if db_task:
                     db_task.status = "FAILED"
+                    db_task.progress = 0
                     db_task.error = error_msg
                     db.commit()
 
-                redis_client.set(f"colab_task_result:{task_id}", json.dumps({"status": "FAILURE", "error": error_msg}))
+                redis_client.set(f"colab_task_result:{task_id}", json.dumps({"status": "FAILURE", "error": error_msg}), ex=3600)
 
                 update_payload = {
                     "task_id": task_id,
@@ -294,8 +311,11 @@ async def websocket_colab_endpoint(websocket: WebSocket, token: str = Query(None
         redis_client.set("colab:connected", "false")
 
 @router.get("/api/colab/tasks/pending")
-def colab_get_pending_tasks(token: str = Query(None)):
-    if token != settings.FUSIONCLIP_SECRET_KEY:
+def colab_get_pending_tasks(
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None)
+):
+    if not verify_colab_token(token=token, authorization=authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
     
     task_data = redis_client.lpop("colab_pending_tasks_http")
@@ -306,35 +326,45 @@ def colab_get_pending_tasks(token: str = Query(None)):
     return {"task": None}
 
 @router.post("/api/colab/tasks/update")
-def colab_update_task_http(payload: ColabTaskUpdate, token: str = Query(None), db: Session = Depends(get_db)):
-    if token != settings.FUSIONCLIP_SECRET_KEY:
+def colab_update_task_http(
+    payload: ColabTaskUpdate,
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    if not verify_colab_token(token=token, authorization=authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
     
     db_task = db.query(Task).filter(Task.task_id == payload.task_id).first()
     if db_task:
         db_task.status = payload.status
-        db_task.progress = payload.progress
+        db_task.progress = 0 if payload.status == "FAILED" else payload.progress
         if payload.error:
             db_task.error = payload.error
         db.commit()
     
     if payload.status == "COMPLETED":
-        redis_client.set(f"colab_task_result:{payload.task_id}", json.dumps({"status": "SUCCESS", "output": payload.output or {}}))
+        redis_client.set(f"colab_task_result:{payload.task_id}", json.dumps({"status": "SUCCESS", "output": payload.output or {}}), ex=3600)
     elif payload.status == "FAILED":
-        redis_client.set(f"colab_task_result:{payload.task_id}", json.dumps({"status": "FAILURE", "error": payload.error or "Unknown error"}))
+        redis_client.set(f"colab_task_result:{payload.task_id}", json.dumps({"status": "FAILURE", "error": payload.error or "Unknown error"}), ex=3600)
 
     update_payload = {
         "task_id": payload.task_id,
         "status": payload.status,
-        "progress": payload.progress,
+        "progress": 0 if payload.status == "FAILED" else payload.progress,
         "error": payload.error
     }
     redis_client.publish("task_updates", json.dumps(update_payload))
     return {"status": "SUCCESS"}
 
 @router.post("/api/colab/metrics")
-def colab_update_metrics_http(payload: ColabMetrics, token: str = Query(None), db: Session = Depends(get_db)):
-    if token != settings.FUSIONCLIP_SECRET_KEY:
+def colab_update_metrics_http(
+    payload: ColabMetrics,
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    if not verify_colab_token(token=token, authorization=authorization):
         raise HTTPException(status_code=401, detail="Unauthorized")
     
     metrics = {

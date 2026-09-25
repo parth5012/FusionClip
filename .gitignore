@@ -21,6 +21,7 @@ coverage.xml
 
 # Node environment
 node_modules/
+frontend/node_modules
 .npm
 npm-debug.log*
 yarn-debug.log*

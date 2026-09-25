@@ -1,16 +1,21 @@
-"""Google Gemini integration built on the ``google-genai`` SDK.
+"""Google Gemini integration.
 
-All outbound calls live here so routers and Celery tasks can resolve a key via
-the encrypted secret store and hand it straight to these helpers. The SDK is
-never imported by callers, which keeps offline tests able to monkeypatch a
-single module (``app.services.gemini``) instead of the whole SDK surface.
+Text generation goes through the raw generateContent REST endpoint (httpx);
+Imagen/Veo/Files analysis use the ``google-genai`` SDK. All outbound calls
+live here so routers and Celery tasks can resolve a key via the encrypted
+secret store and hand it straight to these helpers. Neither the SDK nor httpx
+is ever imported by callers, which keeps offline tests able to monkeypatch a
+single module (``app.services.gemini``) or ``httpx.post`` instead of the whole
+SDK surface.
 """
 
 import io
 import logging
 import time
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
+import httpx
+from fastapi import HTTPException
 from google import genai
 from google.genai import types
 
@@ -33,11 +38,83 @@ def build_client(api_key: str) -> genai.Client:
     return genai.Client(api_key=api_key)
 
 
+def call_gemini_generate_content(
+    api_key: str,
+    model: str,
+    contents: list,
+    generation_config: Optional[dict] = None,
+) -> dict:
+    """Call the Gemini generateContent REST endpoint with error status mapping."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {
+        "x-goog-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+    payload: Dict[str, Any] = {"contents": contents}
+    if generation_config:
+        payload["generationConfig"] = generation_config
+
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+    except Exception as exc:
+        logger.error(f"Gemini request failed: {exc}")
+        raise HTTPException(
+            status_code=502, detail="Failed to connect to Google Gemini API"
+        ) from exc
+
+    if resp.status_code == 200:
+        return resp.json()
+
+    err_body = {}
+    try:
+        err_body = resp.json()
+    except Exception:
+        pass
+
+    if isinstance(err_body, dict):
+        err_msg = err_body.get("error", {}).get("message", resp.text)
+    else:
+        err_msg = str(err_body)
+
+    if resp.status_code == 401:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Gemini authentication failed: invalid or expired API key. "
+                "Note standard keys were deprecated September 2026."
+            ),
+        )
+    elif resp.status_code == 429:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Gemini rate limit or quota exceeded (RESOURCE_EXHAUSTED): {err_msg}",
+        )
+    elif resp.status_code in (400, 403, 404):
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Gemini API error ({resp.status_code}): {err_msg}",
+        )
+    else:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini service error ({resp.status_code}): {err_msg}",
+        )
+
+
 def generate_text(api_key: str, prompt: str, model: str = TEXT_MODEL) -> str:
-    """Generate text content from a prompt using a Gemini chat model."""
-    client = build_client(api_key)
-    response = client.models.generate_content(model=model, contents=prompt)
-    return response.text or ""
+    """Generate text content from a prompt using Gemini (REST generateContent)."""
+    data = call_gemini_generate_content(
+        api_key,
+        model,
+        contents=[{"role": "user", "parts": [{"text": prompt}]}],
+    )
+    candidates = data.get("candidates", [])
+    if not candidates or not candidates[0].get("content"):
+        raise HTTPException(
+            status_code=502, detail="Gemini returned an empty candidate list"
+        )
+    parts = candidates[0]["content"].get("parts", [])
+    return "".join(part.get("text", "") for part in parts)
 
 
 def _upload_media(client: genai.Client, data: bytes, mime_type: str, display_name: str):

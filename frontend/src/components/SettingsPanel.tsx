@@ -1,8 +1,8 @@
 'use client';
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useStore } from '../store/useStore';
-import { deleteSecret, fetchSecretStatus, saveSecrets, SaveSecretsPayload } from '../utils/api';
+import { deleteSecret, fetchSecretStatus, saveSecrets, SaveSecretsPayload, configureColabTunnel, fetchColabTunnelState } from '../utils/api';
 import {
   Key,
   Shield,
@@ -32,6 +32,11 @@ export default function SettingsPanel() {
   const [savedTunnel, setSavedTunnel] = useState(false);
   const [keyError, setKeyError] = useState<string | null>(null);
   const [savingKeys, setSavingKeys] = useState(false);
+  const [tunnelError, setTunnelError] = useState<string | null>(null);
+  const [savingTunnel, setSavingTunnel] = useState(false);
+  const [togglingTunnel, setTogglingTunnel] = useState(false);
+  // Don't clobber text the user typed while the backend load was in flight.
+  const tunnelTouched = useRef(false);
 
   const refreshKeyStatus = useCallback(async () => {
     try {
@@ -41,9 +46,24 @@ export default function SettingsPanel() {
     }
   }, [setKeyStatus]);
 
+  // Tunnel URL + connection intent are server state (colab_tunnel_url /
+  // colab_tunnel_status), resolved against the metrics 10s-staleness rule.
+  const refreshTunnelState = useCallback(async () => {
+    try {
+      const state = await fetchColabTunnelState();
+      setColabTunnel({ endpointUrl: state.url, status: state.status });
+      if (!tunnelTouched.current) {
+        setTunnelUrlInput(state.url);
+      }
+    } catch {
+      /* backend unreachable — leave the default disconnected state */
+    }
+  }, [setColabTunnel]);
+
   useEffect(() => {
     refreshKeyStatus();
-  }, [refreshKeyStatus]);
+    refreshTunnelState();
+  }, [refreshKeyStatus, refreshTunnelState]);
 
   const saveApiKeys = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -86,18 +106,40 @@ export default function SettingsPanel() {
     }
   };
 
-  const saveTunnelSettings = (e: React.FormEvent) => {
+  const saveTunnelSettings = async (e: React.FormEvent) => {
     e.preventDefault();
-    setColabTunnel({
-      endpointUrl: tunnelUrlInput,
-    });
-    setSavedTunnel(true);
-    setTimeout(() => setSavedTunnel(false), 3000);
+    setTunnelError(null);
+    setSavingTunnel(true);
+    try {
+      // Persist the endpoint URL, keeping the current connection intent.
+      const saved = await configureColabTunnel(tunnelUrlInput.trim(), colabTunnel.status);
+      setColabTunnel({ endpointUrl: saved.url, status: saved.status });
+      tunnelTouched.current = false;
+      setTunnelUrlInput(saved.url);
+      setSavedTunnel(true);
+      setTimeout(() => setSavedTunnel(false), 3000);
+    } catch {
+      setTunnelError('Failed to save tunnel endpoint. Check that the backend is reachable.');
+    } finally {
+      setSavingTunnel(false);
+    }
   };
 
-  const toggleTunnelState = () => {
+  const toggleTunnelState = async () => {
     const nextStatus = colabTunnel.status === 'running' ? 'disconnected' : 'running';
-    setColabTunnel({ status: nextStatus });
+    setTunnelError(null);
+    setTogglingTunnel(true);
+    try {
+      const saved = await configureColabTunnel(colabTunnel.endpointUrl, nextStatus);
+      setColabTunnel({ endpointUrl: saved.url, status: saved.status });
+      if (!tunnelTouched.current) {
+        setTunnelUrlInput(saved.url);
+      }
+    } catch {
+      setTunnelError('Failed to update tunnel connection state. Check that the backend is reachable.');
+    } finally {
+      setTogglingTunnel(false);
+    }
   };
 
   return (
@@ -292,7 +334,8 @@ export default function SettingsPanel() {
                 <button
                   type="button"
                   onClick={toggleTunnelState}
-                  className={`px-3 py-1.5 text-xs font-semibold rounded-md border shadow-sm transition active:scale-[98%] ${
+                  disabled={savingTunnel || togglingTunnel}
+                  className={`px-3 py-1.5 text-xs font-semibold rounded-md border shadow-sm transition active:scale-[98%] disabled:opacity-50 disabled:cursor-not-allowed ${
                     colabTunnel.status === 'running'
                       ? 'bg-rose-950/45 border-rose-800 text-rose-300 hover:bg-rose-900/60'
                       : 'bg-emerald-950/45 border-emerald-800 text-emerald-300 hover:bg-emerald-900/60'
@@ -301,6 +344,12 @@ export default function SettingsPanel() {
                   {colabTunnel.status === 'running' ? 'Disconnect' : 'Connect'}
                 </button>
               </div>
+
+              {tunnelError && (
+                <p className="text-xs text-rose-400 bg-rose-950/30 border border-rose-900/50 rounded-md px-3 py-2">
+                  {tunnelError}
+                </p>
+              )}
 
               {/* Endpoint form */}
               <form onSubmit={saveTunnelSettings} className="space-y-4">
@@ -312,7 +361,10 @@ export default function SettingsPanel() {
                     type="url"
                     placeholder="https://xxxx-your-tunnel-endpoint.trycloudflare.com"
                     value={tunnelUrlInput}
-                    onChange={(e) => setTunnelUrlInput(e.target.value)}
+                    onChange={(e) => {
+                      tunnelTouched.current = true;
+                      setTunnelUrlInput(e.target.value);
+                    }}
                     className="bg-slate-950 border border-slate-700 rounded-md w-full px-3 py-2 text-sm text-slate-105 placeholder-slate-650 focus:outline-none focus:ring-1 focus:ring-sky-500 focus:border-sky-500 font-mono"
                   />
                   <span className="text-[10px] text-slate-550 mt-1 block">
@@ -323,9 +375,10 @@ export default function SettingsPanel() {
                 <div className="pt-2 flex items-center justify-between">
                   <button
                     type="submit"
-                    className="bg-sky-600 hover:bg-sky-500 text-white font-semibold text-sm px-4 py-2 rounded-md shadow-sm transition active:scale-[98%]"
+                    disabled={savingTunnel || togglingTunnel}
+                    className="bg-sky-600 hover:bg-sky-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold text-sm px-4 py-2 rounded-md shadow-sm transition active:scale-[98%]"
                   >
-                    Save Endpoint
+                    {savingTunnel ? 'Saving…' : 'Save Endpoint'}
                   </button>
 
                   {savedTunnel && (

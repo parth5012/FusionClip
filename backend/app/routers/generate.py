@@ -3,11 +3,13 @@ Flux/SDXL/XTTS/ChatTTS/MusicGen pipelines + Colab dispatch, mock fallback)."""
 
 """Multimedia generation endpoints (real Gemini, Colab dispatch, mock fallback)."""
 
+import base64
 import logging
 import time
 import redis
 import json
 import uuid
+import httpx
 import mimetypes
 
 from typing import List, Optional
@@ -30,6 +32,7 @@ from app.tasks import parse_duration
 from app.services import secrets as secret_store
 from app.services import elevenlabs as elevenlabs_service
 from app.services import gemini as gemini_service
+from app.services.embedding import get_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +48,7 @@ ELEVENLABS_KEY_HEADER = "X-ElevenLabs-Key"
 import io
 import os
 from typing import Optional
-import torch
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
-from diffusers import FluxPipeline, StableDiffusionXLPipeline
-from diffusers.schedulers import EulerDiscreteScheduler
 from PIL import Image
 from app.models import MediaAsset, Task
 
@@ -102,6 +102,7 @@ def _save_asset(db: Session, title: str, filename: str, content_type: str, size:
             file_size=size,
             content_type=content_type,
             duration=duration,
+            embedding=get_embedding(title),
         )
         db.add(asset)
         db.commit()
@@ -222,6 +223,8 @@ def generate_text(
 
     try:
         text = gemini_service.generate_text(api_key, prompt)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Gemini text generation failed: {e}")
         raise HTTPException(status_code=502, detail=f"Gemini text generation failed: {e}")
@@ -399,18 +402,28 @@ def generate_audio(
     api_key = _resolve_elevenlabs_key(db, request)
     if api_key:
         try:
-            audio = elevenlabs_service.synthesize(
-                api_key,
-                prompt,
-                voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
-                stability=stability,
-                clarity=clarity,
-            )
+            if type == "sfx":
+                audio = elevenlabs_service.generate_sound_effect(
+                    api_key,
+                    text=prompt,
+                    duration_seconds=None,
+                )
+                filename = f"eleven_sfx_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
+            else:
+                audio = elevenlabs_service.synthesize(
+                    api_key,
+                    prompt,
+                    voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
+                    stability=stability,
+                    clarity=clarity,
+                )
+                filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"ElevenLabs audio synthesis failed: {e}")
             raise HTTPException(status_code=502, detail=f"ElevenLabs audio synthesis failed: {e}")
 
-        filename = f"gen_audio_{int(time.time())}.mp3"
         upload_success = upload_object(audio, filename, content_type="audio/mpeg")
         _save_asset(
             db,
@@ -798,6 +811,7 @@ def clone_elevenlabs_voice(
 
 @router.post("/api/generate/image")
 def generate_image(
+    request: Request,
     prompt: str = Query(...),
     steps: int = Query(28),
     scale: float = Query(7.5),
@@ -821,6 +835,64 @@ def generate_image(
             file_extension="png",
             content_type="image/png"
         )
+
+    gemini_key = _resolve_gemini_key(db, request)
+    if gemini_key:
+        try:
+            data = gemini_service.call_gemini_generate_content(
+                api_key=gemini_key,
+                model="gemini-3.1-flash-image",
+                contents=[{"role": "user", "parts": [{"text": prompt}]}],
+                generation_config={"responseModalities": ["IMAGE"]},
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Gemini image generation failed: {e}")
+            raise HTTPException(status_code=502, detail=f"Gemini image generation failed: {e}")
+
+        candidates = data.get("candidates", [])
+        if not candidates or not candidates[0].get("content"):
+            raise HTTPException(
+                status_code=502, detail="Gemini returned an empty candidate list"
+            )
+        parts = candidates[0]["content"].get("parts", [])
+        img_bytes = None
+        for part in parts:
+            inline_data = part.get("inlineData") or part.get("inline_data")
+            if inline_data and "data" in inline_data:
+                img_bytes = base64.b64decode(inline_data["data"])
+                break
+        if not img_bytes:
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini did not return image data in candidate parts",
+            )
+
+        filename = f"gemini_img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+        upload_success = upload_object(img_bytes, filename, content_type="image/png")
+        if upload_success:
+            try:
+                title = f"Gemini Image: {prompt[:30]}..."
+                asset = MediaAsset(
+                    title=title,
+                    file_path=filename,
+                    file_size=len(img_bytes),
+                    content_type="image/png",
+                    duration=0.0,
+                    embedding=get_embedding(prompt or title),
+                )
+                db.add(asset)
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to save generated image asset: {e}")
+                db.rollback()
+        return {
+            "status": "COMPLETED",
+            "parameters": {"steps": steps, "scale": scale},
+            "filename": filename,
+            "url": generate_url(filename) if upload_success else "",
+        }
 
     try:
         # Load pipeline
@@ -862,7 +934,8 @@ def generate_image(
             file_path=filename,
             file_size=len(img_byte_arr),
             content_type="image/png",
-            duration=0.0
+            duration=0.0,
+            embedding=get_embedding(prompt or title),
         )
         db.add(asset)
         db.commit()
@@ -875,9 +948,41 @@ def generate_image(
             "colab": False
         }
     except Exception as e:
-        logger.error(f"Failed to generate image: {e}")
-        raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
+        logger.warning(f"Local image generation unavailable, falling back to mock: {e}")
 
+    filename = f"gen_image_{int(time.time())}.png"
+    content = b"Mock local flux generated image bytes."
+    upload_success = upload_object(content, filename, content_type="image/png")
+    try:
+        title = f"Flux Generated: {prompt[:30]}..."
+        asset = MediaAsset(
+            title=title,
+            file_path=filename,
+            file_size=len(content),
+            content_type="image/png",
+            duration=0.0,
+            embedding=get_embedding(prompt or title),
+        )
+        db.add(asset)
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to save generated image asset: {e}")
+        db.rollback()
+    return {
+        "status": "COMPLETED",
+        "parameters": {"steps": steps, "scale": scale, "use_flux": use_flux},
+        "filename": filename,
+        "url": generate_url(filename) if upload_success else "",
+        "colab": False
+    }
+
+
+
+flux_pipeline = None
+sdxl_pipeline = None
+xtts_pipeline = None
+chattts_pipeline = None
+musicgen_pipeline = None
 
 
 def load_flux_pipeline():
@@ -885,6 +990,8 @@ def load_flux_pipeline():
     global flux_pipeline
     if flux_pipeline is None:
         try:
+            import torch
+            from diffusers import FluxPipeline
             flux_pipeline = FluxPipeline.from_pretrained(
                 "black-forest-labs/FLUX.1-schnell",
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
@@ -902,6 +1009,8 @@ def load_sdxl_pipeline():
     global sdxl_pipeline
     if sdxl_pipeline is None:
         try:
+            import torch
+            from diffusers import StableDiffusionXLPipeline
             sdxl_pipeline = StableDiffusionXLPipeline.from_pretrained(
                 "stabilityai/stable-diffusion-xl-base-1.0",
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
@@ -921,6 +1030,7 @@ def load_xtts_pipeline():
     global xtts_pipeline
     if xtts_pipeline is None:
         try:
+            import torch
             from TTS.api import TTS
             xtts_pipeline = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=torch.cuda.is_available())
         except Exception as e:
@@ -948,6 +1058,7 @@ def load_musicgen_pipeline():
     global musicgen_pipeline
     if musicgen_pipeline is None:
         try:
+            import torch
             from transformers import MusicgenForConditionalGeneration, AutoProcessor
             musicgen_pipeline = MusicgenForConditionalGeneration.from_pretrained(
                 "facebook/musicgen-small",
@@ -991,6 +1102,7 @@ def generate_music(
         )
 
     try:
+        import torch
         # Build full prompt combining all parameters
         full_prompt = f"{prompt}. Genre: {genre}. Style: {style}. Tempo: {tempo} BPM. Instruments: {instrumentation}."
 

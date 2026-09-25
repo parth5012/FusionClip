@@ -10,6 +10,7 @@ import UpscalerPanel from '../components/UpscalerPanel';
 import SettingsPanel from '../components/SettingsPanel';
 import PlayersPanel from '../components/PlayersPanel';
 import MonitorPanel from '../components/MonitorPanel';
+import UpscalePanel from '../components/UpscalePanel';
 import QueueDashboard from '../components/QueueDashboard';
 import { useStore } from '../store/useStore';
 
@@ -34,6 +35,8 @@ export default function Home() {
         return <CatalogPanel />;
       case 'generation':
         return <GenerationPanel />;
+      case 'upscale':
+        return <UpscalePanel />;
       case 'upscaler':
         return <UpscalerPanel />;
       case 'players':

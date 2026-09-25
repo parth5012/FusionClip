@@ -1,15 +1,20 @@
-"""ElevenLabs integration built on the ``elevenlabs`` SDK.
+"""ElevenLabs integration.
 
-All outbound calls live here so routers and Celery tasks can resolve a key via
-the encrypted secret store and hand it straight to these helpers. The SDK is
-never imported by callers, which keeps offline tests able to monkeypatch a
-single module (``app.services.elevenlabs``) instead of the whole SDK surface.
+Speech synthesis and sound effects go through the raw ElevenLabs REST
+endpoints (httpx); voice cloning/listing use the ``elevenlabs`` SDK. All
+outbound calls live here so routers and Celery tasks can resolve a key via
+the encrypted secret store and hand it straight to these helpers. Neither the
+SDK nor httpx is ever imported by callers, which keeps offline tests able to
+monkeypatch a single module (``app.services.elevenlabs``) or ``httpx.post``
+instead of the whole SDK surface.
 """
 
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, NoReturn, Optional
 
+import httpx
+from fastapi import HTTPException
 from elevenlabs import ElevenLabs, VoiceSettings
 
 logger = logging.getLogger(__name__)
@@ -35,27 +40,44 @@ def synthesize(
     clarity: float = 0.75,
     model: str = DEFAULT_MODEL,
 ) -> bytes:
-    """Synthesize speech and return raw audio bytes.
+    """Synthesize speech and return raw audio bytes (REST text-to-speech).
 
-    ``clarity`` maps to the SDK's ``similarity_boost`` voice setting (its former
-    name in older SDK versions); it controls how closely the output matches the
-    selected voice. Higher ``stability`` produces flatter, more monotone speech.
+    ``clarity`` maps to the API's ``similarity_boost`` voice setting (its
+    former name in older SDK versions); it controls how closely the output
+    matches the selected voice. Higher ``stability`` produces flatter, more
+    monotone speech.
     """
-    client = build_client(api_key)
-    voice_settings = VoiceSettings(
-        stability=stability,
-        similarity_boost=clarity,
-        style=0.0,
-        use_speaker_boost=True,
+    url = (
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+        f"?output_format={DEFAULT_OUTPUT_FORMAT}"
     )
-    stream = client.text_to_speech.convert(
-        voice_id=voice_id,
-        output_format=DEFAULT_OUTPUT_FORMAT,
-        text=text,
-        model_id=model,
-        voice_settings=voice_settings,
-    )
-    return b"".join(stream)
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+    payload: Dict = {
+        "text": text,
+        "model_id": model,
+        "voice_settings": {
+            "stability": stability,
+            "similarity_boost": clarity,
+            "style": 0.0,
+            "use_speaker_boost": True,
+        },
+    }
+
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+    except Exception as exc:
+        logger.error(f"ElevenLabs TTS request failed: {exc}")
+        raise HTTPException(
+            status_code=502, detail="Failed to connect to ElevenLabs API"
+        ) from exc
+
+    if resp.status_code == 200:
+        return resp.content
+
+    _handle_elevenlabs_error(resp)
 
 
 def clone_voice(
@@ -98,10 +120,64 @@ def generate_sound_effect(
     text: str,
     duration_seconds: Optional[float] = None,
 ) -> bytes:
-    """Generate a sound effect from a text prompt and return raw audio bytes."""
-    client = build_client(api_key)
-    response = client.text_to_sound_effects.convert(
-        text=text,
-        duration_seconds=duration_seconds,
-    )
-    return b"".join(response)
+    """Generate a sound effect from a text prompt and return raw audio bytes (REST)."""
+    url = f"https://api.elevenlabs.io/v1/sound-generation?output_format={DEFAULT_OUTPUT_FORMAT}"
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+    payload: Dict = {
+        "text": text,
+        "model_id": "eleven_text_to_sound_v2",
+    }
+    if duration_seconds is not None:
+        payload["duration_seconds"] = duration_seconds
+
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+    except Exception as exc:
+        logger.error(f"ElevenLabs sound-generation request failed: {exc}")
+        raise HTTPException(
+            status_code=502, detail="Failed to connect to ElevenLabs API"
+        ) from exc
+
+    if resp.status_code == 200:
+        return resp.content
+
+    _handle_elevenlabs_error(resp)
+
+
+def _handle_elevenlabs_error(resp: httpx.Response) -> NoReturn:
+    """Map an ElevenLabs REST error response onto an HTTPException."""
+    err_body = {}
+    try:
+        err_body = resp.json()
+    except Exception:
+        pass
+
+    detail_obj = err_body.get("detail", {}) if isinstance(err_body, dict) else {}
+    if isinstance(detail_obj, dict):
+        err_msg = detail_obj.get("message", resp.text)
+    else:
+        err_msg = str(detail_obj or resp.text)
+
+    if resp.status_code == 401:
+        raise HTTPException(
+            status_code=401,
+            detail=f"ElevenLabs authentication failed: invalid API key. {err_msg}",
+        )
+    elif resp.status_code == 429:
+        raise HTTPException(
+            status_code=429,
+            detail=f"ElevenLabs concurrency or quota limit exceeded: {err_msg}",
+        )
+    elif resp.status_code in (400, 422):
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"ElevenLabs error ({resp.status_code}): {err_msg}",
+        )
+    else:
+        raise HTTPException(
+            status_code=502,
+            detail=f"ElevenLabs service error ({resp.status_code}): {err_msg}",
+        )

@@ -135,6 +135,28 @@ test.describe('Generation & Catalog', () => {
     await expect(page.getByText('Flux', { exact: false }).or(page.getByText('SDXL', { exact: false }))).toBeVisible();
   });
 
+  test('generation panel UI triggers text generation and renders completion with library link', async ({ page }) => {
+    await page.goto('/');
+    await navigateToTab(page, 'Generative AI');
+
+    // Ensure prompt textarea is visible
+    const promptInput = page.locator('textarea').first();
+    await expect(promptInput).toBeVisible({ timeout: 10000 });
+    await promptInput.fill('A cyberpunk city in rainfall');
+
+    // Click Trigger Generation
+    const generateBtn = page.getByRole('button', { name: /Trigger Generation/i });
+    await expect(generateBtn).toBeVisible();
+    await generateBtn.click();
+
+    // Verify completion message appears
+    await expect(page.getByText('Generation completed successfully', { exact: false })).toBeVisible({ timeout: 15000 });
+
+    // Verify S3 library action button is present
+    const libraryBtn = page.getByRole('button', { name: /View in S3 Library/i });
+    await expect(libraryBtn).toBeVisible();
+  });
+
   test('catalog panel UI loads and shows search interface', async ({ page }) => {
     await page.goto('/');
     await navigateToTab(page, 'Catalog Search');

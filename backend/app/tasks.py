@@ -1,4 +1,5 @@
 ﻿import time
+import os
 import subprocess
 import traceback
 import sys
@@ -1018,7 +1019,7 @@ class CLIPEmbedder:
         return cls.pad_embedding(emb)
 
     @classmethod
-    def pad_embedding(cls, emb: list[float], target_dim: int = 1536) -> list[float]:
+    def pad_embedding(cls, emb: list[float], target_dim: int = 384) -> list[float]:
         if len(emb) < target_dim:
             emb = emb + [0.0] * (target_dim - len(emb))
         return emb[:target_dim]

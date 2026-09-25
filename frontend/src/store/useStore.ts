@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-export type TabType = 'library' | 'catalog' | 'generation' | 'upscaler' | 'players' | 'settings' | 'tunnels' | 'monitor' | "queue";
+export type TabType = 'library' | 'catalog' | 'generation' | 'upscale' | 'upscaler' | 'players' | 'settings' | 'tunnels' | 'monitor' | 'queue';
 
 export interface ProviderKeyStatus {
   configured: boolean;
@@ -113,19 +113,29 @@ export const useStore = create<AppState>()(
       // that no API key material — not even a redacted last4 — is written to
       // localStorage. API keys themselves live only in the encrypted
       // server-side store and are never held in client state at all.
+      // colabTunnel is likewise excluded (#79): tunnel URL + connection state
+      // are live server state (GET /api/settings + GET /api/colab/metrics).
+      // Caching a "running" flag in localStorage is what let the header badge
+      // claim Connected while the backend reported disconnected.
       partialize: (state) => ({
         activeTab: state.activeTab,
-        colabTunnel: state.colabTunnel,
         sidebarOpen: state.sidebarOpen,
       }),
       // Migration: strip any apiKeys leaked by pre-WS-1 versions. Without this,
       // partialize only filters *writes* — existing users' plaintext keys stay
       // on disk and are scrubbed only as an incidental side effect of the next
       // state mutation (which never fires when the backend is unreachable).
-      version: 1,
+      // v2 additionally drops the cached colabTunnel slice (#79): the tunnel
+      // badge must reflect the backend on every load, never stale storage.
+      version: 2,
       migrate: (persistedState: any, _version: number) => {
-        if (persistedState && 'apiKeys' in persistedState) {
+        if (!persistedState) return persistedState;
+        if ('apiKeys' in persistedState) {
           const { apiKeys, ...clean } = persistedState;
+          persistedState = clean;
+        }
+        if ('colabTunnel' in persistedState) {
+          const { colabTunnel, ...clean } = persistedState;
           return clean;
         }
         return persistedState;

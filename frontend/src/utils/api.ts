@@ -1,4 +1,10 @@
-﻿const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+import {
+  normalizeSettingsStatus,
+  resolveTunnelStatus,
+} from './tunnel';
+import type { TunnelStatus } from './tunnel';
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 export interface StorageItem {
   name: string;
@@ -143,27 +149,6 @@ export async function startTask(
 
   if (!res.ok) {
     throw new Error(`Failed to start task: ${taskType}`);
-  }
-  return res.json();
-}
-
-export async function startUpscale(
-  path: string,
-  params: {
-    denoising_strength: number;
-    controlnet_weight: number;
-    preset: string;
-    preview: boolean;
-  }
-): Promise<TaskResponse> {
-  const url = `${API_BASE_URL}/api/upscale?path=${encodeURIComponent(path)}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(params),
-  });
-  if (!res.ok) {
-    throw new Error('Failed to start upscale task');
   }
   return res.json();
 }
@@ -369,10 +354,237 @@ export async function fetchColabMetrics(): Promise<ColabMetricsResponse> {
   return res.json();
 }
 
+/* ── Colab Tunnel (backend-backed, #79) ──────────────────────────────────
+ * The tunnel endpoint URL and connection intent live in the server-side
+ * settings store (keys `colab_tunnel_url` / `colab_tunnel_status`) and are
+ * written via POST /api/colab/tunnel. The *effective* status additionally
+ * honours the GET /api/colab/metrics 10s-staleness rule: a tunnel whose
+ * notebook stopped reporting is shown as disconnected even if the stored
+ * intent is still "running". Nothing here reads localStorage.
+ * ------------------------------------------------------------------------ */
+
+export type { TunnelStatus };
+
+export interface TunnelSettings {
+  url: string;
+  status: TunnelStatus;
+}
+
+export interface ColabTunnelState extends TunnelSettings {
+  /** Raw liveness from GET /api/colab/metrics (fresh notebook report?). */
+  metricsConnected: boolean;
+}
+
+/** Read the persisted tunnel URL + intent from GET /api/settings. */
+export async function fetchTunnelSettings(): Promise<TunnelSettings> {
+  const res = await fetch(`${API_BASE_URL}/api/settings`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch tunnel settings');
+  }
+  const body = await res.json();
+  return {
+    url: typeof body?.colab_tunnel_url === 'string' ? body.colab_tunnel_url : '',
+    status: normalizeSettingsStatus(body?.colab_tunnel_status),
+  };
+}
+
+/** Persist the tunnel URL + intent via POST /api/colab/tunnel. */
+export async function configureColabTunnel(
+  url: string,
+  status: TunnelStatus,
+): Promise<TunnelSettings> {
+  const res = await fetch(
+    `${API_BASE_URL}/api/colab/tunnel?url=${encodeURIComponent(url)}&status=${encodeURIComponent(status)}`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    throw new Error('Failed to configure Colab tunnel');
+  }
+  const body = await res.json();
+  return {
+    url: typeof body?.colab_url === 'string' ? body.colab_url : url,
+    status: normalizeSettingsStatus(body?.colab_status),
+  };
+}
+
+/** Effective tunnel state: settings intent resolved against metrics liveness. */
+export async function fetchColabTunnelState(): Promise<ColabTunnelState> {
+  const [settings, metrics] = await Promise.all([
+    fetchTunnelSettings(),
+    fetchColabMetrics().catch(() => ({
+      status: 'disconnected' as const,
+      metrics: null,
+    })),
+  ]);
+  const metricsConnected = metrics.status === 'connected';
+  return {
+    url: settings.url,
+    status: resolveTunnelStatus(settings.status, metrics.status),
+    metricsConnected,
+  };
+}
+
+/* ── Generation API Endpoints ─────────────────────────────────────────── */
+
+export interface GenerateTextResponse {
+  status: string;
+  output: string;
+  colab?: boolean;
+}
+
+export interface GenerateAudioResponse {
+  status: string;
+  type: string;
+  filename: string;
+  url: string;
+  colab?: boolean;
+}
+
+export interface GenerateImageResponse {
+  status: string;
+  parameters: { steps: number; scale: number };
+  filename: string;
+  url: string;
+  colab?: boolean;
+}
+
+async function postGenerate<T>(url: string, fallbackMessage: string): Promise<T> {
+  const res = await fetch(url, { method: 'POST' });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = err?.detail;
+    let message = fallbackMessage;
+    if (typeof detail === 'string') {
+      message = detail;
+    } else if (detail) {
+      message = JSON.stringify(detail);
+    }
+    throw new Error(message);
+  }
+  return res.json();
+}
+
 export async function fetchSettings(): Promise<Record<string, string>> {
   const res = await fetch(`${API_BASE_URL}/api/settings`);
   if (!res.ok) {
     throw new Error('Failed to fetch settings');
+  }
+  return res.json();
+}
+
+export async function generateText(prompt: string, model?: string): Promise<GenerateTextResponse> {
+  const params = new URLSearchParams({ prompt });
+  if (model) params.set('model', model);
+  const url = `${API_BASE_URL}/api/generate/text?${params.toString()}`;
+  return postGenerate<GenerateTextResponse>(url, 'Text generation failed');
+}
+
+export async function generateAudio(
+  prompt: string,
+  type: 'tts' | 'sfx' = 'tts',
+  voiceId?: string,
+  duration?: number,
+): Promise<GenerateAudioResponse> {
+  const params = new URLSearchParams({ prompt, type });
+  if (voiceId) params.set('voice_id', voiceId);
+  if (duration !== undefined) params.set('duration', duration.toString());
+  const url = `${API_BASE_URL}/api/generate/audio?${params.toString()}`;
+  return postGenerate<GenerateAudioResponse>(url, 'Audio generation failed');
+}
+
+export async function generateImage(
+  prompt: string,
+  steps = 28,
+  scale = 7.5,
+  aspectRatio?: string,
+  provider?: string,
+): Promise<GenerateImageResponse> {
+  const params = new URLSearchParams({
+    prompt,
+    steps: steps.toString(),
+    scale: scale.toString(),
+  });
+  if (aspectRatio) params.set('aspect_ratio', aspectRatio);
+  if (provider) params.set('provider', provider);
+  const url = `${API_BASE_URL}/api/generate/image?${params.toString()}`;
+  return postGenerate<GenerateImageResponse>(url, 'Image generation failed');
+}
+
+/* ── Magnific Upscaler API (#94 / #96) ──────────────────────────────── */
+
+export interface UpscalePayload {
+  image_path: string;
+  scale: number;
+  preset?: string;
+  creativity?: number;
+  resemblance?: number;
+  fractality?: number;
+  hdr?: number;
+  category?: string;
+  prompt?: string;
+}
+
+export interface UpscaleStartResponse {
+  message: string;
+  task_id: string;
+  status: string;
+  scale: number;
+  preset: string;
+  category: string;
+  output_path: string;
+  parameters: {
+    creativity: number;
+    resemblance: number;
+    fractality: number;
+    hdr: number;
+    denoise: number;
+    controlnet_scale: number;
+  };
+}
+
+export interface UpscaleStatusResponse {
+  task_id: string;
+  name: string | null;
+  status: string; // QUEUED | PROCESSING | COMPLETED | FAILED
+  progress: number;
+  error: string | null;
+  logs: string | null;
+  output_path: string | null;
+  result_url: string | null;
+}
+
+export interface UpscalePresetDefinition {
+  name: string;
+  description: string;
+  creativity: number;
+  resemblance: number;
+  fractality: number;
+  hdr: number;
+}
+
+export interface UpscaleCategoryDefinition {
+  label: string;
+  description: string;
+  prompt_keywords: string;
+}
+
+async function readErrorDetail(res: Response, fallback: string): Promise<string> {
+  const err = await res.json().catch(() => ({ detail: res.statusText }));
+  const detail = err?.detail;
+  if (typeof detail === 'string') return detail;
+  if (detail) return JSON.stringify(detail);
+  return fallback;
+}
+
+/** Dispatch a Magnific-style tile upscale job. */
+export async function startUpscale(payload: UpscalePayload): Promise<UpscaleStartResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/upscale`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Upscale request failed'));
   }
   return res.json();
 }
@@ -412,6 +624,35 @@ export async function startBatchExport(
     throw new Error('Failed to start batch export');
   }
   return res.json();
+}
+
+/** Poll progress/result for an upscale job. */
+export async function getUpscaleStatus(taskId: string): Promise<UpscaleStatusResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/upscale/status/${encodeURIComponent(taskId)}`);
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to fetch upscale status'));
+  }
+  return res.json();
+}
+
+/** Engine preset registry (Subtle / Vivid / Wild / Custom). */
+export async function fetchUpscalePresets(): Promise<Record<string, UpscalePresetDefinition>> {
+  const res = await fetch(`${API_BASE_URL}/api/upscale/presets`);
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to fetch upscale presets'));
+  }
+  const body = await res.json();
+  return body.presets ?? {};
+}
+
+/** Engine content-category registry (v1 six categories). */
+export async function fetchUpscaleCategories(): Promise<Record<string, UpscaleCategoryDefinition>> {
+  const res = await fetch(`${API_BASE_URL}/api/upscale/categories`);
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to fetch upscale categories'));
+  }
+  const body = await res.json();
+  return body.categories ?? {};
 }
 
 export function triggerDownload(url: string, filename?: string) {

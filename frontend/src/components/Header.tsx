@@ -2,11 +2,12 @@
 
 import React, { useEffect } from 'react';
 import { useStore } from '../store/useStore';
-import { fetchSecretStatus } from '../utils/api';
+import { fetchSecretStatus, fetchColabTunnelState } from '../utils/api';
+import { TUNNEL_POLL_INTERVAL_MS } from '../utils/tunnel';
 import { Database, HardDrive, Zap, Cpu, Menu, ShieldAlert } from 'lucide-react';
 
 export default function Header() {
-  const { toggleSidebar, sidebarOpen, colabTunnel, keyStatus, setKeyStatus } = useStore();
+  const { toggleSidebar, sidebarOpen, colabTunnel, setColabTunnel, keyStatus, setKeyStatus } = useStore();
 
   // The header is mounted on every tab, so it is the natural place to sync the
   // server-reported key configuration state into the store on load.
@@ -23,6 +24,33 @@ export default function Header() {
       cancelled = true;
     };
   }, [setKeyStatus]);
+
+  // The Colab badge must reflect live backend state — the persisted
+  // colab_tunnel_status intent resolved against the metrics 10s-staleness
+  // rule (#79) — never a cached localStorage flag. Re-read on mount (so a
+  // reload shows what the server actually holds) and on a short poll.
+  useEffect(() => {
+    let cancelled = false;
+    const syncTunnel = async () => {
+      try {
+        const state = await fetchColabTunnelState();
+        if (!cancelled) {
+          setColabTunnel({ endpointUrl: state.url, status: state.status });
+        }
+      } catch {
+        /* backend unreachable — set status disconnected while preserving endpoint url */
+        if (!cancelled) {
+          setColabTunnel({ status: 'disconnected' });
+        }
+      }
+    };
+    syncTunnel();
+    const interval = setInterval(syncTunnel, TUNNEL_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [setColabTunnel]);
 
   const missingKeys = !keyStatus.gemini.configured || !keyStatus.elevenlabs.configured;
 
