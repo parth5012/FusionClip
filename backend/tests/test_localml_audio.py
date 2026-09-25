@@ -864,3 +864,130 @@ class TestFix7XTTSCallingConvention:
         assert len(captured_calls) == 1
         tts_call = captured_calls[0]
         assert "speaker_wav" not in tts_call["kwargs"], "speaker_wav must NOT be passed when no reference is given"
+
+
+class TestCodeRabbitFixesAudio:
+    """Tests for CodeRabbit PR #130 review findings (B1, B2)."""
+
+    def test_b1_plain_tts_supplies_deterministic_default_speaker_when_speakers_present(
+        self, client, monkeypatch, stub_storage
+    ):
+        """B1: Plain TTS with model exposing speakers supplies first/lowest-index speaker as default."""
+        captured_calls = []
+
+        class StubModelWithSpeakers:
+            speakers = ["FirstSpeaker", "SecondSpeaker"]
+
+            def tts_to_file(self, text, file_path, **kwargs):
+                captured_calls.append(kwargs)
+                with open(file_path, "wb") as f:
+                    f.write(b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+
+        stub_model = StubModelWithSpeakers()
+        monkeypatch.setattr(model_registry, "load_model", lambda mid, **k: stub_model)
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+
+        res = client.post("/api/generate/audio?prompt=Hello+default+speaker&type=tts&provider=local")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["status"] == "COMPLETED"
+        assert len(captured_calls) == 1
+        assert captured_calls[0].get("speaker") == "FirstSpeaker"
+        assert "speaker_wav" not in captured_calls[0]
+
+    def test_b1_plain_tts_refuses_before_inference_when_no_speakers_and_no_reference(
+        self, client, monkeypatch
+    ):
+        """B1: When model has no speakers and request has no reference, refuse before inference with LOAD_FAILED."""
+        tts_called = []
+
+        class StubModelNoSpeakers:
+            speakers = []
+
+            def tts_to_file(self, text, file_path, **kwargs):
+                tts_called.append(True)
+
+        stub_model = StubModelNoSpeakers()
+        monkeypatch.setattr(model_registry, "load_model", lambda mid, **k: stub_model)
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+
+        res = client.post("/api/generate/audio?prompt=Hello+no+speaker&type=tts&provider=local")
+        assert res.status_code == 200
+        body = res.json()
+        assert body.get("degraded") is True
+        assert body.get("reason") == DegradedReason.LOAD_FAILED.value
+        assert "speaker" in body.get("message", "").lower() or "reference" in body.get("message", "").lower()
+        assert len(tts_called) == 0, "tts_to_file must not be called when refused before inference"
+
+    def test_b2_upload_failure_returns_degraded_response_and_does_not_persist(
+        self, client, monkeypatch, db_session
+    ):
+        """B2: Forced upload_object -> False must return degraded failure, not COMPLETED, and not persist MediaAsset."""
+        fake_wav = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80>\x00\x00\x00}\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+
+        class StubModel:
+            speakers = ["Speaker1"]
+
+            def tts_to_file(self, text, file_path, **kwargs):
+                with open(file_path, "wb") as f:
+                    f.write(fake_wav)
+
+        stub_model = StubModel()
+        monkeypatch.setattr(model_registry, "load_model", lambda mid, **k: stub_model)
+        monkeypatch.setattr(
+            vram_guard,
+            "get_gpu_info",
+            lambda device=0: {
+                "available": True,
+                "device_name": "NVIDIA RTX 4090",
+                "total_bytes": int(24.0 * (1024 ** 3)),
+                "free_bytes": int(20.0 * (1024 ** 3)),
+                "used_bytes": int(4.0 * (1024 ** 3)),
+                "total_gb": 24.0,
+                "free_gb": 20.0,
+                "used_gb": 4.0,
+                "vram_percent": 16.7,
+            },
+        )
+
+        import app.ml.audio as audio_mod
+        monkeypatch.setattr(audio_mod, "upload_object", lambda *args, **kwargs: False)
+
+        initial_count = db_session.query(MediaAsset).count()
+        res = client.post("/api/generate/audio?prompt=Hello+upload+fail&type=tts&provider=local")
+        assert res.status_code == 200
+        body = res.json()
+        assert body.get("status") != "COMPLETED", "Upload failure must not report COMPLETED"
+        assert body.get("degraded") is True
+        assert body.get("reason") == DegradedReason.LOAD_FAILED.value
+        assert "storage" in body.get("message", "").lower() or "upload" in body.get("message", "").lower()
+        assert db_session.query(MediaAsset).count() == initial_count, "MediaAsset must not be persisted on upload failure"
+

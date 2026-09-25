@@ -203,8 +203,8 @@ def apply_scheduler_to_pipeline(
 
 def run_local_image_generation(
     prompt: str,
-    steps: int = 28,
-    scale: float = 7.5,
+    steps: Optional[int] = 28,
+    scale: Optional[float] = 7.5,
     aspect_ratio: Optional[str] = None,
     scheduler: Optional[str] = None,
     db: Optional[Session] = None,
@@ -262,10 +262,27 @@ def run_local_image_generation(
 
         # 4. Execute pipeline
         width, height = get_dimensions_for_aspect_ratio(aspect_ratio)
+
+        # Resolve model-specific inference defaults (B4)
+        # FLUX.1-schnell is timestep-distilled: requires guidance_scale=0.0 and ~4 steps.
+        # SDXL uses standard 28 steps and guidance_scale=7.5.
+        inference_steps = steps
+        inference_scale = scale
+        if selected_model_id == "flux-schnell":
+            if steps is None or (steps == 28 and (scale is None or scale == 7.5)):
+                inference_steps = 4
+            if scale is None or (scale == 7.5 and (steps is None or steps == 28)):
+                inference_scale = 0.0
+        elif selected_model_id == "sdxl":
+            if inference_steps is None:
+                inference_steps = 28
+            if inference_scale is None:
+                inference_scale = 7.5
+
         inference_kwargs: Dict[str, Any] = {
             "prompt": prompt,
-            "num_inference_steps": steps,
-            "guidance_scale": scale,
+            "num_inference_steps": inference_steps,
+            "guidance_scale": inference_scale,
             "width": width,
             "height": height,
         }
@@ -308,8 +325,15 @@ def run_local_image_generation(
         # 6. Upload real bytes and persist MediaAsset
         filename = build_image_filename()
         upload_success = upload_object(png_bytes, filename, content_type="image/png")
+        if not upload_success:
+            logger.error(f"Failed to upload generated image '{filename}' to storage")
+            return make_degraded_response(
+                reason=DegradedReason.LOAD_FAILED.value,
+                message="Failed to upload generated image to storage",
+                model_id=selected_model_id,
+            ).model_dump()
 
-        if upload_success and db is not None:
+        if db is not None:
             try:
                 model_family_name = "Flux" if selected_model_id == "flux-schnell" else "SDXL"
                 title = f"{model_family_name} Generated: {prompt[:30]}..."
@@ -327,8 +351,11 @@ def run_local_image_generation(
                 logger.error(f"Failed to save generated image asset: {exc}")
                 db.rollback()
 
-        # 7. Response matching Gemini shape
-        params_dict: Dict[str, Any] = {"steps": steps, "scale": scale}
+        # 7. Response matching Gemini shape (preserve requested/default response contract)
+        params_dict: Dict[str, Any] = {
+            "steps": steps if steps is not None else inference_steps,
+            "scale": scale if scale is not None else inference_scale,
+        }
         if scheduler is not None:
             params_dict["scheduler"] = scheduler
 
@@ -336,5 +363,5 @@ def run_local_image_generation(
             "status": "COMPLETED",
             "parameters": params_dict,
             "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
+            "url": generate_url(filename),
         }
