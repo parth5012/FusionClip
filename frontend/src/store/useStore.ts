@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import type { AudioMarker } from '../utils/api';
 
 export type TabType = 'library' | 'catalog' | 'generation' | 'upscale' | 'upscaler' | 'players' | 'settings' | 'tunnels' | 'monitor' | 'queue';
 
@@ -37,6 +38,13 @@ export interface ColabMetricsHistoryPoint {
   cpu_load: number;
 }
 
+/** A generated audio clip plus the markers to draw on its waveform. */
+export interface WaveAudio {
+  url: string;
+  filename: string;
+  markers: AudioMarker[];
+}
+
 interface AppState {
   // Navigation
   activeTab: TabType;
@@ -66,6 +74,12 @@ interface AppState {
   sidebarOpen: boolean;
   toggleSidebar: () => void;
   setSidebarOpen: (open: boolean) => void;
+
+  // Latest generated audio handed to the waveform player, including any
+  // clone markers the backend attached (features.md: "voice cloning markers").
+  // Session-only: a stale marker must not survive a reload.
+  waveAudio: WaveAudio | null;
+  setWaveAudio: (waveAudio: WaveAudio | null) => void;
 }
 
 export const EMPTY_KEY_STATUS: KeyStatus = {
@@ -105,7 +119,10 @@ export const useStore = create<AppState>()(
 
       sidebarOpen: true,
       toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
-      setSidebarOpen: (sidebarOpen) => set({ sidebarOpen }),
+      setSidebarOpen: (open) => set({ sidebarOpen: open }),
+
+      waveAudio: null,
+      setWaveAudio: (waveAudio) => set({ waveAudio }),
     }),
     {
       name: 'fusionclip-settings', // persisted in localStorage

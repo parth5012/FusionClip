@@ -31,7 +31,7 @@ import {
 type Modality = 'text' | 'image' | 'tts' | 'sfx' | 'voice' | 'local';
 
 export default function GenerationPanel() {
-  const { keyStatus, setActiveTab, colabTunnel } = useStore();
+  const { keyStatus, setActiveTab, colabTunnel, setWaveAudio } = useStore();
   const [activeModality, setActiveModality] = useState<Modality>('text');
   const [prompt, setPrompt] = useState('A cinematic drone shot over a cybernetic neon city at dusk');
   const [isGenerating, setIsGenerating] = useState(false);
@@ -44,6 +44,8 @@ export default function GenerationPanel() {
   const [scale, setScale] = useState(7.5);
   const [voiceId, setVoiceId] = useState('21m00Tcm4TlvDq8ikWAM');
   const [duration, setDuration] = useState(5.0);
+  // Catalog file_path of a >=3s sample to clone from (local XTTS zero-shot path).
+  const [voiceReference, setVoiceReference] = useState('');
 
   // Result states
   const [textResult, setTextResult] = useState<GenerateTextResponse | null>(null);
@@ -51,6 +53,19 @@ export default function GenerationPanel() {
   const [imageResult, setImageResult] = useState<GenerateImageResponse | null>(null);
 
   const missingCommercialKeys = !keyStatus.gemini.configured || !keyStatus.elevenlabs.configured;
+
+  // Publish the clip (and its clone markers) to the waveform player. Degraded
+  // refusals carry no url, so they never clobber what is already loaded.
+  const commitAudio = (res: GenerateAudioResponse) => {
+    setAudioResult(res);
+    if (res.url) {
+      setWaveAudio({
+        url: res.url,
+        filename: res.filename ?? '',
+        markers: res.markers ?? [],
+      });
+    }
+  };
 
   const isGeminiRequired = activeModality === 'text' || activeModality === 'image';
   const isElevenLabsRequired =
@@ -70,11 +85,9 @@ export default function GenerationPanel() {
         const res = await generateText(prompt, model);
         setTextResult(res);
       } else if (activeModality === 'tts') {
-        const res = await generateAudio(prompt, 'tts', voiceId);
-        setAudioResult(res);
+        commitAudio(await generateAudio(prompt, 'tts', voiceId));
       } else if (activeModality === 'sfx') {
-        const res = await generateAudio(prompt, 'sfx', undefined, duration);
-        setAudioResult(res);
+        commitAudio(await generateAudio(prompt, 'sfx', undefined, duration));
       } else if (activeModality === 'image' || activeModality === 'local') {
         const res = await generateImage(
           prompt,
@@ -85,9 +98,13 @@ export default function GenerationPanel() {
         );
         setImageResult(res);
       } else if (activeModality === 'voice') {
-        // Voice design preview uses ElevenLabs TTS endpoint with designated preview voice
-        const res = await generateAudio(prompt, 'tts', voiceId);
-        setAudioResult(res);
+        // Voice Lab: with a reference sample it is XTTS zero-shot cloning on the
+        // local pipeline; without one it falls back to the ElevenLabs preview.
+        const reference = voiceReference.trim();
+        const res = reference
+          ? await generateAudio(prompt, 'voice_clone', undefined, undefined, reference)
+          : await generateAudio(prompt, 'tts', voiceId);
+        commitAudio(res);
       }
     } catch (err: unknown) {
       console.error('Generation request failed:', err);
@@ -301,6 +318,24 @@ export default function GenerationPanel() {
             </div>
           )}
 
+          {activeModality === 'voice' && (
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-slate-300">Voice Reference (3s+ sample)</label>
+              <input
+                type="text"
+                value={voiceReference}
+                onChange={(e) => setVoiceReference(e.target.value)}
+                placeholder="catalog file_path, e.g. speaker_sample.wav"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-sky-500"
+              />
+              <p className="text-[10px] text-slate-500">
+                {voiceReference.trim()
+                  ? 'Zero-shot clone on the local XTTS v2 pipeline.'
+                  : 'Empty = ElevenLabs voice-design preview.'}
+              </p>
+            </div>
+          )}
+
           {activeModality === 'tts' && (
             <div className="space-y-1.5">
               <label className="text-xs font-medium text-slate-300">Speaker Voice</label>
@@ -465,14 +500,47 @@ export default function GenerationPanel() {
                   {(activeModality === 'tts' || activeModality === 'sfx' || activeModality === 'voice') &&
                     audioResult && (
                       <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-3">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="font-bold text-slate-200">{audioResult.filename}</span>
-                          <span className="text-[10px] font-mono text-slate-500">{audioResult.type.toUpperCase()}</span>
-                        </div>
-                        {audioResult.url ? (
-                          <audio controls src={audioResult.url} className="w-full" />
+                        {audioResult.degraded ? (
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="font-bold text-slate-200">Local pipeline unavailable</span>
+                              <span className="text-[10px] font-mono text-amber-400">{audioResult.reason}</span>
+                            </div>
+                            <p className="text-[11px] text-slate-400">{audioResult.message}</p>
+                          </div>
                         ) : (
-                          <div className="text-xs text-slate-500">Audio uploaded: {audioResult.filename}</div>
+                          <>
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="font-bold text-slate-200">{audioResult.filename}</span>
+                              <span className="flex items-center gap-2">
+                                {audioResult.markers?.some((m) => m.kind === 'voice_clone') && (
+                                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-fuchsia-500/15 text-fuchsia-300 border border-fuchsia-500/30">
+                                    voice clone
+                                  </span>
+                                )}
+                                <span className="text-[10px] font-mono text-slate-500">
+                                  {audioResult.type?.toUpperCase()}
+                                </span>
+                              </span>
+                            </div>
+                            {audioResult.url ? (
+                              <audio controls src={audioResult.url} className="w-full" />
+                            ) : (
+                              <div className="text-xs text-slate-500">Audio uploaded: {audioResult.filename}</div>
+                            )}
+                            {(audioResult.markers?.length ?? 0) > 0 && (
+                              <div className="flex flex-wrap gap-2">
+                                {audioResult.markers!.map((m, i) => (
+                                  <span
+                                    key={`${m.kind}-${m.time}-${i}`}
+                                    className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700"
+                                  >
+                                    {m.label}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                     )}
