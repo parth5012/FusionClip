@@ -97,6 +97,7 @@ def stub_storage(monkeypatch):
         "app.routers.media",
         "app.tasks",
         "app.ml.image",
+        "app.ml.audio",
     ):
         for name, impl in (
             ("upload_object", _upload_object),

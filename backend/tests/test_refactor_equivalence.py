@@ -296,7 +296,7 @@ class TestDefaultedCallShapes:
     def test_generate_audio_default_type_is_tts(self, client, stub_storage):
         body = client.post("/api/generate/audio?prompt=defaults").json()
         assert body["type"] == "tts"
-        assert set(body) == {"status", "type", "filename", "url"}
+        assert set(body) == {"status", "type", "filename", "url", "markers"}
 
     def test_generate_image_default_parameter_types(self, client, stub_storage):
         params = client.post("/api/generate/image?prompt=defaults").json()["parameters"]
