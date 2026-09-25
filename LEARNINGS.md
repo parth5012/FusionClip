@@ -99,6 +99,12 @@
 - Parsing audio duration directly from in-memory WAV byte arrays using Python's standard library `wave.open(io.BytesIO(wav_bytes), "rb")` yields exact duration (`frames / framerate`) without invoking heavy external dependencies like `ffmpeg` or `sox`.
 - If the byte stream is malformed or non-WAV, cleanly falling back to the requested duration parameter or a sensible default prevents upload failures.
 
+### 24. Resident Model Eviction and Inference Serialization
+- When loading multi-gigabyte models (e.g. FLUX.1 schnell ~13GB and MusicGen large ~10.4GB) on a 16GB GPU, resident models must be evicted when switching pipelines (`evict_except(keep_ids)`) to prevent `insufficient_vram` deadlocks.
+- Admission, model load, and inference must be serialized behind a global `INFERENCE_LOCK = threading.RLock()` across both image and audio pipelines to ensure eviction never runs while another request is mid-inference.
+- Audio references for zero-shot voice cloning must be resolved from S3/MinIO storage into secure temporary files (`tempfile.NamedTemporaryFile`) and passed as `speaker_wav` to XTTS with guaranteed cleanup.
+
+
 
 
 
