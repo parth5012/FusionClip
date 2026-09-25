@@ -24,7 +24,10 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# Module-level inference lock serializing all local GPU admission + inference
+# Module-level inference lock serializing local GPU admission + inference within one process
+# Note: INFERENCE_LOCK and ModelRegistry._lock are threading.RLock instances and serialize
+# threads within a single Python process. Cross-process coordination (e.g. between the API
+# process and Celery prefork worker processes) is not covered and is tracked on the map.
 INFERENCE_LOCK = threading.RLock()
 
 
