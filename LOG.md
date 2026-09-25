@@ -113,3 +113,23 @@
 - Unit: `bun test frontend/src/utils/` → 10 pass.
 - E2E: `09-upscaler.spec.ts` → **3 passed** (registries, FileManager flow, Magnific panel).
 - Issue #96 closed with resolution comment.
+
+
+## 2026-09-25: Merge origin/main into the #96 branch (post-#96 integration)
+
+### Iteration Status: Done
+
+- **Merged `origin/main` (merge-base `843569d`) — 13 conflicts resolved, keeping #96 while preserving main's new features.**
+  - `models.py`: `Vector(384)` (our embedding scheme) + main's `source_path` column; alembic `b7e0c1a2d3f4` merge revision for 3 heads.
+  - `generate.py`: main's file as base + 15 count-asserted grafts (lazy torch/diffusers imports, pipeline cache globals main was missing, `_save_asset` embedding, HTTPException guards, ElevenLabs sfx/tts branches, Gemini image branch, image local→mock fallback).
+  - `services/gemini.py` / `services/elevenlabs.py`: REST helpers (`call_gemini_generate_content`, `synthesize`, `generate_sound_effect`) + error mappers.
+  - `api.ts`: union of both sides; dropped main's dead legacy `startUpscale(path,…)` (zero callers).
+  - `FileManager.tsx`: union imports/state; main's drag-drop + batch-upload UI wrapped around our Magnific jobs panel; our modal flow kept (pinned by e2e); main's `UpscalerPanel` stays reachable via its Sidebar tab; removed main's now-unused `useStore` destructure.
+  - `useStore`/`Sidebar`/`page.tsx`: both upscale tabs wired; `tasks.py`: `upscale`/`video_upscale` in `ALLOWED_TASK_TYPES`.
+  - Deps installed into the project venv: `elevenlabs==2.69.0`, `google-genai`, `scipy` (scipy also declared in `requirements.txt`); torch/diffusers deliberately NOT installed (generate.py torch paths made lazy).
+- **Verification (all gates):**
+  - Backend: `pytest backend/tests/ -q` → **304 passed** (pre-merge: 301 +3; fixed test asserts: CLIP 1536→384, `eleven_tts_` filename, unknown-task-type since upscale is now real).
+  - Typecheck: `tsc --noEmit` → 0 errors.
+  - Unit: `bun test frontend/src/utils/` → 10 pass.
+  - E2E: `09-upscaler.spec.ts` → **3 passed** (first cold-run attempt failed a 20s upload-visibility timeout during Next/moto warm-up; warm re-run green, isolated re-run green).
+- **Flags for review:** main's CLIP hybrid search not ported (fastembed/384 kept); both upscale tabs in Sidebar (product cleanup); `aspect_ratio`/`provider` query params dropped from `generateImage` (frontend still sends them, FastAPI ignores); image-gemini/audio-key responses carry no `colab` key (matches both sides' existing key-sets); main's `09-upscaler-before-after.spec.ts` needs Redis+Celery worker — no redis binary/sudo in this env (docker stack covers it; API-level upscale paths covered by pytest).
