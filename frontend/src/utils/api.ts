@@ -301,12 +301,28 @@ export interface GenerateTextResponse {
   colab?: boolean;
 }
 
+/**
+ * Timestamped overlay for the waveform player. The backend emits one marker per
+ * local-generation event it can attest to - today that is the voice-clone
+ * provenance marker (kind: 'voice_clone'). Empty array means "nothing to show".
+ */
+export interface AudioMarker {
+  time: number;
+  label: string;
+  kind: string;
+}
+
 export interface GenerateAudioResponse {
-  status: string;
-  type: string;
-  filename: string;
-  url: string;
+  status?: string;
+  type?: string;
+  filename?: string;
+  url?: string;
   colab?: boolean;
+  markers?: AudioMarker[];
+  /** Present instead of `status` when the local pipeline refused honestly (#71). */
+  degraded?: boolean;
+  reason?: string;
+  message?: string;
 }
 
 export interface GenerateImageResponse {
@@ -342,13 +358,16 @@ export async function generateText(prompt: string, model?: string): Promise<Gene
 
 export async function generateAudio(
   prompt: string,
-  type: 'tts' | 'sfx' = 'tts',
+  type: 'tts' | 'sfx' | 'voice_clone' = 'tts',
   voiceId?: string,
   duration?: number,
+  reference?: string,
 ): Promise<GenerateAudioResponse> {
   const params = new URLSearchParams({ prompt, type });
   if (voiceId) params.set('voice_id', voiceId);
   if (duration !== undefined) params.set('duration', duration.toString());
+  // Zero-shot cloning (XTTS v2): catalog asset file_path used as the speaker reference.
+  if (reference) params.set('reference', reference);
   const url = `${API_BASE_URL}/api/generate/audio?${params.toString()}`;
   return postGenerate<GenerateAudioResponse>(url, 'Audio generation failed');
 }
