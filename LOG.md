@@ -215,6 +215,34 @@
     FusionClip backend stack is up in this worktree.
   - Final verified state for #101: **295 backend tests passing**, frontend build clean.
 
+## 2026-09-25: Wayfinder Map #71 - Local Torch Models (SVD Video Pipeline)
+
+### Iteration Status: Done
+
+- **Phase 2 (AFK): #102 - Implement SVD image-to-video pipeline and task wiring**
+  - Implemented `app.ml.video`:
+    - `run_local_image_to_video`: Implemented admission check via `vram_guard.check_vram("svd")` under `INFERENCE_LOCK`.
+    - Returns typed DegradedResponse (`degraded: true` with machine-readable reasons `no_gpu`, `insufficient_vram`, `load_failed`) on GPU refusal or runtime errors.
+    - Decodes conditioning image bytes and validates image integrity via PIL (raises `ValueError` for unreadable/corrupt images).
+    - Lazy loader factory `make_video_loader`: strictly encapsulates diffusers and torch imports so the backend boots without torch installed, with CPU offload on CUDA (`enable_model_cpu_offload()`).
+    - Reports denoising progress (0..79%) via `callback_on_step_end`.
+    - Encodes PIL frames to H.264 MP4 using system `ffmpeg` binary with frame progress scraping from stderr (80..99%).
+    - Generates nanosecond-timestamped pure-digit filenames (`gen_video_{time_ns}.mp4`).
+    - Uploads MP4 to storage and creates `MediaAsset` catalog record in DB.
+  - Extended `process_gpu_task` in `app/tasks.py`:
+    - Added op dispatch for `op == "image_to_video"`.
+    - Resolves source bytes from storage via `download_object`.
+    - Progress callback updates Celery state (`meta={"percent": int, "status": str}`), publishes to Redis channel `task_updates`, and upserts `Task` row in DB.
+    - Preserved existing scaffold behavior for other models.
+  - Added endpoint `POST /api/generate/video` in `app/routers/generate.py`:
+    - Validates `source` relative path (rejects traversals `..`, absolute paths, backslashes, empty) and resolves via `download_object` (returns 400 if missing or unreadable).
+    - Validates bounds: `num_frames` in 2..25 (400 if outside), `fps` in 1..30 (400 if outside).
+    - Preserves Colab priority when worker is connected.
+    - Dispatches to `process_gpu_task.delay("svd", ...)` and returns `{"task_id": ..., "status": "PENDING", "type": "video", ...}`.
+  - Updated `backend/tests/conftest.py` adding `app.ml.video` to `stub_storage`.
+  - Authored comprehensive test suite `backend/tests/test_localml_video.py` (18 tests passing).
+  - Verified: 313 backend tests passing (18 added, 313 passed in 52.76s).
+
 
 
 
