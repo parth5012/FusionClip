@@ -22,6 +22,20 @@ from app.deps import get_db
 from app.models import Task
 from app.task_logging import parse_log_events
 
+from app.celery_app import celery
+from app.config import settings
+from app.deps import get_db
+from app.ml.guard import vram_guard
+from app.ml.registry import model_registry
+from app.models import Task
+from app.schemas import (
+    GPUHealthResponse,
+    GPUQueueMetrics,
+    GPUVRAMMetrics,
+    ModelHealthInfo,
+)
+from app.tasks import process_multimedia_task
+
 logger = logging.getLogger(__name__)
 
 redis_client = redis.from_url(settings.REDIS_URL)
@@ -249,6 +263,64 @@ def get_task_counts(db: Session = Depends(get_db)):
         pending=pending,
         failed=failed,
         completed=completed,
+    )
+
+
+@router.get("/api/tasks/gpu/health", response_model=GPUHealthResponse)
+def get_gpu_health(db: Session = Depends(get_db)):
+    """Retrieve health metrics for local GPU compute, model states, and GPU task queue (#99)."""
+    gpu_info = vram_guard.get_gpu_info()
+    models_dict = {}
+    for meta in model_registry.list_models():
+        models_dict[meta.model_id] = ModelHealthInfo(
+            model_id=meta.model_id,
+            family=meta.family,
+            dtype_quant=meta.dtype_quant,
+            approx_vram_gb=meta.approx_vram_gb,
+            license=meta.license,
+            loaded=model_registry.is_loaded(meta.model_id),
+            description=meta.description,
+        )
+
+    # Queue metrics from redis
+    depth = 0
+    try:
+        depth = redis_client.llen("media.gpu") or 0
+    except Exception as e:
+        logger.warning(f"Could not read media.gpu queue depth: {e}")
+
+    # In-flight task count from DB. Task rows carry no queue column, so this is
+    # the total across every queue, not media.gpu alone.
+    active_tasks_total = 0
+    try:
+        active_tasks_total = db.query(Task).filter(Task.status == "PROCESSING").count()
+    except Exception as e:
+        logger.warning(f"Could not read active task count: {e}")
+
+    # Health status based on GPU presence and memory pressure
+    if not gpu_info["available"]:
+        status = "unavailable"
+    elif gpu_info["vram_percent"] > 95.0:
+        status = "degraded"
+    else:
+        status = "healthy"
+
+    return GPUHealthResponse(
+        status=status,
+        gpu=GPUVRAMMetrics(
+            available=gpu_info["available"],
+            device_name=gpu_info["device_name"],
+            total_gb=gpu_info["total_gb"],
+            free_gb=gpu_info["free_gb"],
+            used_gb=gpu_info["used_gb"],
+            vram_percent=gpu_info["vram_percent"],
+        ),
+        models=models_dict,
+        queue=GPUQueueMetrics(
+            queue_name="media.gpu",
+            depth=depth,
+            active_tasks_total=active_tasks_total,
+        ),
     )
 
 
