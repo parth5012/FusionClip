@@ -24,6 +24,10 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+# Module-level inference lock serializing all local GPU admission + inference
+INFERENCE_LOCK = threading.RLock()
+
+
 
 class ModelMetadata(BaseModel):
     """Metadata describing a local inference model in the registry."""
@@ -236,6 +240,20 @@ class ModelRegistry:
             gc.collect()
             self._empty_cuda_cache()
             return True
+
+    def evict_except(self, keep_ids: set[str]) -> list[str]:
+        """Under the registry lock, unload every resident model not in keep_ids.
+
+        Returns list of model_ids that were evicted.
+        Must be a no-op returning [] when nothing else is resident.
+        """
+        with self._lock:
+            evicted: list[str] = []
+            for model_id in list(self._models.keys()):
+                if model_id not in keep_ids and self.is_loaded(model_id):
+                    if self.unload_model(model_id):
+                        evicted.append(model_id)
+            return evicted
 
     def unload_all(self) -> int:
         """Unload all currently loaded models. Returns count of unloaded models."""

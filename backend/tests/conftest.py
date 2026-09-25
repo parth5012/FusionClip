@@ -77,6 +77,12 @@ def stub_storage(monkeypatch):
         uploaded[object_name] = {"data": data, "content_type": content_type}
         return True
 
+    def _download_object(object_name):
+        item = uploaded.get(object_name)
+        if item is not None:
+            return item["data"]
+        return None
+
     def _generate_url(object_name, expires_in=3600):
         return f"http://test-minio/{object_name}"
 
@@ -121,6 +127,7 @@ def stub_storage(monkeypatch):
         for name, impl in (
             ("upload_object", _upload_object),
             ("get_object_bytes", _get_object_bytes),
+            ("download_object", _download_object),
             ("generate_url", _generate_url),
             ("delete_object", _delete_object),
             ("list_workspace_files", _list_workspace_files),

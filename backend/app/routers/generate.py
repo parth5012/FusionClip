@@ -141,12 +141,23 @@ def _validate_aspect_ratio(val: Optional[str]) -> None:
         )
 
 
+SAFE_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
+
+
 def _validate_safe_reference(val: Optional[str], param_name: str = "reference") -> None:
     if val is not None:
-        if not val or ".." in val or len(val) > 128 or not SAFE_IDENTIFIER_PATTERN.match(val):
+        if (
+            not val
+            or not val.strip()
+            or ".." in val
+            or val.startswith("/")
+            or "\\" in val
+            or len(val) > 256
+            or not SAFE_REFERENCE_PATTERN.match(val)
+        ):
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid {param_name}: must be non-empty, cannot contain '..', and must match safe identifier pattern",
+                detail=f"Invalid {param_name}: must be non-empty relative path without '..', backslashes, or illegal characters",
             )
 
 
@@ -418,6 +429,13 @@ def generate_audio(
     _validate_safe_identifier(provider, "provider")
     _validate_safe_reference(reference, "reference")
 
+    if duration is not None:
+        if duration < 0.5 or duration > 30.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid duration: must be between 0.5 and 30.0 seconds, got {duration}",
+            )
+
     if type not in SUPPORTED_AUDIO_TYPES:
         raise HTTPException(
             status_code=400,
@@ -447,7 +465,8 @@ def generate_audio(
             content_type="audio/mpeg",
         )
 
-    if provider != "local":
+    ELEVENLABS_AUDIO_TYPES = frozenset({"tts", "voice", "sfx"})
+    if provider != "local" and type in ELEVENLABS_AUDIO_TYPES:
         eleven_key = get_secret("elevenlabs", db)
         if eleven_key:
             if type == "sfx":
