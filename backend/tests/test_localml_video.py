@@ -97,6 +97,43 @@ class TestVideoImportAndHelpers:
         filename2 = build_video_filename()
         assert filename1 != filename2, "Nanosecond timestamps should not collide"
 
+    def test_make_video_loader_picks_dtype_by_device(self, monkeypatch):
+        """make_video_loader selects float32 on CPU and float16 on GPU (F1)."""
+        import sys
+        from app.ml.video import make_video_loader
+
+        mock_torch = MagicMock()
+        mock_torch.float16 = "mock_float16"
+        mock_torch.float32 = "mock_float32"
+
+        mock_pipe = MagicMock()
+        mock_diffusers = MagicMock()
+        mock_diffusers.StableVideoDiffusionPipeline.from_pretrained.return_value = mock_pipe
+
+        monkeypatch.setitem(sys.modules, "torch", mock_torch)
+        monkeypatch.setitem(sys.modules, "diffusers", mock_diffusers)
+
+        # 1. On CPU (cuda=False) -> must select float32
+        mock_torch.cuda.is_available.return_value = False
+        loader_cpu = make_video_loader("svd")
+        pipe_cpu = loader_cpu()
+        mock_diffusers.StableVideoDiffusionPipeline.from_pretrained.assert_called_with(
+            "stabilityai/stable-video-diffusion-img2vid-xt",
+            torch_dtype="mock_float32",
+        )
+        pipe_cpu.to.assert_called_with("cpu")
+
+        # 2. On GPU (cuda=True) -> must select float16 and enable offload
+        mock_torch.cuda.is_available.return_value = True
+        loader_gpu = make_video_loader("svd")
+        pipe_gpu = loader_gpu()
+        mock_diffusers.StableVideoDiffusionPipeline.from_pretrained.assert_called_with(
+            "stabilityai/stable-video-diffusion-img2vid-xt",
+            torch_dtype="mock_float16",
+        )
+        pipe_gpu.enable_model_cpu_offload.assert_called_once()
+
+
 
 class TestVideoProgressMapping:
     def test_video_progress_ranges_and_monotonicity(self):
@@ -294,6 +331,73 @@ class TestVideoPipelineExecution:
         assert res.get("reason") == DegradedReason.LOAD_FAILED.value
         assert "failed to encode video frames" in res.get("message", "").lower()
 
+    def test_encode_frames_to_mp4_real_ffmpeg_failure_captures_exit_code_and_stderr(self):
+        """Genuine ffmpeg failure raises VideoEncodingError with exit code and stderr lines (F9)."""
+        from app.ml.video import encode_frames_to_mp4, VideoEncodingError
+
+        frames = [Image.new("RGB", (64, 64))]
+        # framerate 0 is an invalid video rate in ffmpeg and causes immediate non-zero exit
+        with pytest.raises(VideoEncodingError) as exc_info:
+            encode_frames_to_mp4(frames, fps=0)
+
+        err = exc_info.value
+        assert err.returncode is not None and err.returncode != 0
+        assert f"exit code {err.returncode}" in str(err)
+        assert err.stderr is not None
+        assert "Unable to parse option value" in err.stderr or "Error" in err.stderr
+
+    def test_encode_frames_to_mp4_timeout_raises_encoding_error(self, monkeypatch):
+        """When ffmpeg stalls or exceeds bounded timeout, VideoEncodingError is raised and child killed (F4)."""
+        import subprocess
+        from app.ml.video import encode_frames_to_mp4, VideoEncodingError
+
+        frames = [Image.new("RGB", (64, 64))]
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.returncode = None
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.fileno.return_value = 999
+        mock_proc.stderr.read.return_value = ""
+
+        # Make select return empty (timeout)
+        monkeypatch.setattr("select.select", lambda r, w, x, t: ([], [], []))
+        monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: mock_proc)
+
+        with pytest.raises(VideoEncodingError, match="timed out"):
+            encode_frames_to_mp4(frames, fps=7, timeout=0.01)
+
+        mock_proc.kill.assert_called_once()
+        mock_proc.stderr.close.assert_called_once()
+
+    def test_encode_frames_to_mp4_cleans_up_child_on_callback_exception(self, monkeypatch):
+        """When progress_cb raises an exception, the child process is killed and stderr closed (F4)."""
+        import subprocess
+        from app.ml.video import encode_frames_to_mp4
+
+        frames = [Image.new("RGB", (64, 64))]
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.returncode = None
+        mock_proc.stderr = MagicMock()
+        mock_proc.stderr.fileno.return_value = 999
+        # Simulate frame progress output
+        mock_proc.stderr.read.side_effect = ["f", "r", "a", "m", "e", "=", " ", "1", "\n", ""]
+
+        monkeypatch.setattr("select.select", lambda r, w, x, t: ([mock_proc.stderr], [], []))
+        monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: mock_proc)
+
+        def exploding_cb(pct, status):
+            raise RuntimeError("Progress callback crashed")
+
+        with pytest.raises(RuntimeError, match="Progress callback crashed"):
+            encode_frames_to_mp4(frames, fps=7, progress_cb=exploding_cb)
+
+        mock_proc.kill.assert_called_once()
+        mock_proc.stderr.close.assert_called_once()
+
+
 
 class TestTasksProcessGpuTaskDispatch:
     def test_process_gpu_task_image_to_video_dispatch(self, monkeypatch, db_session, stub_storage):
@@ -373,7 +477,7 @@ class TestTasksProcessGpuTaskDispatch:
         assert db_task is not None
         assert db_task.progress in (90, 100)
 
-    def test_process_gpu_task_guard_refusal_returns_degraded_contract(self, monkeypatch, stub_storage):
+    def test_process_gpu_task_guard_refusal_returns_degraded_contract(self, monkeypatch, stub_storage, stub_redis):
         """VRAM guard refusal inside process_gpu_task returns degraded response with SUCCESS state."""
         from app.tasks import process_gpu_task
 
@@ -399,6 +503,113 @@ class TestTasksProcessGpuTaskDispatch:
         assert res.get("degraded") is True
         assert res.get("reason") == DegradedReason.NO_GPU.value
 
+    def test_process_gpu_task_exception_records_failed_in_db_and_publishes(
+        self, monkeypatch, db_session, stub_storage
+    ):
+        """Unexpected exceptions in process_gpu_task mark DB Task FAILED and publish terminal event (F3a)."""
+        import app.tasks as tasks_module
+        from app.tasks import process_gpu_task
+
+        test_source = "uploads/corrupt.png"
+        stub_storage["uploaded"][test_source] = {"data": create_test_png_bytes(), "content_type": "image/png"}
+
+        # Simulate unexpected inference crash
+        def crashing_run(*args, **kwargs):
+            raise RuntimeError("Unexpected GPU inference kernel crash")
+
+        import app.ml.video as vid_mod
+        monkeypatch.setattr(vid_mod, "run_local_image_to_video", crashing_run)
+        monkeypatch.setattr("app.ml.video.run_local_image_to_video", crashing_run, raising=False)
+
+        published_redis = []
+        monkeypatch.setattr(
+            tasks_module.redis_client,
+            "publish",
+            lambda channel, msg: published_redis.append((channel, json.loads(msg))),
+        )
+
+        task_id = "test-gpu-crash-task"
+        process_gpu_task.push_request(id=task_id)
+        try:
+            with pytest.raises(RuntimeError, match="Unexpected GPU inference kernel crash"):
+                process_gpu_task.run(
+                    "svd",
+                    payload={"op": "image_to_video", "source": test_source, "num_frames": 14, "fps": 7},
+                )
+        finally:
+            process_gpu_task.pop_request()
+
+        # 1. DB Task row must exist and be FAILED, not PROCESSING
+        db_task = db_session.query(Task).filter(Task.task_id == task_id).first()
+        assert db_task is not None
+        assert db_task.status == "FAILED"
+        assert "Unexpected GPU inference kernel crash" in db_task.error
+
+        # 2. Redis task_updates must have received terminal FAILED event
+        failed_events = [
+            msg for chan, msg in published_redis
+            if chan == "task_updates" and msg.get("task_id") == task_id and msg.get("status") == "FAILED"
+        ]
+        assert len(failed_events) >= 1
+        assert "Unexpected GPU inference kernel crash" in failed_events[0]["error"]
+
+    def test_process_gpu_task_degraded_publishes_terminal_event_and_updates_db(
+        self, monkeypatch, db_session, stub_storage
+    ):
+        """Degraded responses from local video inference update DB Task to FAILED and publish terminal event (F3b)."""
+        import app.tasks as tasks_module
+        from app.tasks import process_gpu_task
+
+        test_source = "uploads/refused.png"
+        stub_storage["uploaded"][test_source] = {"data": create_test_png_bytes(), "content_type": "image/png"}
+
+        # Simulate degraded response from run_local_image_to_video
+        def degraded_run(*args, **kwargs):
+            return {
+                "degraded": True,
+                "reason": "no_gpu",
+                "message": "No CUDA GPU detected on host",
+                "fallback_tier": "refusal",
+            }
+
+        import app.ml.video as vid_mod
+        monkeypatch.setattr(vid_mod, "run_local_image_to_video", degraded_run)
+        monkeypatch.setattr("app.ml.video.run_local_image_to_video", degraded_run, raising=False)
+
+        published_redis = []
+        monkeypatch.setattr(
+            tasks_module.redis_client,
+            "publish",
+            lambda channel, msg: published_redis.append((channel, json.loads(msg))),
+        )
+
+        task_id = "test-gpu-degraded-task"
+        process_gpu_task.push_request(id=task_id)
+        try:
+            res = process_gpu_task.run(
+                "svd",
+                payload={"op": "image_to_video", "source": test_source, "num_frames": 14, "fps": 7},
+            )
+        finally:
+            process_gpu_task.pop_request()
+
+        assert res.get("degraded") is True
+
+        # 1. DB Task must not be PROCESSING or COMPLETED
+        db_task = db_session.query(Task).filter(Task.task_id == task_id).first()
+        assert db_task is not None
+        assert db_task.status == "FAILED"
+        assert "No CUDA GPU detected on host" in (db_task.error or "")
+
+        # 2. Redis task_updates must have received terminal FAILED event
+        terminal_events = [
+            msg for chan, msg in published_redis
+            if chan == "task_updates" and msg.get("task_id") == task_id and msg.get("status") == "FAILED"
+        ]
+        assert len(terminal_events) == 1
+        assert terminal_events[0]["degraded"] is True
+
+
 
 class TestGenerateVideoEndpoint:
     def test_validation_path_traversals(self, client):
@@ -419,6 +630,24 @@ class TestGenerateVideoEndpoint:
         res = client.post("/api/generate/video?source=nonexistent.png")
         assert res.status_code == 400
         assert "not found" in res.json().get("detail", "").lower()
+
+    def test_validation_local_disk_fallback_removed_rejects_disk_files(self, client, stub_storage):
+        """Local disk files not in storage must NOT be read (F7 storage isolation)."""
+        disk_path = Path("test_disk_isolate.png")
+        try:
+            disk_path.write_bytes(create_test_png_bytes())
+            # Ensure it is NOT in stub_storage
+            stub_storage["uploaded"].pop(str(disk_path), None)
+
+            res = client.post(f"/api/generate/video?source={disk_path.name}")
+            # Must return 400 because it should not read from host disk
+            assert res.status_code == 400
+            assert "not found or unreadable in storage" in res.json().get("detail", "").lower()
+        finally:
+            if disk_path.exists():
+                disk_path.unlink()
+
+
 
     def test_validation_corrupt_source_image_in_storage(self, client, stub_storage):
         """POST /api/generate/video returns 400 when source file is unreadable/corrupt."""

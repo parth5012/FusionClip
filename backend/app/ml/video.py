@@ -15,6 +15,7 @@ import io
 import logging
 import os
 import re
+import select
 import subprocess
 import tempfile
 import time
@@ -37,8 +38,18 @@ logger = logging.getLogger(__name__)
 
 
 class VideoEncodingError(RuntimeError):
-    """Raised when ffmpeg video encoding fails with a non-zero exit code."""
-    pass
+    """Raised when ffmpeg video encoding fails with a non-zero exit code or timeout."""
+
+    def __init__(
+        self,
+        message: str,
+        returncode: Optional[int] = None,
+        stderr: Optional[str] = None,
+    ):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
+
 
 
 def build_video_filename() -> str:
@@ -90,7 +101,7 @@ def make_video_loader(model_id: str = "svd"):
 
         from diffusers import StableVideoDiffusionPipeline  # type: ignore
 
-        dtype = getattr(torch, "float16", torch.float32)
+        dtype = torch.float16 if cuda else torch.float32
         pipe = StableVideoDiffusionPipeline.from_pretrained(
             "stabilityai/stable-video-diffusion-img2vid-xt",
             torch_dtype=dtype,
@@ -109,10 +120,12 @@ def encode_frames_to_mp4(
     pil_frames: List[Image.Image],
     fps: int,
     progress_cb: Optional[Callable[[int, str], None]] = None,
+    timeout: float = 60.0,
 ) -> bytes:
     """Encode PIL images into an H.264 MP4 using the system ffmpeg binary.
 
     Scrapes stderr for encoded frame progress and invokes progress_cb.
+    Enforces a bounded timeout and kills child process on failure or callback error.
     """
     if not pil_frames:
         raise ValueError("No frames provided for video encoding")
@@ -151,33 +164,77 @@ def encode_frames_to_mp4(
         frame_regex = re.compile(r"frame=\s*(\d+)")
         buf = ""
         stderr_lines = []
-        while True:
-            ch = process.stderr.read(1)
-            if not ch:
-                break
-            buf += ch
-            if ch in ("\r", "\n"):
-                stderr_lines.append(buf)
-                match = frame_regex.search(buf)
-                if match and progress_cb is not None:
-                    frame_idx = int(match.group(1))
-                    pct, status_text = video_progress("encode", frame_idx, total_frames)
-                    progress_cb(pct, status_text)
-                buf = ""
+        start_time = time.time()
 
-        process.wait()
-        if process.returncode != 0:
-            err_details = "".join(stderr_lines).strip()
-            raise VideoEncodingError(
-                f"FFmpeg encoding failed with exit code {process.returncode}: {err_details}"
-            )
+        try:
+            while True:
+                remaining = timeout - (time.time() - start_time)
+                if remaining <= 0:
+                    raise VideoEncodingError(
+                        f"FFmpeg encoding timed out after {timeout} seconds"
+                    )
 
-        if progress_cb is not None:
-            pct, status_text = video_progress("encode", total_frames, total_frames)
-            progress_cb(pct, status_text)
+                if process.stderr is not None:
+                    rlist, _, _ = select.select([process.stderr], [], [], min(remaining, 0.5))
+                    if not rlist:
+                        if process.poll() is not None:
+                            # Drain remaining stderr
+                            rest = process.stderr.read()
+                            if rest:
+                                stderr_lines.append(rest)
+                            break
+                        continue
 
-        with open(out_mp4, "rb") as f:
-            return f.read()
+                    ch = process.stderr.read(1)
+                    if not ch:
+                        break
+                    buf += ch
+                    if ch in ("\r", "\n"):
+                        stderr_lines.append(buf)
+                        match = frame_regex.search(buf)
+                        if match and progress_cb is not None:
+                            frame_idx = int(match.group(1))
+                            pct, status_text = video_progress("encode", frame_idx, total_frames)
+                            progress_cb(pct, status_text)
+                        buf = ""
+                else:
+                    break
+
+            remaining_wait = max(0.1, timeout - (time.time() - start_time))
+            try:
+                process.wait(timeout=remaining_wait)
+            except subprocess.TimeoutExpired as exc:
+                raise VideoEncodingError(
+                    f"FFmpeg encoding timed out after {timeout} seconds"
+                ) from exc
+
+            if process.returncode != 0:
+                err_details = "".join(stderr_lines).strip()
+                raise VideoEncodingError(
+                    f"FFmpeg encoding failed with exit code {process.returncode}: {err_details}",
+                    returncode=process.returncode,
+                    stderr=err_details,
+                )
+
+            if progress_cb is not None:
+                pct, status_text = video_progress("encode", total_frames, total_frames)
+                progress_cb(pct, status_text)
+
+            with open(out_mp4, "rb") as f:
+                return f.read()
+
+        finally:
+            if process.poll() is None:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+            if process.stderr is not None:
+                try:
+                    process.stderr.close()
+                except Exception:
+                    pass
 
 
 def run_local_image_to_video(
