@@ -72,6 +72,8 @@ def stub_storage(monkeypatch):
     downloaded: dict = {}
 
     def _upload_object(data, object_name, content_type="application/octet-stream"):
+        if hasattr(data, "read"):
+            data = data.read()
         uploaded[object_name] = {"data": data, "content_type": content_type}
         return True
 

@@ -1,8 +1,10 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.database import init_db
@@ -32,6 +34,14 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def custom_validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Map validation errors to 400 for /api/export per API contract, retaining 422 elsewhere."""
+    if request.url.path.startswith("/api/export"):
+        return JSONResponse(status_code=400, content={"detail": exc.errors()})
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # Configure CORS for the Next.js frontend. An explicit origin list is required
 # because allow_credentials=True is incompatible with a wildcard origin.

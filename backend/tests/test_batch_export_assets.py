@@ -44,6 +44,11 @@ class TestBatchExportApi:
         assert res.status_code == 400
         assert "99999" in res.json()["detail"] or "not found" in res.json()["detail"].lower()
 
+    def test_asset_ids_over_100_rejected_with_400(self, client):
+        oversized = list(range(1, 102))  # 101 items
+        res = client.post("/api/export/batch", json={"asset_ids": oversized})
+        assert res.status_code == 400
+
     def test_valid_asset_ids_enqueues_task_and_creates_db_record(
         self, client, db_session, monkeypatch
     ):
@@ -358,6 +363,117 @@ class TestBatchExportCeleryTask:
         db_task = db_session.query(Task).filter(Task.task_id == task_id).first()
         assert db_task.status == "FAILED"
         assert db_task.error is not None
+        assert db_task.traceback is not None
+
+    def test_export_assets_zip_sanitizes_zip_slip_and_windows_paths(
+        self, db_session, stub_storage, stub_redis, monkeypatch
+    ):
+        from app.tasks import export_assets_zip
+
+        # Path with traversal tokens
+        malicious = MediaAsset(
+            title="Evil Asset",
+            file_path="uploads/../../evil.sh",
+            file_size=100,
+            content_type="application/x-sh",
+        )
+        # Windows-style path with backslashes
+        win_asset = MediaAsset(
+            title="Windows Asset",
+            file_path="sub\\dir\\nested\\test.txt",
+            file_size=50,
+            content_type="text/plain",
+        )
+        task_id = "test-zip-slip-task"
+        db_task = Task(
+            task_id=task_id,
+            name="batch_export",
+            status="PENDING",
+            progress=0,
+        )
+        db_session.add_all([malicious, win_asset, db_task])
+        db_session.commit()
+
+        stub_storage["uploaded"]["uploads/../../evil.sh"] = {
+            "data": b"echo evil",
+            "content_type": "text/plain",
+        }
+        stub_storage["uploaded"]["sub\\dir\\nested\\test.txt"] = {
+            "data": b"hello windows",
+            "content_type": "text/plain",
+        }
+
+        raw = export_assets_zip.run.__func__
+        result = raw(
+            _FakeCeleryTask(task_id=task_id),
+            asset_ids=[malicious.id, win_asset.id],
+            include_derivatives=False,
+        )
+
+        assert result["count"] == 2
+        export_key = f"exports/export_{task_id}.zip"
+        archive = zipfile.ZipFile(io.BytesIO(stub_storage["uploaded"][export_key]["data"]))
+        namelist = archive.namelist()
+        for name in namelist:
+            assert ".." not in name
+            assert "\\" not in name
+            assert not name.startswith("/")
+        assert "evil.sh" in namelist
+        assert "test.txt" in namelist
+
+    def test_export_assets_zip_excludes_duplicate_when_parent_and_child_both_selected(
+        self, db_session, stub_storage, stub_redis, monkeypatch
+    ):
+        from app.tasks import export_assets_zip
+
+        parent = MediaAsset(
+            title="Parent Image",
+            file_path="images/orig.png",
+            file_size=1000,
+            content_type="image/png",
+        )
+        db_session.add(parent)
+        db_session.commit()
+
+        derivative = MediaAsset(
+            title="Child Image",
+            file_path="upscaled/child.png",
+            file_size=4000,
+            content_type="image/png",
+            source_path="images/orig.png",
+        )
+        task_id = "test-dup-task"
+        db_task = Task(
+            task_id=task_id,
+            name="batch_export",
+            status="PENDING",
+            progress=0,
+        )
+        db_session.add_all([derivative, db_task])
+        db_session.commit()
+
+        stub_storage["uploaded"]["images/orig.png"] = {
+            "data": b"orig-data",
+            "content_type": "image/png",
+        }
+        stub_storage["uploaded"]["upscaled/child.png"] = {
+            "data": b"child-data",
+            "content_type": "image/png",
+        }
+
+        # Select BOTH parent and derivative explicitly
+        raw = export_assets_zip.run.__func__
+        result = raw(
+            _FakeCeleryTask(task_id=task_id),
+            asset_ids=[parent.id, derivative.id],
+            include_derivatives=True,
+        )
+
+        # Count must be exactly 2 (not 3!)
+        assert result["count"] == 2
+        export_key = f"exports/export_{task_id}.zip"
+        archive = zipfile.ZipFile(io.BytesIO(stub_storage["uploaded"][export_key]["data"]))
+        assert len(archive.namelist()) == 2
 
 
 class TestExportStatusAndDownload:

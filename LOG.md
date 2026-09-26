@@ -169,3 +169,22 @@
   - Frontend: `bun test src/utils/` → **23 passed, 0 failed** (all 4 new export unit tests passed).
   - Typecheck: `npx tsc --noEmit` → **0 errors**.
   - Production build: `npm run build` → **Compiled successfully**.
+
+
+## 2026-09-26: Code review response on #106
+
+### Iteration Status: Done
+
+- **Addressed 7 review findings**:
+  1. **Memory DoS prevention**: capped `AssetBatchExportIn.asset_ids` at `max_length=100`, mapped validation errors on `/api/export` to 400 Bad Request, replaced RAM `BytesIO` zip buffering with `tempfile.NamedTemporaryFile` disk streaming and cleanup in `finally:`. Added test for >100 rejection.
+  2. **Zip-slip traversal protection**: added `sanitize_archive_entry_name` normalizing backslashes, using `os.path.basename`, and rejecting `.`/`..`/empty names. Added test asserting malicious traversal paths (`uploads/../../evil.sh`) and Windows-style paths strip separators.
+  3. **Duplicate entry exclusion**: filtered `~MediaAsset.id.in_(selected_ids)` when querying derivatives so selecting both parent and child doesn't duplicate the child. Added test verifying count = 2.
+  4. **Frontend polling failure resilience**: added consecutive error counter (max 5) to status polling interval, safely stopping spinner and clearing task ID on connection loss.
+  5. **UI badge overlap fix**: moved media type badge in Grid card from `top-2.5 left-2.5` to `top-2.5 right-2.5`, avoiding collision with selection checkbox.
+  6. **Failure traceback capture**: set `db_task.traceback = traceback.format_exc()` in `export_assets_zip` error handler; asserted in tests.
+  7. **Nits resolved**: cleared `selectedAssetIds` on export completion; computed `exportSummary` against `mediaList` so counts persist through filter changes.
+- **Verification:**
+  - Backend: `HF_HUB_OFFLINE=1 pytest` → **330 passed, 2 skipped** (18/18 batch export tests passed).
+  - Frontend: `bun test src/utils/` → **23 passed, 0 failed**.
+  - Typecheck: `npx tsc --noEmit` → **0 errors**.
+  - Production build: `npm run build` → **Compiled successfully**.
