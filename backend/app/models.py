@@ -1,6 +1,6 @@
 import datetime
 import sqlalchemy
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, JSON, Table, ForeignKey, func
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, JSON, Table, ForeignKey, Index, func
 from sqlalchemy.orm import relationship
 from app.database import Base
 
@@ -39,6 +39,10 @@ class Tag(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, nullable=False, index=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_tags_name_lower", func.lower(name), unique=True),
+    )
 
     assets = relationship("MediaAsset", secondary=asset_tags, back_populates="tags")
 

@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
@@ -196,6 +197,25 @@ def search_media(
 # --- Tag CRUD Endpoints ---------------------------------------------------
 
 
+def _get_or_create_tag(db: Session, name: str) -> Tag:
+    clean_name = name.strip()
+    lower_name = clean_name.lower()
+    tag = db.query(Tag).filter(func.lower(Tag.name) == lower_name).first()
+    if tag:
+        return tag
+    try:
+        with db.begin_nested():
+            tag = Tag(name=clean_name)
+            db.add(tag)
+            db.flush()
+            return tag
+    except IntegrityError:
+        tag = db.query(Tag).filter(func.lower(Tag.name) == lower_name).first()
+        if tag:
+            return tag
+        raise
+
+
 @router.get("/api/tags", response_model=List[TagOut])
 def list_tags(db: Session = Depends(get_db)):
     """List all tags in alphabetical order."""
@@ -209,11 +229,15 @@ def create_tag(payload: TagCreate, db: Session = Depends(get_db)):
     clean_name = payload.name.strip()
     if not clean_name:
         raise HTTPException(status_code=400, detail="Tag name cannot be empty")
-    tag = db.query(Tag).filter(func.lower(Tag.name) == clean_name.lower()).first()
-    if not tag:
-        tag = Tag(name=clean_name)
-        db.add(tag)
+    tag = _get_or_create_tag(db, clean_name)
+    try:
         db.commit()
+    except IntegrityError:
+        db.rollback()
+        tag = db.query(Tag).filter(func.lower(Tag.name) == clean_name.lower()).first()
+        if not tag:
+            raise
+    else:
         db.refresh(tag)
     return {"id": tag.id, "name": tag.name}
 
@@ -247,15 +271,16 @@ def add_asset_tag(asset_id: int, payload: TagCreate, db: Session = Depends(get_d
     clean_name = payload.name.strip()
     if not clean_name:
         raise HTTPException(status_code=400, detail="Tag name cannot be empty")
-    tag = db.query(Tag).filter(func.lower(Tag.name) == clean_name.lower()).first()
-    if not tag:
-        tag = Tag(name=clean_name)
-        db.add(tag)
-        db.flush()
+    tag = _get_or_create_tag(db, clean_name)
     if tag not in asset.tags:
         asset.tags.append(tag)
-        db.commit()
-        db.refresh(asset)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
+        else:
+            db.refresh(asset)
     return {
         "id": tag.id,
         "name": tag.name,
@@ -300,16 +325,17 @@ def set_asset_tags(asset_id: int, payload: AssetTagsUpdate, db: Session = Depend
         if lower_name in seen:
             continue
         seen.add(lower_name)
-        tag = db.query(Tag).filter(func.lower(Tag.name) == lower_name).first()
-        if not tag:
-            tag = Tag(name=clean_name)
-            db.add(tag)
-            db.flush()
+        tag = _get_or_create_tag(db, clean_name)
         new_tags.append(tag)
 
     asset.tags = new_tags
-    db.commit()
-    db.refresh(asset)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
+    else:
+        db.refresh(asset)
     return {
         "asset_id": asset.id,
         "tags": [{"id": t.id, "name": t.name} for t in asset.tags],

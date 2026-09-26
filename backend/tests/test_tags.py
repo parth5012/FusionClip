@@ -90,6 +90,13 @@ def test_create_tag_endpoint(client, db_session):
     res2 = client.post("/api/tags", json={"name": "cinematic"})
     assert res2.status_code in (200, 201)
     assert res2.json()["id"] == data["id"]
+    assert db_session.query(Tag).filter(Tag.name == "cinematic").count() == 1
+
+    # Case-insensitive duplicate create yields existing row, no 500
+    res_case = client.post("/api/tags", json={"name": "CINEMATIC"})
+    assert res_case.status_code in (200, 201)
+    assert res_case.json()["id"] == data["id"]
+    assert db_session.query(Tag).filter(Tag.name == "cinematic").count() == 1
 
 
 def test_add_and_remove_tag_on_asset(client, db_session):
@@ -148,6 +155,18 @@ def test_put_asset_tags_bulk(client, db_session):
     oversized_tags = [f"tag{i}" for i in range(51)]
     res_oversized = client.put(f"/api/media/{asset.id}/tags", json={"tags": oversized_tags})
     assert res_oversized.status_code == 422
+
+    # Reject list with comma-containing tag element
+    res_comma_elem = client.put(f"/api/media/{asset.id}/tags", json={"tags": ["valid", "invalid,tag"]})
+    assert res_comma_elem.status_code == 422
+
+    # Reject list with >64-char tag element
+    res_long_elem = client.put(f"/api/media/{asset.id}/tags", json={"tags": ["valid", "x" * 65]})
+    assert res_long_elem.status_code == 422
+
+    # Reject list with empty string element
+    res_empty_elem = client.put(f"/api/media/{asset.id}/tags", json={"tags": [""]})
+    assert res_empty_elem.status_code == 422
 
     # Accept list with exactly 50 tags
     max_tags = [f"tag{i}" for i in range(50)]
@@ -249,3 +268,32 @@ def test_search_media_with_tag_filters(client, db_session):
     assert res.status_code == 200
     ids = {item["id"] for item in res.json()}
     assert ids == {a1.id, a2.id}
+
+
+def test_case_variant_concurrency_and_integrity_error_recovery(client, db_session):
+    """Case-variant tags must not duplicate or raise 500 when created concurrently."""
+    # 1. Create tag "Forest"
+    tag_initial = Tag(name="Forest")
+    db_session.add(tag_initial)
+    db_session.commit()
+
+    # 2. POST /api/tags with lowercase "forest" returns the existing tag without creating a new row
+    res = client.post("/api/tags", json={"name": "forest"})
+    assert res.status_code in (200, 201)
+    assert res.json()["id"] == tag_initial.id
+    assert db_session.query(Tag).count() == 1
+
+    # 3. Add case-variant tag via POST /api/media/{asset_id}/tags
+    asset = _create_asset(db_session, "Deep Woods", "woods.jpg")
+    res = client.post(f"/api/media/{asset.id}/tags", json={"name": "FOREST"})
+    assert res.status_code in (200, 201)
+    assert res.json()["id"] == tag_initial.id
+    assert db_session.query(Tag).count() == 1
+    assert any(t["id"] == tag_initial.id for t in res.json()["tags"])
+
+    # 4. PUT /api/media/{asset_id}/tags with case variant reuses existing row
+    res = client.put(f"/api/media/{asset.id}/tags", json={"tags": ["fOrEsT", "nature"]})
+    assert res.status_code == 200
+    assert db_session.query(Tag).count() == 2
+    forest_tag = next(t for t in res.json()["tags"] if t["name"].lower() == "forest")
+    assert forest_tag["id"] == tag_initial.id
