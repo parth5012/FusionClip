@@ -12,7 +12,7 @@ import uuid
 from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 from pydantic import BaseModel
 
 from app.celery_app import celery
@@ -192,6 +192,65 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
     }
 
 
+RUNNING_STATUSES = frozenset({"PROCESSING", "PROGRESS", "RUNNING", "RETRYING"})
+PENDING_STATUSES = frozenset({"PENDING", "PENDING_RETRY", "QUEUED", "WAITING"})
+FAILED_STATUSES = frozenset({"FAILED", "FAILURE"})
+COMPLETED_STATUSES = frozenset({"COMPLETED", "SUCCESS"})
+
+
+class TaskCountsResponse(BaseModel):
+    running: int = 0
+    pending: int = 0
+    failed: int = 0
+    completed: int = 0
+
+
+@router.get("/api/tasks/counts", response_model=TaskCountsResponse)
+def get_task_counts(db: Session = Depends(get_db)):
+    """Retrieve running/pending/failed/completed counts across DB and Celery Redis queues."""
+    status_counts = (
+        db.query(func.upper(Task.status), func.count(Task.id))
+        .group_by(func.upper(Task.status))
+        .all()
+    )
+    running = 0
+    pending = 0
+    failed = 0
+    completed = 0
+    for raw_status, count in status_counts:
+        if not raw_status:
+            continue
+        status = raw_status.strip()
+        if status in RUNNING_STATUSES:
+            running += count
+        elif status in PENDING_STATUSES:
+            pending += count
+        elif status in FAILED_STATUSES:
+            failed += count
+        elif status in COMPLETED_STATUSES:
+            completed += count
+
+    # Redis Celery broker queue backlog
+    redis_pending = 0
+    if redis_client:
+        celery_queues = ["celery", "media.fast", "media.heavy"]
+        for q in celery_queues:
+            try:
+                q_len = redis_client.llen(q)
+                if q_len:
+                    redis_pending += int(q_len)
+            except Exception as e:
+                logger.warning(f"Failed to inspect Redis queue length for '{q}': {e}")
+    pending += redis_pending
+
+    return TaskCountsResponse(
+        running=running,
+        pending=pending,
+        failed=failed,
+        completed=completed,
+    )
+
+
 @router.websocket("/api/ws/tasks")
 async def websocket_tasks_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -209,11 +268,18 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
                     data = data.decode()
                 data = json.loads(data)
                 await websocket.send_json(data)
+            else:
+                await asyncio.sleep(0.01)
     except WebSocketDisconnect:
         logger.info("WebSocket connection disconnected")
+    except Exception as e:
+        logger.warning(f"WebSocket tasks connection error: {e}")
     finally:
-        pubsub.unsubscribe("task_updates")
-        pubsub.close()
+        try:
+            pubsub.unsubscribe("task_updates")
+            pubsub.close()
+        except Exception:
+            pass
 
 
 class TaskListItem(BaseModel):

@@ -58,9 +58,9 @@ const menuItems = [
     },
     {
       id: 'queue' as TabType,
-      label: 'Queue Dashboard',
+      label: 'Task Queue',
       icon: ListOrdered,
-      description: 'Background task history',
+      description: 'Monitor background task queue',
     },
   ];
 
