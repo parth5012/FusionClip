@@ -12,6 +12,8 @@ import PlayersPanel from '../components/PlayersPanel';
 import MonitorPanel from '../components/MonitorPanel';
 import UpscalePanel from '../components/UpscalePanel';
 import QueueDashboard from '../components/QueueDashboard';
+// PROTOTYPE (map #73 / #113) — three Skin Enhancer panel layouts, ?skinVariant=A|B|C.
+import SkinPrototypeHost from '../components/skin-prototype';
 import { useStore } from '../store/useStore';
 
 export default function Home() {
@@ -29,6 +31,7 @@ export default function Home() {
               </p>
             </div>
             <FileManager />
+            <SkinPrototypeHost />
           </div>
         );
       case 'catalog':
