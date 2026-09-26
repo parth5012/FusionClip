@@ -20,11 +20,10 @@ import {
   WifiOff,
   ListOrdered,
 } from 'lucide-react';
-import { fetchTasks, fetchTaskCounts, retryTask, TaskListItem } from '../utils/api';
+import { fetchTasks, fetchTaskCounts, retryTask } from '../utils/api';
 import {
   categorizeTaskStatus,
   applyTaskUpdate,
-  adjustTaskCounts,
   TaskCounts,
   TaskItem,
   TaskBucket,
@@ -121,6 +120,9 @@ export default function QueueDashboard() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectAttemptsRef = useRef(0);
+  const inFlightBackfillRef = useRef(false);
+  const pendingBackfillRef = useRef(false);
 
   // Backfill counts from REST endpoint
   const backfillCounts = useCallback(async () => {
@@ -132,10 +134,28 @@ export default function QueueDashboard() {
         failed: countsData.failed,
         completed: countsData.completed,
       });
-    } catch (err: any) {
-      console.warn('Failed to backfill task counts:', err);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn('Failed to backfill task counts:', message);
     }
   }, []);
+
+  const throttledBackfill = useCallback(async () => {
+    if (inFlightBackfillRef.current) {
+      pendingBackfillRef.current = true;
+      return;
+    }
+    inFlightBackfillRef.current = true;
+    try {
+      await backfillCounts();
+    } finally {
+      inFlightBackfillRef.current = false;
+      if (pendingBackfillRef.current) {
+        pendingBackfillRef.current = false;
+        throttledBackfill();
+      }
+    }
+  }, [backfillCounts]);
 
   // Fetch tasks list
   const loadTasks = useCallback(async () => {
@@ -152,12 +172,23 @@ export default function QueueDashboard() {
       );
       setTasks(data.tasks);
       setTotal(data.total);
-    } catch (err: any) {
-      setError(err.message || 'Failed to load tasks');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to load tasks';
+      setError(message);
     } finally {
       setLoading(false);
     }
   }, [page, pageSize, statusFilter, typeFilter, searchQuery]);
+
+  // Hold stable refs so WebSocket effect does not re-subscribe on filter/page changes
+  const loadTasksRef = useRef(loadTasks);
+  loadTasksRef.current = loadTasks;
+
+  const backfillCountsRef = useRef(backfillCounts);
+  backfillCountsRef.current = backfillCounts;
+
+  const throttledBackfillRef = useRef(throttledBackfill);
+  throttledBackfillRef.current = throttledBackfill;
 
   // Initial load
   useEffect(() => {
@@ -170,8 +201,9 @@ export default function QueueDashboard() {
     try {
       await retryTask(taskId);
       await Promise.all([loadTasks(), backfillCounts()]);
-    } catch (err: any) {
-      setError(err.message || 'Failed to retry task');
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to retry task';
+      setError(message);
     } finally {
       setRetryingIds((prev) => {
         const next = new Set(prev);
@@ -185,15 +217,26 @@ export default function QueueDashboard() {
   useEffect(() => {
     const wsUrl = `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/ws/tasks`.replace(/^http/, 'ws');
 
+    const scheduleReconnect = () => {
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      // Capped exponential backoff: 1s, 2s, 4s, 8s, up to 15s max
+      const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 15000);
+      reconnectAttemptsRef.current += 1;
+      reconnectTimeoutRef.current = setTimeout(connect, delay);
+    };
+
     const connect = () => {
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
         setWsStatus('connected');
+        reconnectAttemptsRef.current = 0;
         // Backfill REST state on connect and after reconnect
-        backfillCounts();
-        loadTasks();
+        backfillCountsRef.current();
+        loadTasksRef.current();
       };
 
       ws.onmessage = (event) => {
@@ -201,17 +244,17 @@ export default function QueueDashboard() {
           const update = JSON.parse(event.data);
           if (!update || !update.task_id) return;
 
-          setTasks((prevTasks) => {
-            const existing = prevTasks.find((t) => t.task_id === update.task_id);
-            const oldStatus = existing ? existing.status : null;
+          setTasks((prevTasks) => applyTaskUpdate(prevTasks, update));
 
-            // Dynamically adjust count cards
-            setCounts((prevCounts) =>
-              adjustTaskCounts(prevCounts, oldStatus, update.status || 'PROCESSING')
-            );
-
-            return applyTaskUpdate(prevTasks, update);
-          });
+          const statusUpper = (update.status || '').toUpperCase();
+          if (
+            statusUpper === 'COMPLETED' ||
+            statusUpper === 'SUCCESS' ||
+            statusUpper === 'FAILED' ||
+            statusUpper === 'FAILURE'
+          ) {
+            throttledBackfillRef.current();
+          }
         } catch {
           // ignore malformed frames
         }
@@ -220,7 +263,7 @@ export default function QueueDashboard() {
       ws.onclose = () => {
         setWsStatus('reconnecting');
         // Do NOT blank out tasks or counts; keep stale data visible
-        reconnectTimeoutRef.current = setTimeout(connect, 3000);
+        scheduleReconnect();
       };
 
       ws.onerror = () => {
@@ -232,10 +275,20 @@ export default function QueueDashboard() {
     connect();
 
     return () => {
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      wsRef.current?.close();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     };
-  }, [backfillCounts, loadTasks]);
+  }, []);
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 

@@ -183,7 +183,7 @@ export async function fetchTasks(
   params.set('page', String(page));
   params.set('page_size', String(pageSize));
   if (status) params.set('status', status);
-  if (taskType) params.set('type', taskType);
+  if (taskType) params.set('task_type', taskType);
   if (search) params.set('search', search);
   if (errorType) params.set('error_type', errorType);
   const url = `${API_BASE_URL}/api/tasks/list?${params.toString()}`;
