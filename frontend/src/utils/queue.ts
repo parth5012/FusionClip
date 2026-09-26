@@ -35,6 +35,7 @@ export interface TaskUpdatePayload {
   error?: string | null;
   error_type?: string | null;
   traceback?: string | null;
+  logs?: string | null;
   retry_count?: number;
   max_retries?: number;
   name?: string;
@@ -76,6 +77,7 @@ export function applyTaskUpdate(tasks: TaskItem[], update: TaskUpdatePayload): T
       error: update.error !== undefined ? update.error : existing.error,
       error_type: update.error_type !== undefined ? update.error_type : existing.error_type,
       traceback: update.traceback !== undefined ? update.traceback : existing.traceback,
+      logs: update.logs !== undefined ? update.logs : existing.logs,
       retry_count: update.retry_count !== undefined ? update.retry_count : existing.retry_count,
       max_retries: update.max_retries !== undefined ? update.max_retries : existing.max_retries,
       updated_at: new Date().toISOString(),
@@ -140,4 +142,157 @@ export function calculateTaskCounts(tasks: TaskItem[]): TaskCounts {
     }
   }
   return counts;
+}
+
+export interface TaskLogEvent {
+  event: string;
+  timestamp?: string;
+  task_id?: string;
+  task_name?: string;
+  error?: string;
+  error_type?: string;
+  traceback?: string;
+  retry_count?: number;
+  max_retries?: number;
+  reason?: string;
+  status?: string;
+  result_summary?: string;
+  message?: string;
+  [key: string]: any;
+}
+
+/**
+ * Parse raw Task.logs string into structured event list (#108).
+ * Supports JSON Lines (NDJSON), JSON array, and legacy non-JSON text lines.
+ * Degrades gracefully on null/empty/malformed rows without crashing.
+ */
+export function parseTaskLogs(rawLogs?: string | null): TaskLogEvent[] {
+  if (!rawLogs || typeof rawLogs !== 'string') return [];
+  const trimmed = rawLogs.trim();
+  if (!trimmed) return [];
+
+  // Try JSON array first
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed.map((item) =>
+          typeof item === 'object' && item !== null
+            ? (item as TaskLogEvent)
+            : { event: 'log', message: String(item) }
+        );
+      }
+    } catch {
+      // Fall through to line-by-line parsing
+    }
+  }
+
+  // Parse line by line (NDJSON / legacy plain text)
+  const lines = trimmed.split('\n');
+  const events: TaskLogEvent[] = [];
+
+  for (const line of lines) {
+    const lineTrimmed = line.trim();
+    if (!lineTrimmed) continue;
+
+    try {
+      const parsed = JSON.parse(lineTrimmed);
+      if (typeof parsed === 'object' && parsed !== null) {
+        events.push(parsed as TaskLogEvent);
+      } else {
+        events.push({ event: 'log', message: String(parsed) });
+      }
+    } catch {
+      // Legacy plain text line or non-JSON log
+      events.push({ event: 'log', message: lineTrimmed });
+    }
+  }
+
+  return events;
+}
+
+/**
+ * Human-readable label for task lifecycle events.
+ */
+export function formatEventLabel(event: TaskLogEvent): string {
+  if (!event || !event.event) return 'Event';
+  switch (event.event.toLowerCase()) {
+    case 'started':
+      return 'Task Started';
+    case 'failed':
+      return 'Task Failed';
+    case 'retry':
+      return 'Task Retrying';
+    case 'finished':
+      return 'Task Completed';
+    case 'pruned':
+      return 'Logs Pruned';
+    case 'log':
+      return 'Log';
+    default:
+      return event.event
+        .split('_')
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+  }
+}
+
+/**
+ * Visual styling classes for event badge pills.
+ */
+export function getEventBadgeStyle(event: TaskLogEvent): {
+  bg: string;
+  text: string;
+  border: string;
+} {
+  const ev = (event?.event || '').toLowerCase();
+  switch (ev) {
+    case 'started':
+      return {
+        bg: 'bg-sky-950/80',
+        text: 'text-sky-400',
+        border: 'border-sky-800',
+      };
+    case 'failed':
+      return {
+        bg: 'bg-rose-950/80',
+        text: 'text-rose-400',
+        border: 'border-rose-800',
+      };
+    case 'retry':
+      return {
+        bg: 'bg-amber-950/80',
+        text: 'text-amber-400',
+        border: 'border-amber-800',
+      };
+    case 'finished':
+      return {
+        bg: 'bg-emerald-950/80',
+        text: 'text-emerald-400',
+        border: 'border-emerald-800',
+      };
+    case 'pruned':
+      return {
+        bg: 'bg-slate-900',
+        text: 'text-slate-400',
+        border: 'border-slate-700',
+      };
+    default:
+      return {
+        bg: 'bg-slate-850',
+        text: 'text-slate-300',
+        border: 'border-slate-700',
+      };
+  }
+}
+
+/**
+ * Check if an event contains non-empty Python traceback.
+ */
+export function hasTraceback(event: TaskLogEvent): boolean {
+  return (
+    !!event &&
+    typeof event.traceback === 'string' &&
+    event.traceback.trim().length > 0
+  );
 }

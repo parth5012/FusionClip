@@ -5,9 +5,14 @@ import {
   applyTaskUpdate,
   adjustTaskCounts,
   calculateTaskCounts,
+  parseTaskLogs,
+  formatEventLabel,
+  getEventBadgeStyle,
+  hasTraceback,
   TaskUpdatePayload,
   TaskItem,
   TaskCounts,
+  TaskLogEvent,
 } from './queue';
 
 describe('Task Queue: status categorization (#107)', () => {
@@ -170,5 +175,103 @@ describe('Task Queue: calculateTaskCounts from task array (#107)', () => {
       failed: 1,
       completed: 1,
     });
+  });
+});
+
+describe('Task Queue: task logs parsing and formatting (#108)', () => {
+  it('parses JSON Lines logs into structured events', () => {
+    const rawLogs = [
+      JSON.stringify({ event: 'started', timestamp: '2026-09-26T10:00:00Z', task_name: 'transcode' }),
+      JSON.stringify({
+        event: 'failed',
+        timestamp: '2026-09-26T10:00:05Z',
+        error: 'CUDA out of memory',
+        error_type: 'OOM',
+        traceback: 'Traceback (most recent call last):\n  File "run.py", line 10\nMemoryError',
+      }),
+    ].join('\n');
+
+    const events = parseTaskLogs(rawLogs);
+    assert.equal(events.length, 2);
+    assert.equal(events[0].event, 'started');
+    assert.equal(events[0].task_name, 'transcode');
+    assert.equal(events[1].event, 'failed');
+    assert.equal(events[1].error_type, 'OOM');
+    assert.match(events[1].traceback!, /MemoryError/);
+  });
+
+  it('parses JSON array format seamlessly', () => {
+    const rawArray = JSON.stringify([
+      { event: 'started', timestamp: '2026-09-26T10:00:00Z', task_name: 'waveform' },
+      { event: 'finished', timestamp: '2026-09-26T10:00:03Z', status: 'COMPLETED', result_summary: 'OK' },
+    ]);
+
+    const events = parseTaskLogs(rawArray);
+    assert.equal(events.length, 2);
+    assert.equal(events[0].event, 'started');
+    assert.equal(events[1].event, 'finished');
+    assert.equal(events[1].status, 'COMPLETED');
+  });
+
+  it('handles null, undefined, empty, or whitespace logs gracefully', () => {
+    assert.deepEqual(parseTaskLogs(null), []);
+    assert.deepEqual(parseTaskLogs(undefined), []);
+    assert.deepEqual(parseTaskLogs(''), []);
+    assert.deepEqual(parseTaskLogs('   \n  \t '), []);
+  });
+
+  it('handles legacy non-JSON plain text lines without crashing', () => {
+    const legacyLogs = 'Step 1/4: initial frame extraction\nStep 2/4: upscaling\nDone in 2.4s';
+    const events = parseTaskLogs(legacyLogs);
+    assert.equal(events.length, 3);
+    assert.equal(events[0].event, 'log');
+    assert.equal(events[0].message, 'Step 1/4: initial frame extraction');
+    assert.equal(events[1].message, 'Step 2/4: upscaling');
+  });
+
+  it('handles mixed valid JSON lines and corrupt lines without dropping valid lines', () => {
+    const mixedLogs = [
+      JSON.stringify({ event: 'started', timestamp: '2026-09-26T10:00:00Z' }),
+      '{INVALID_JSON_CORRUPT_LINE',
+      JSON.stringify({ event: 'finished', timestamp: '2026-09-26T10:00:02Z', status: 'COMPLETED' }),
+    ].join('\n');
+
+    const events = parseTaskLogs(mixedLogs);
+    assert.equal(events.length, 3);
+    assert.equal(events[0].event, 'started');
+    assert.equal(events[1].event, 'log');
+    assert.equal(events[1].message, '{INVALID_JSON_CORRUPT_LINE');
+    assert.equal(events[2].event, 'finished');
+  });
+
+  it('formats event labels accurately', () => {
+    assert.equal(formatEventLabel({ event: 'started' }), 'Task Started');
+    assert.equal(formatEventLabel({ event: 'failed' }), 'Task Failed');
+    assert.equal(formatEventLabel({ event: 'retry' }), 'Task Retrying');
+    assert.equal(formatEventLabel({ event: 'finished' }), 'Task Completed');
+    assert.equal(formatEventLabel({ event: 'pruned' }), 'Logs Pruned');
+    assert.equal(formatEventLabel({ event: 'log' }), 'Log');
+    assert.equal(formatEventLabel({ event: 'custom_hook' }), 'Custom Hook');
+  });
+
+  it('returns badge style object for event types', () => {
+    const startedStyle = getEventBadgeStyle({ event: 'started' });
+    assert.ok(startedStyle.bg.includes('sky') || startedStyle.text.includes('sky'));
+
+    const failedStyle = getEventBadgeStyle({ event: 'failed' });
+    assert.ok(failedStyle.bg.includes('rose') || failedStyle.text.includes('rose'));
+
+    const finishedStyle = getEventBadgeStyle({ event: 'finished' });
+    assert.ok(finishedStyle.bg.includes('emerald') || finishedStyle.text.includes('emerald'));
+
+    const retryStyle = getEventBadgeStyle({ event: 'retry' });
+    assert.ok(retryStyle.bg.includes('amber') || retryStyle.text.includes('amber'));
+  });
+
+  it('detects presence of traceback', () => {
+    assert.equal(hasTraceback({ event: 'failed', traceback: 'Traceback...' }), true);
+    assert.equal(hasTraceback({ event: 'failed', traceback: '' }), false);
+    assert.equal(hasTraceback({ event: 'failed', traceback: '   ' }), false);
+    assert.equal(hasTraceback({ event: 'failed' }), false);
   });
 });

@@ -96,7 +96,6 @@
 - Python compile check: clean.
 
 
-
 ## 2026-09-24: Wayfinder Map #70 - Magnific Core Upscaler (#96 ship)
 
 ### Iteration Status: Done
@@ -188,3 +187,19 @@
   - Frontend: `bun test src/utils/` → **23 passed, 0 failed**.
   - Typecheck: `npx tsc --noEmit` → **0 errors**.
   - Production build: `npm run build` → **Compiled successfully**.
+
+## 2026-09-26: Wayfinder Map #72 - Task Logs & Error Viewer (#108)
+
+### Iteration Status: Done
+
+- **#108 Capture stack traces into Task.logs and build error-log viewer**
+  - Backend: Created `backend/app/task_logging.py` wiring Celery lifecycle signals (`task_prerun`, `task_postrun`, `task_failure`, `task_retry`) and fallback helper `_handle_task_failure`. Events (`started`, `failed`, `retry`, `finished`) stored as NDJSON in `Task.logs`. Full Python traceback saved to `Task.traceback` column, while `Task.logs` traceback is bounded (8KB cap + explicit truncation marker). Concurrency protected via thread-safety and bounded caps (max 50 events, 64KB). Added `logs` to `TaskListItem` response model in `backend/app/routers/tasks.py`.
+  - Frontend: `frontend/src/utils/queue.ts` parser and formatting helpers (`parseTaskLogs`, `formatEventLabel`, `getEventBadgeStyle`, `hasTraceback`). `frontend/src/components/QueueDashboard.tsx` expanded row logs viewer (`TaskLogsViewer`) showing event badges, timestamp, failure diagnostics, collapsible monospace Python stack trace, and copy-to-clipboard button.
+  - Tests: `backend/tests/test_task_logs.py` (6 tests covering success events, failure stack trace, oversized truncation, concurrent appends, API list exposure, edge cases). `frontend/src/utils/queue.test.ts` (8 new tests covering NDJSON parsing, JSON array fallback, legacy string wrapping, badge styles, traceback detection).
+
+### Overall Verification:
+- Backend: `pytest` → **318 passed, 2 skipped**.
+- Frontend unit: `bun test src/utils/` → **32 passed**.
+- Typecheck: `npx tsc --noEmit` → **clean (0 errors)**.
+- Build: `npm run build` → **compiled successfully**.
+
