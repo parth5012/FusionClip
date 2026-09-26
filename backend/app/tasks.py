@@ -176,15 +176,6 @@ def _handle_task_failure(task_id: str, e: Exception, max_retries: int) -> bool:
             )
             update_task_retry(db_task, new_retry_count, db)
             db_task.status = "RETRYING"
-            from app.task_logging import append_task_event
-            append_task_event(
-                task_id=task_id,
-                event_type="retry",
-                db=db,
-                reason=error_msg,
-                traceback=tb,
-                retry_count=new_retry_count,
-            )
             db.commit()
 
             redis_client.publish("task_updates", json.dumps({
@@ -202,15 +193,6 @@ def _handle_task_failure(task_id: str, e: Exception, max_retries: int) -> bool:
             db_task.error = error_msg
             db_task.traceback = tb
             db_task.error_type = error_type
-            from app.task_logging import append_task_event
-            append_task_event(
-                task_id=task_id,
-                event_type="failed",
-                db=db,
-                error=error_msg,
-                error_type=error_type,
-                traceback=tb,
-            )
             db.commit()
 
             redis_client.publish("task_updates", json.dumps({

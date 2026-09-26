@@ -20,6 +20,7 @@ from app.config import settings
 from app.tasks import process_multimedia_task, process_upscale_task, exponential_backoff
 from app.deps import get_db
 from app.models import Task
+from app.task_logging import parse_log_events
 
 logger = logging.getLogger(__name__)
 
@@ -144,8 +145,7 @@ def list_tasks(
                 "status": t.status,
                 "progress": t.progress,
                 "error": t.error,
-                "logs": t.logs,
-                "traceback": t.traceback,
+                "event_count": len(parse_log_events(t.logs)) if t.logs else 0,
                 "error_type": t.error_type,
                 "retry_count": t.retry_count,
                 "max_retries": t.max_retries,
@@ -303,8 +303,7 @@ class TaskListItem(BaseModel):
     progress: int
     error: Optional[str] = None
     error_type: Optional[str] = None
-    traceback: Optional[str] = None
-    logs: Optional[str] = None
+    event_count: int = 0
     retry_count: int
     max_retries: int
     created_at: Optional[str] = None
@@ -316,6 +315,13 @@ class TaskListResponse(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class TaskLogsResponse(BaseModel):
+    task_id: str
+    logs: Optional[str] = None
+    traceback: Optional[str] = None
+    event_count: int = 0
 
 
 class ErrorTypesResponse(BaseModel):
@@ -361,8 +367,7 @@ def list_tasks(
                 progress=t.progress,
                 error=t.error,
                 error_type=t.error_type,
-                traceback=t.traceback,
-                logs=t.logs,
+                event_count=len(parse_log_events(t.logs)) if t.logs else 0,
                 retry_count=t.retry_count,
                 max_retries=t.max_retries,
                 created_at=t.created_at.isoformat() if t.created_at else None,
@@ -380,6 +385,22 @@ def list_tasks(
 def get_error_types():
     """Return available error type categories."""
     return ErrorTypesResponse(error_types=["OOM", "timeout", "validation", "runtime"])
+
+
+@router.get("/api/tasks/{task_id}/logs", response_model=TaskLogsResponse)
+def get_task_logs(task_id: str, db: Session = Depends(get_db)):
+    """Retrieve detailed logs and traceback for a specific task (#108)."""
+    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    events = parse_log_events(db_task.logs)
+    return TaskLogsResponse(
+        task_id=task_id,
+        logs=db_task.logs,
+        traceback=db_task.traceback,
+        event_count=len(events),
+    )
 
 
 @router.post("/api/tasks/{task_id}/retry", response_model=RetryResponse)
@@ -401,9 +422,9 @@ def retry_task(task_id: str, db: Session = Depends(get_db)):
     db.commit()
 
     if db_task.name == "upscale":
-        process_multimedia_task.delay("", "transcode")
+        process_multimedia_task.apply_async(args=["", "transcode"], task_id=task_id)
     else:
-        process_multimedia_task.delay("", db_task.name)
+        process_multimedia_task.apply_async(args=["", db_task.name], task_id=task_id)
 
     return RetryResponse(message="Task queued for retry", task_id=task_id)
 

@@ -116,7 +116,7 @@ def append_task_event(
         close_session = db is None
 
         try:
-            db_task = session.query(Task).filter(Task.task_id == task_id).first()
+            db_task = session.query(Task).filter(Task.task_id == task_id).with_for_update().first()
             if not db_task:
                 task_name = kwargs.get("task_name") or "task"
                 db_task = Task(
@@ -145,8 +145,9 @@ def append_task_event(
                 db_task.status = "FAILED"
                 error_raw = kwargs.get("error")
                 error_str = sanitize_str(error_raw) if error_raw is not None else "Unknown error"
-                event["error"] = error_str
-                db_task.error = error_str
+                bounded_error = truncate_text(error_str, MAX_TRACEBACK_LEN, "\n... [TRUNCATED: error exceeded limit]")
+                event["error"] = bounded_error
+                db_task.error = bounded_error
 
                 error_type = sanitize_str(kwargs.get("error_type") or categorize_error(error_str))
                 event["error_type"] = error_type
@@ -163,7 +164,8 @@ def append_task_event(
             elif event_type == "retry":
                 db_task.status = "RETRYING"
                 reason = kwargs.get("reason") or kwargs.get("error")
-                event["reason"] = sanitize_str(reason) if reason is not None else None
+                reason_str = sanitize_str(reason) if reason is not None else None
+                event["reason"] = truncate_text(reason_str, MAX_TRACEBACK_LEN, "\n... [TRUNCATED: reason exceeded limit]")
                 raw_tb = kwargs.get("traceback")
                 if raw_tb is not None:
                     event["traceback"] = truncate_text(sanitize_str(raw_tb), MAX_TRACEBACK_LEN, TRUNCATION_MARKER)
@@ -196,6 +198,8 @@ def append_task_event(
                     return db_task
                 if event_type == "started" and last_ev.get("task_name") == event.get("task_name"):
                     return db_task
+                if event_type == "retry" and last_ev.get("retry_count") == event.get("retry_count"):
+                    return db_task
 
             existing_events.append(event)
 
@@ -212,12 +216,29 @@ def append_task_event(
             # Serialize to NDJSON (JSON Lines)
             serialized = "\n".join(json.dumps(ev, ensure_ascii=False) for ev in existing_events) + "\n"
 
-            # Check total byte size
+            # Check total byte size and trim down to hard floor (2 events)
             if len(serialized.encode("utf-8", errors="replace")) > MAX_LOGS_BYTES:
-                # Retain only the most recent events that fit
-                while len(existing_events) > 3 and len(serialized.encode("utf-8", errors="replace")) > MAX_LOGS_BYTES:
+                # Retain only the most recent events that fit (down to hard floor: 2 events)
+                while len(existing_events) > 2 and len(serialized.encode("utf-8", errors="replace")) > MAX_LOGS_BYTES:
                     existing_events.pop(1)
                     serialized = "\n".join(json.dumps(ev, ensure_ascii=False) for ev in existing_events) + "\n"
+
+                # If still exceeds MAX_LOGS_BYTES even at 2 events (or 1 event):
+                # aggressively trim traceback and error on the latest event
+                if len(serialized.encode("utf-8", errors="replace")) > MAX_LOGS_BYTES and existing_events:
+                    latest = existing_events[-1]
+                    excess = len(serialized.encode("utf-8", errors="replace")) - MAX_LOGS_BYTES + 100
+                    if "traceback" in latest and latest["traceback"]:
+                        cur_len = len(latest["traceback"])
+                        new_len = max(50, cur_len - excess)
+                        latest["traceback"] = truncate_text(latest["traceback"][:new_len], new_len, TRUNCATION_MARKER)
+                        serialized = "\n".join(json.dumps(ev, ensure_ascii=False) for ev in existing_events) + "\n"
+                    excess2 = len(serialized.encode("utf-8", errors="replace")) - MAX_LOGS_BYTES + 100
+                    if excess2 > 0 and "error" in latest and latest["error"]:
+                        cur_len = len(latest["error"])
+                        new_len = max(50, cur_len - excess2)
+                        latest["error"] = truncate_text(latest["error"][:new_len], new_len, "\n... [TRUNCATED: error exceeded limit]")
+                        serialized = "\n".join(json.dumps(ev, ensure_ascii=False) for ev in existing_events) + "\n"
 
             db_task.logs = serialized
             session.commit()
@@ -238,49 +259,65 @@ def append_task_event(
 @task_prerun.connect
 def on_task_prerun(task_id=None, task=None, args=None, kwargs=None, **kw):
     """Fired when a task starts execution."""
-    if not task_id:
+    try:
+        if not task_id:
+            return
+        task_name = getattr(task, "name", "unknown") if task else "unknown"
+        append_task_event(task_id, "started", task_name=task_name)
+    except Exception as e:
+        logger.warning(f"Error in on_task_prerun signal handler for task {task_id}: {e}")
         return
-    task_name = getattr(task, "name", "unknown") if task else "unknown"
-    append_task_event(task_id, "started", task_name=task_name)
 
 
 @task_postrun.connect
 def on_task_postrun(task_id=None, task=None, args=None, kwargs=None, retval=None, state=None, **kw):
     """Fired after a task has finished executing."""
-    if not task_id:
+    try:
+        if not task_id:
+            return
+        # Only record finished event on success/completion; failure is recorded by task_failure
+        if state in ("SUCCESS", "COMPLETED"):
+            append_task_event(task_id, "finished", status="COMPLETED", retval=retval)
+    except Exception as e:
+        logger.warning(f"Error in on_task_postrun signal handler for task {task_id}: {e}")
         return
-    # Only record finished event on success/completion; failure is recorded by task_failure
-    if state in ("SUCCESS", "COMPLETED"):
-        append_task_event(task_id, "finished", status="COMPLETED", retval=retval)
 
 
 @task_failure.connect
 def on_task_failure(task_id=None, exception=None, args=None, kwargs=None, traceback=None, einfo=None, **kw):
     """Fired when a task fails with an unhandled exception."""
-    if not task_id:
+    try:
+        if not task_id:
+            return
+
+        full_tb = ""
+        if einfo and getattr(einfo, "traceback", None):
+            full_tb = einfo.traceback
+        elif traceback:
+            import traceback as tb_module
+            full_tb = "".join(tb_module.format_tb(traceback))
+        else:
+            import traceback as tb_module
+            full_tb = tb_module.format_exc()
+
+        error_msg = str(exception) if exception else "Task failed"
+        append_task_event(task_id, "failed", error=error_msg, traceback=full_tb)
+    except Exception as e:
+        logger.warning(f"Error in on_task_failure signal handler for task {task_id}: {e}")
         return
-
-    full_tb = ""
-    if einfo and getattr(einfo, "traceback", None):
-        full_tb = einfo.traceback
-    elif traceback:
-        import traceback as tb_module
-        full_tb = "".join(tb_module.format_tb(traceback))
-    else:
-        import traceback as tb_module
-        full_tb = tb_module.format_exc()
-
-    error_msg = str(exception) if exception else "Task failed"
-    append_task_event(task_id, "failed", error=error_msg, traceback=full_tb)
 
 
 @task_retry.connect
 def on_task_retry(request=None, reason=None, einfo=None, **kw):
     """Fired when a task is scheduled for retry."""
-    task_id = getattr(request, "id", None) if request else None
-    if not task_id:
-        return
+    try:
+        task_id = getattr(request, "id", None) if request else None
+        if not task_id:
+            return
 
-    full_tb = einfo.traceback if einfo and getattr(einfo, "traceback", None) else None
-    retry_count = getattr(request, "retries", None) if request else None
-    append_task_event(task_id, "retry", reason=str(reason) if reason else None, traceback=full_tb, retry_count=retry_count)
+        full_tb = einfo.traceback if einfo and getattr(einfo, "traceback", None) else None
+        retry_count = getattr(request, "retries", None) if request else None
+        append_task_event(task_id, "retry", reason=str(reason) if reason else None, traceback=full_tb, retry_count=retry_count)
+    except Exception as e:
+        logger.warning(f"Error in on_task_retry signal handler for task {task_id}: {e}")
+        return

@@ -203,3 +203,24 @@
 - Typecheck: `npx tsc --noEmit` → **clean (0 errors)**.
 - Build: `npm run build` → **compiled successfully**.
 
+
+## 2026-09-26: Code Review on #108 - Task Logs & Error Viewer
+
+### Iteration Status: Done
+
+- **Addressed all 7 review findings for #108:**
+  - Blocker 1: Fixed upscale ID mismatch in `backend/app/routers/upscale.py` and `backend/app/routers/tasks.py` by switching to `apply_async(..., task_id=task_id)`. Audited all 7 `.delay()` dispatch sites across `backend/app/routers/*.py`.
+  - Blocker 2: Removed duplicate manual retry logging in `_handle_task_failure`; relied on `task_retry` signal with deduplication by `retry_count`.
+  - Blocker 3: Wrapped all 4 Celery signal handlers (`on_task_prerun`, `on_task_postrun`, `on_task_failure`, `on_task_retry`) in top-level `try/except Exception` logging blocks so signal failures never kill tasks.
+  - Should-fix 4: Added `.with_for_update()` to task query in `append_task_event` for multi-process row locking.
+  - Should-fix 5: Hardened bounds: bounded `error` with `truncate_text`; byte-trim loop prunes down to hard floor (2 events: initial + latest) and trims latest event's traceback/error to ensure row <= `MAX_LOGS_BYTES`.
+  - Should-fix 6: List payload optimization: removed `logs` and `traceback` from `GET /api/tasks/list` (returning `event_count` instead); added `GET /api/tasks/{task_id}/logs`; implemented lazy loading with cache and error states in `QueueDashboard.tsx`.
+  - Should-fix 7: Added tests in `backend/tests/test_task_logs.py` covering single retry event, signal handler failure swallow, `/logs` endpoint retrieval, and 2-event row with huge failed event within `MAX_LOGS_BYTES`.
+  - Nit: Capped legacy raw-traceback fallback render in the UI at 10,000 characters while preserving full traceback copy.
+
+### Overall Verification:
+- Backend: `pytest` → **322 passed, 2 skipped** (10 tests in `test_task_logs.py`).
+- Frontend unit: `bun test src/utils/` → **32 passed**.
+- Typecheck: `npx tsc --noEmit` → **clean (0 errors)**.
+- Build: `npm run build` → **compiled successfully**.
+
