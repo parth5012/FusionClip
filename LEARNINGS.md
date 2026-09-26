@@ -165,3 +165,26 @@
 - **HTML5 `<video>` `<track>` elements and CORS**: `<track>` elements require `crossOrigin="anonymous"` on the `<video>` element when loading cross-origin URLs (e.g. S3 / MinIO presigned URLs on localhost:9000). If a track URL returns a 403 or network error, an `onError` listener on the `<track>` element marks the track as loaded with an error badge while preventing player crash.
 - **Embedded subtitle bitmap codecs vs WebVTT**: formats like `hdmv_pgs_subtitle` (Blu-ray PGS) or `dvd_subtitle` are rasterized bitmaps rather than text streams. Transcoding to WebVTT text via `ffmpeg -c:s webvtt` fails with bitmap codecs. Gracefully skip bitmap streams during probing/extraction without halting the pipeline.
 - **Degrading ffmpeg failures**: ffmpeg or ffprobe may fail or be missing in stripped runtime containers. The extraction pipeline must catch subprocess and parsing exceptions, log warnings, and degrade to 0 tracks rather than returning 500 error responses during media upload.
+
+## 2026-09-26: Rebasing map #71 (Local Torch Models) onto `main` for map #73
+
+### 14. `main` and `master` Had Diverged — the Same Ticket Number Landed Twice
+- PR #130 (map #71) was merged with `--base master`, so the localml line never reached `main`. `main` separately carried the upscaler (#94/#96) and the #105-#109 leftovers. `git rev-list --left-right --count origin/main...origin/master` reported `45 22`.
+- Symptom: the Skin Enhancer planning agent reported "the upscaler endpoint and tile/feather-stitch engine do not exist", while a second read of the same worktree found `MediaAsset.source_path` lineage and `BeforeAfterModal` in the `main` history. Both were true, on different branches.
+- Lesson: before planning any feature that depends on another map's output, run `git rev-list --left-right --count origin/main...HEAD` and check `gh pr list --state merged --json baseRefName`. A merged PR on a non-default base is invisible to "did map X ship?".
+
+### 15. Mechanical Union Conflict Resolution Is Right for Appends, Wrong for Route Rewrites
+- Most of the 12 conflicts were append-in-different-place (`LEARNINGS.md`, `LOG.md`, Celery routes, module lists in `conftest.py`) and resolved correctly by keeping both sides.
+- `backend/app/routers/generate.py` was the exception: `main` and the localml branch had each **rewritten the same route body**, so git left one version as unconflicted context. A union would have left `main`'s legacy `load_flux_pipeline` block running *before* the localml `run_local_image_generation()` return, making the new path unreachable. Resolved by rebuilding the file from `origin/main` plus the three localml route rewrites (`generate_audio`, `generate_image`, `generate_video`) with explicit route boundaries.
+- Two routes would have been silently deleted by a naive splice (`main[:idx] + new` dropped `/api/generate/tts`, `/api/generate/voice-list`, `/api/generate/sound-effect`, `/api/generate/voice-clone` because they sit *between* the audio and image routes). Caught by diffing `@router.` route lists between input and output.
+- Lesson: after any rebase/merge that touches a router file, diff the `@router.<method>` route list against both parents. Route loss is silent — the app still boots.
+
+### 16. Refactor Direction Decides the Seam, Not Merge Order
+- The localml tests patched `app.routers.generate.call_elevenlabs_tts` / `call_gemini_generate_content` (raw-httpx module functions). `main` had already refactored those into `app/services/elevenlabs.py` and `app/services/gemini.py` with the same behaviour.
+- Keeping the module-level wrappers *and* the service module would have been duplication. The service module won (it is the newer, already-tested refactor), and the localml tests were repointed at `app.routers.generate.elevenlabs_service.synthesize` etc. Production behaviour is identical; only the monkeypatch target moved.
+- Lesson: when two branches disagree about a seam, pick the one that is a refactor *toward* a module boundary. Do not re-add the older shape to keep a test's `monkeypatch.setattr` string working — the test is the thing that should move.
+
+### 17. "No Mock Bytes" Was a Repo-Wide Rule That `main` Still Violated
+- `test_localml_audio.py::TestMockStringElimination` greps every `backend/app/**/*.py` for `Mock elevenlabs generated audio bytes`. `main`'s `/api/generate/tts` still had that fallback, so the rebase could not be green until it was removed.
+- `/api/generate/tts` declares `response_model=GenerationTtsOut`, so returning a `DegradedResponse` envelope produced a `ResponseValidationError`. The honest fix for an ElevenLabs-only route is **503 via the existing `_no_elevenlabs_key_http_503()`** — matching `/api/generate/voice-clone` — while `/api/generate/audio?type=tts` (which has a real local fallback) keeps the degraded envelope.
+- Lesson: `response_model` decides which honesty mechanism is available. A degraded envelope is for "a real path exists but could not be admitted"; a 503 is for "this path has no fallback at all".

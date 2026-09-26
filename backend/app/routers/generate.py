@@ -35,6 +35,7 @@ from app.config import settings
 from app.deps import get_db
 from app.ml.contracts import DegradedReason, make_degraded_response
 from app.ml.audio import SUPPORTED_AUDIO_TYPES, run_local_audio_generation
+from app.ml.contracts import DegradedReason, make_degraded_response
 from app.ml.image import SUPPORTED_SCHEDULERS, run_local_image_generation
 from app.models import Configuration, MediaAsset, Task
 from app.schemas import (
@@ -491,20 +492,26 @@ def generate_audio(
     if provider != "local" and type in ELEVENLABS_AUDIO_TYPES:
         eleven_key = _resolve_elevenlabs_key(db, request)
         if eleven_key:
-            if type == "sfx":
-                content = elevenlabs_service.generate_sound_effect(
-                    eleven_key,
-                    text=prompt,
-                    duration_seconds=duration if duration is not None else 5.0,
-                )
-                filename = f"eleven_sfx_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
-            else:
-                content = elevenlabs_service.synthesize(
-                    eleven_key,
-                    prompt,
-                    voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
-                )
-                filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
+            try:
+                if type == "sfx":
+                    content = elevenlabs_service.generate_sound_effect(
+                        eleven_key,
+                        text=prompt,
+                        duration_seconds=duration if duration is not None else 5.0,
+                    )
+                    filename = f"eleven_sfx_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
+                else:
+                    content = elevenlabs_service.synthesize(
+                        eleven_key,
+                        prompt,
+                        voice_id=voice_id or elevenlabs_service.DEFAULT_VOICE_ID,
+                    )
+                    filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.error(f"ElevenLabs audio synthesis failed: {e}")
+                raise HTTPException(status_code=502, detail=f"ElevenLabs audio synthesis failed: {e}")
                 filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
 
             upload_success = upload_object(content, filename, content_type="audio/mpeg")
@@ -562,8 +569,11 @@ def generate_tts(
     """Text-to-speech via real ElevenLabs, persisted to MinIO.
 
     Preference order mirrors ``/api/generate/audio``: Colab dispatch when
-    connected, real ElevenLabs when a key is configured, and a mock fallback
-    otherwise so the client always receives a usable shape.
+    connected, then real ElevenLabs. This route is ElevenLabs-only and declares
+    ``response_model=GenerationTtsOut``, so a missing key is a configuration
+    error (503, same as ``/api/generate/voice-clone``) rather than a third
+    fallback that invents audio. For the local path use
+    ``/api/generate/audio?type=tts``, which degrades through the VRAM guard.
     """
     if is_colab_connected():
         return dispatch_gen_to_colab(
@@ -577,27 +587,7 @@ def generate_tts(
     api_key = _resolve_elevenlabs_key(db, request)
     resolved_voice = voice_id or elevenlabs_service.DEFAULT_VOICE_ID
     if not api_key:
-        filename = f"gen_audio_{int(time.time())}.mp3"
-        content = b"Mock elevenlabs generated audio bytes."
-        upload_success = upload_object(content, filename, content_type="audio/mpeg")
-        _save_asset(
-            db,
-            title=f"ElevenLabs Synthesized: {text[:30]}...",
-            filename=filename,
-            content_type="audio/mpeg",
-            size=len(content),
-            duration=3.0,
-        )
-        return {
-            "status": "COMPLETED",
-            "voice_id": resolved_voice,
-            "model": model,
-            "stability": stability,
-            "clarity": clarity,
-            "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
-            "content_type": "audio/mpeg",
-        }
+        raise _no_elevenlabs_key_http_503()
 
     try:
         audio = elevenlabs_service.synthesize(

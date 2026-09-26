@@ -14,21 +14,24 @@ from app.services.elevenlabs import DEFAULT_MODEL, DEFAULT_VOICE_ID
 
 
 class TestGenerateAudioNoKey:
-    def test_no_key_returns_mock_fallback(self, client, stub_storage, db_session):
+    def test_no_key_degrades_to_local_pipeline_instead_of_inventing_bytes(
+        self, client, stub_storage, db_session
+    ):
+        """No ElevenLabs key => fall through to the local XTTS pipeline.
+
+        With no GPU in CI the VRAM guard refuses, and the route answers with the
+        labeled degraded envelope (Decision #3). It must never persist or upload
+        a fabricated mp3.
+        """
         res = client.post("/api/generate/audio?prompt=Hello+world&type=tts")
         assert res.status_code == 200
         body = res.json()
-        assert set(body) == {"status", "type", "filename", "url"}
-        assert body["status"] == "COMPLETED"
-        assert body["filename"].startswith("gen_audio_")
-        assert body["filename"] in stub_storage["uploaded"]
-
-        asset = (
-            db_session.query(MediaAsset)
-            .filter(MediaAsset.file_path == body["filename"])
-            .one()
-        )
-        assert asset.content_type == "audio/mpeg"
+        assert body.get("degraded") is True, body
+        assert body.get("reason")
+        assert body.get("message")
+        assert "filename" not in body
+        assert stub_storage["uploaded"] == {}
+        assert db_session.query(MediaAsset).count() == 0
 
 
 class TestGenerateAudioElevenLabs:
@@ -167,7 +170,7 @@ class TestGenerateAudioElevenLabs:
         monkeypatch.setattr("app.services.elevenlabs.synthesize", fake_synthesize)
 
         client.post(
-            "/api/generate/audio?prompt=hi&voice_id=ExsVoice123&stability=0.3&clarity=0.9"
+            "/api/generate/tts?text=hi&voice_id=ExsVoice123&stability=0.3&clarity=0.9"
         )
         assert captured == {"voice_id": "ExsVoice123", "stability": 0.3, "clarity": 0.9}
 
@@ -184,23 +187,20 @@ class TestGenerateAudioElevenLabs:
 
 
 class TestGenerateTts:
-    def test_no_key_returns_mock_fallback(self, client, stub_storage, db_session):
-        res = client.post("/api/generate/tts?text=Hello+world")
-        assert res.status_code == 200
-        body = res.json()
-        assert set(body) == {"status", "voice_id", "model", "stability", "clarity", "filename", "url", "content_type"}
-        assert body["status"] == "COMPLETED"
-        assert body["voice_id"] == DEFAULT_VOICE_ID
-        assert body["filename"].startswith("gen_audio_")
-        assert body["url"].startswith("http://test-minio/")
-        assert body["filename"] in stub_storage["uploaded"]
+    def test_no_key_returns_503_instead_of_mock_bytes(
+        self, client, stub_storage, db_session
+    ):
+        """No key => 503 config error; no fabricated mp3, no MediaAsset.
 
-        asset = (
-            db_session.query(MediaAsset)
-            .filter(MediaAsset.file_path == body["filename"])
-            .one()
-        )
-        assert asset.content_type == "audio/mpeg"
+        This route is ElevenLabs-only and declares ``response_model=GenerationTtsOut``,
+        so the honest answer is a refusal, not an invented file. The local path is
+        ``/api/generate/audio?type=tts``.
+        """
+        res = client.post("/api/generate/tts?text=Hello+world")
+        assert res.status_code == 503
+        assert "ElevenLabs" in res.json()["detail"]
+        assert stub_storage["uploaded"] == {}
+        assert db_session.query(MediaAsset).count() == 0
 
     def test_stored_key_calls_real_elevenlabs(self, client, db_session, stub_storage, monkeypatch):
         secret_store.set_secret("elevenlabs", "unit-test-placeholder-value", db=db_session)

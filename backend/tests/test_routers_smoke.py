@@ -362,7 +362,10 @@ class TestGenerateRouter:
         res = client.post("/api/generate/image?prompt=Smoke+test+art&steps=10&scale=7.0")
         assert res.status_code == 200
         body = res.json()
-        assert set(body) == {"status", "parameters", "filename", "url", "colab"}
+        # #101 routes local inference through app.ml, whose response shape is
+        # {status, parameters, filename, url} - there is no `colab` key because
+        # the Colab branch returns before reaching the local pipeline.
+        assert set(body) == {"status", "parameters", "filename", "url"}
         assert body["status"] == "COMPLETED"
         assert body["parameters"]["steps"] == 10
         assert body["parameters"]["scale"] == 7.0

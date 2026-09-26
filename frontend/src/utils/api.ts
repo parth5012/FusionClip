@@ -662,7 +662,6 @@ export async function generateImage(
   return postGenerate<GenerateImageResponse>(url, 'Image generation failed');
 }
 
-<<<<<<< HEAD
 /* ── Magnific Upscaler API (#94 / #96) ──────────────────────────────── */
 
 export interface UpscalePayload {
