@@ -11,6 +11,7 @@ import {
   ChevronLeft,
   ChevronsLeft,
   ChevronsRight,
+  ChevronDown,
   ListFilter,
   RotateCcw,
   Bug,
@@ -19,14 +20,22 @@ import {
   Wifi,
   WifiOff,
   ListOrdered,
+  Copy,
+  Check,
+  Terminal,
 } from 'lucide-react';
 import { fetchTasks, fetchTaskCounts, retryTask } from '../utils/api';
 import {
   categorizeTaskStatus,
   applyTaskUpdate,
+  parseTaskLogs,
+  formatEventLabel,
+  getEventBadgeStyle,
+  hasTraceback,
   TaskCounts,
   TaskItem,
   TaskBucket,
+  TaskLogEvent,
 } from '../utils/queue';
 
 type StatusFilter = '' | 'pending' | 'processing' | 'completed' | 'failed';
@@ -96,6 +105,234 @@ function formatTime(iso: string | null | undefined): string {
   if (!iso) return '—';
   const d = new Date(iso);
   return d.toLocaleString();
+}
+
+function TaskLogsViewer({ task }: { task: TaskItem }) {
+  const [expandedTracebacks, setExpandedTracebacks] = useState<Set<string>>(new Set());
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const events = parseTaskLogs(task.logs);
+  const hasEventTraceback = events.some((e) => hasTraceback(e));
+  const showDirectTraceback =
+    !hasEventTraceback && typeof task.traceback === 'string' && task.traceback.trim().length > 0;
+
+  const toggleTraceback = (key: string) => {
+    setExpandedTracebacks((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) {
+        next.delete(key);
+      } else {
+        next.add(key);
+      }
+      return next;
+    });
+  };
+
+  const handleCopyTraceback = async (tracebackText: string, key: string) => {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(tracebackText);
+      } else if (typeof document !== 'undefined') {
+        const textArea = document.createElement('textarea');
+        textArea.value = tracebackText;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+      setCopiedKey(key);
+      setTimeout(() => {
+        setCopiedKey((curr) => (curr === key ? null : curr));
+      }, 2000);
+    } catch (err) {
+      console.error('Failed to copy traceback:', err);
+    }
+  };
+
+  if (events.length === 0 && !showDirectTraceback) {
+    return (
+      <div className="border-t border-slate-800/80 pt-3">
+        <div className="flex items-center gap-2 p-3 bg-slate-900/60 border border-slate-800/80 rounded-md text-slate-400 text-xs">
+          <FileText className="w-4 h-4 text-slate-500 flex-shrink-0" />
+          <span>No execution logs recorded for this task.</span>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="border-t border-slate-800/80 pt-3 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs font-semibold text-slate-300">
+          <Terminal className="w-4 h-4 text-sky-400" />
+          <span>Task Lifecycle Events & Logs</span>
+          <span className="text-[11px] font-normal text-slate-500 font-mono">
+            ({events.length} event{events.length === 1 ? '' : 's'})
+          </span>
+        </div>
+      </div>
+
+      {events.length > 0 && (
+        <div className="bg-slate-900/50 border border-slate-800 rounded-lg divide-y divide-slate-800/60 overflow-hidden">
+          {events.map((event, idx) => {
+            const badgeStyle = getEventBadgeStyle(event);
+            const eventKey = `${task.task_id}-event-${idx}`;
+            const isTbExpanded = expandedTracebacks.has(eventKey);
+            const isCopied = copiedKey === eventKey;
+            const tb = event.traceback;
+
+            return (
+              <div key={eventKey} className="p-3 text-xs space-y-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`inline-flex items-center text-[11px] font-mono px-2 py-0.5 rounded border ${badgeStyle.bg} ${badgeStyle.text} ${badgeStyle.border}`}
+                    >
+                      {formatEventLabel(event)}
+                    </span>
+                    {event.task_name && (
+                      <span className="text-slate-300 font-mono text-[11px] truncate max-w-[240px]" title={event.task_name}>
+                        {event.task_name}
+                      </span>
+                    )}
+                    {event.error_type && (
+                      <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-rose-950/80 text-rose-300 border border-rose-800">
+                        {event.error_type}
+                      </span>
+                    )}
+                    {event.status && event.event !== 'started' && (
+                      <span className="text-[11px] font-mono text-slate-400">
+                        status: <span className="text-slate-300">{event.status}</span>
+                      </span>
+                    )}
+                  </div>
+                  {event.timestamp && (
+                    <span className="text-slate-500 font-mono text-[11px]">
+                      {formatTime(event.timestamp)}
+                    </span>
+                  )}
+                </div>
+
+                {event.error && (
+                  <p className="text-rose-300 font-mono text-xs bg-rose-950/20 border border-rose-900/30 rounded p-2.5 break-words">
+                    {event.error}
+                  </p>
+                )}
+                {event.reason && !event.error && (
+                  <p className="text-amber-300 text-xs bg-amber-950/20 border border-amber-900/30 rounded p-2">
+                    Retry reason: {event.reason}
+                  </p>
+                )}
+                {event.result_summary && (
+                  <div className="text-slate-400 text-xs">
+                    <span className="text-slate-500">Summary: </span>
+                    <span className="font-mono text-slate-300 break-all bg-slate-950/60 px-2 py-0.5 rounded border border-slate-800 inline-block">
+                      {event.result_summary}
+                    </span>
+                  </div>
+                )}
+                {event.message && !event.error && (
+                  <p className="text-slate-400 font-mono text-xs break-words bg-slate-950/40 p-2 rounded border border-slate-850">
+                    {event.message}
+                  </p>
+                )}
+
+                {/* Collapsible & copyable Python stack trace */}
+                {tb && (
+                  <div className="mt-2 border border-slate-800 rounded bg-slate-950 overflow-hidden">
+                    <div className="flex items-center justify-between px-3 py-1.5 bg-slate-900/80 border-b border-slate-800 text-[11px]">
+                      <button
+                        onClick={() => toggleTraceback(eventKey)}
+                        className="flex items-center gap-1.5 text-slate-300 hover:text-sky-400 font-medium transition"
+                        aria-expanded={isTbExpanded}
+                      >
+                        {isTbExpanded ? (
+                          <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+                        ) : (
+                          <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                        )}
+                        <span>Python Stack Trace</span>
+                        <span className="text-slate-500 text-[10px]">
+                          ({isTbExpanded ? 'click to collapse' : 'click to expand'})
+                        </span>
+                      </button>
+                      <button
+                        onClick={() => handleCopyTraceback(tb, eventKey)}
+                        className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border border-slate-700 bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700 transition"
+                        title="Copy traceback to clipboard"
+                      >
+                        {isCopied ? (
+                          <>
+                            <Check className="w-3 h-3 text-emerald-400" />
+                            <span className="text-emerald-400">Copied!</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3 text-slate-400" />
+                            <span>Copy Trace</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                    {isTbExpanded && (
+                      <pre className="p-3 text-[11px] font-mono text-rose-300 overflow-x-auto whitespace-pre-wrap max-h-80 select-text leading-relaxed break-words bg-slate-950">
+                        {tb}
+                      </pre>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Fallback direct traceback if task has column traceback but no event had it */}
+      {showDirectTraceback && (
+        <div className="mt-2 border border-slate-800 rounded bg-slate-950 overflow-hidden">
+          <div className="flex items-center justify-between px-3 py-1.5 bg-slate-900/80 border-b border-slate-800 text-[11px]">
+            <button
+              onClick={() => toggleTraceback(`${task.task_id}-direct-tb`)}
+              className="flex items-center gap-1.5 text-slate-300 hover:text-sky-400 font-medium transition"
+              aria-expanded={expandedTracebacks.has(`${task.task_id}-direct-tb`)}
+            >
+              {expandedTracebacks.has(`${task.task_id}-direct-tb`) ? (
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400" />
+              ) : (
+                <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+              )}
+              <span>Python Stack Trace</span>
+              <span className="text-slate-500 text-[10px]">
+                ({expandedTracebacks.has(`${task.task_id}-direct-tb`) ? 'click to collapse' : 'click to expand'})
+              </span>
+            </button>
+            <button
+              onClick={() => handleCopyTraceback(task.traceback!, `${task.task_id}-direct-tb`)}
+              className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border border-slate-700 bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700 transition"
+              title="Copy traceback to clipboard"
+            >
+              {copiedKey === `${task.task_id}-direct-tb` ? (
+                <>
+                  <Check className="w-3 h-3 text-emerald-400" />
+                  <span className="text-emerald-400">Copied!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3 h-3 text-slate-400" />
+                  <span>Copy Trace</span>
+                </>
+              )}
+            </button>
+          </div>
+          {expandedTracebacks.has(`${task.task_id}-direct-tb`) && (
+            <pre className="p-3 text-[11px] font-mono text-rose-300 overflow-x-auto whitespace-pre-wrap max-h-80 select-text leading-relaxed break-words bg-slate-950">
+              {task.traceback}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function QueueDashboard() {
@@ -589,11 +826,8 @@ export default function QueueDashboard() {
                                 <span>Updated: {formatTime(task.updated_at)}</span>
                               </div>
 
-                              {/* Structured seam for Ticket #108: logs / stack-trace viewer */}
-                              <div className="border-t border-slate-800/80 pt-2 text-xs text-slate-500">
-                                <span className="font-medium text-slate-400">Diagnostics & Logs Seam (#108): </span>
-                                <span>Structured row ready for stack-trace viewer.</span>
-                              </div>
+                              {/* Execution logs & stack-trace viewer (#108) */}
+                              <TaskLogsViewer task={task} />
                             </div>
                           </td>
                         </tr>

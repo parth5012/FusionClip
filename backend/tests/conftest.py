@@ -146,6 +146,7 @@ def patch_tasks_db(monkeypatch, db_session):
     monkeypatch.setattr("app.routers.upscale.SessionLocal", MockSessionLocal(), raising=False)
     # execute_upscale_job opens its session via app.services.upscaler.SessionLocal
     monkeypatch.setattr("app.services.upscaler.SessionLocal", MockSessionLocal(), raising=False)
+    monkeypatch.setattr("app.task_logging.SessionLocal", MockSessionLocal(), raising=False)
 
 patch_tasks_db = pytest.fixture(autouse=True)(patch_tasks_db)
 

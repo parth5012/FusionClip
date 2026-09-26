@@ -304,6 +304,7 @@ class TaskListItem(BaseModel):
     error: Optional[str] = None
     error_type: Optional[str] = None
     traceback: Optional[str] = None
+    logs: Optional[str] = None
     retry_count: int
     max_retries: int
     created_at: Optional[str] = None
@@ -361,6 +362,7 @@ def list_tasks(
                 error=t.error,
                 error_type=t.error_type,
                 traceback=t.traceback,
+                logs=t.logs,
                 retry_count=t.retry_count,
                 max_retries=t.max_retries,
                 created_at=t.created_at.isoformat() if t.created_at else None,

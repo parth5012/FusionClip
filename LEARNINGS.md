@@ -42,7 +42,6 @@
 - API token authentication in FastAPI handlers should use `secrets.compare_digest` rather than `!=` to eliminate timing side channels, and must check that both candidate and secret are non-empty strings.
 
 
-
 ## 2026-09-24: Magnific upscaler ship (#96)
 
 - **`task_id[:6]` is not unique enough**: two `upscale_*` ids sharing the first 6 chars cross-linked `file_path.contains(prefix)` status lookups → silent wrong-job results. Fix: per-job `uuid4().hex[:12]` token embedded in the output object path; status lookup contains the token (not the id prefix).
@@ -70,3 +69,10 @@
 - **In-Memory Zip DoS & Tempfile Streaming**: Buffering multi-asset zip archives in `io.BytesIO` scales memory linearly with payload size and risks OOM worker crashes. Using `tempfile.NamedTemporaryFile` writes zip bytes to disk incrementally and allows streaming directly to S3 via file handles (`s3.put_object(Body=fh)`), followed by deterministic cleanup in `finally:`.
 - **Zip-Slip Directory Traversal Sanitization**: File paths stored in DB (or imported from external sources) may contain `..` or backslashes (`uploads/../../evil.sh`). Zip entry names must normalize backslashes, strip paths via `os.path.basename`, and reject `.`/`..`/empty names falling back to safe deterministic basenames (`asset_{id}.bin`).
 - **Deduplicating Explicit Selections with Relational Derivatives**: When an export job queries derivatives (`source_path.in_(parent_paths)`), if a user selects both a parent asset and its derivative explicitly, the derivative will be included twice unless the child query filters `~MediaAsset.id.in_(selected_ids)`.
+
+## 2026-09-26: Task Logs & Error Diagnostics (Map #72, #108)
+
+- **Surrogate Character Sanitization in Python string encoding**: External error messages or runtime strings with unmatched surrogates (e.g. `\ud83d\ude00`) throw `UnicodeEncodeError` when encoded to standard UTF-8. Sanitizing via `s.encode('utf-8', errors='replace').decode('utf-8')` before JSON serialization and byte-length measurement ensures error capture never fails on malformed input.
+- **Celery Signal Boundaries vs Direct Invocations**: Celery signals (`task_prerun`, `task_postrun`, `task_failure`, `task_retry`) automatically hook all worker-dispatched task executions, but internal failure helpers (`_handle_task_failure`) can be invoked directly in unit tests. Dual-instrumenting with consecutive-event deduplication ensures all execution paths are covered without duplicate events.
+- **NDJSON Log Storage & Resilience**: Storing lifecycle events as JSON Lines (NDJSON) capped at a fixed number of events (50) and bytes (64KB) guarantees bounded DB rows. Line-by-line parsing with fallback wrapping ensures legacy unformatted text rows or corrupt lines render cleanly without crashing the UI.
+
