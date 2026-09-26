@@ -662,8 +662,9 @@ class TestCodeRabbitFixesImage:
                 }
             ]
         }
+        # main (#25) moved the raw-httpx Gemini call into app/services/gemini.py.
         monkeypatch.setattr(
-            gen_router, "call_gemini_generate_content", lambda **kw: gemini_response
+            gen_router.gemini_service, "call_gemini_generate_content", lambda **kw: gemini_response
         )
         monkeypatch.setattr(gen_router, "upload_object", lambda *a, **kw: False)
 

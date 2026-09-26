@@ -413,7 +413,7 @@ class TestCloudElevenLabsPreservation:
             called_tts.append((api_key, text, voice_id))
             return b"fake-elevenlabs-mp3-bytes"
 
-        monkeypatch.setattr("app.routers.generate.call_elevenlabs_tts", fake_tts)
+        monkeypatch.setattr("app.routers.generate.elevenlabs_service.synthesize", fake_tts)
 
         res = client.post("/api/generate/audio?prompt=Welcome+speech&type=tts")
         assert res.status_code == 200
@@ -434,7 +434,7 @@ class TestCloudElevenLabsPreservation:
             called_sfx.append((api_key, text, duration_seconds))
             return b"fake-elevenlabs-sfx-mp3-bytes"
 
-        monkeypatch.setattr("app.routers.generate.call_elevenlabs_sfx", fake_sfx)
+        monkeypatch.setattr("app.routers.generate.elevenlabs_service.generate_sound_effect", fake_sfx)
 
         res = client.post("/api/generate/audio?prompt=Thunder+sound&type=sfx&duration=4.5")
         assert res.status_code == 200
@@ -499,11 +499,11 @@ class TestFix1ElevenlabsRouting:
 
         called_elevenlabs = []
         monkeypatch.setattr(
-            "app.routers.generate.call_elevenlabs_tts",
+            "app.routers.generate.elevenlabs_service.synthesize",
             lambda *a, **k: called_elevenlabs.append("tts"),
         )
         monkeypatch.setattr(
-            "app.routers.generate.call_elevenlabs_sfx",
+            "app.routers.generate.elevenlabs_service.generate_sound_effect",
             lambda *a, **k: called_elevenlabs.append("sfx"),
         )
 
@@ -562,11 +562,11 @@ class TestFix1ElevenlabsRouting:
         set_secret("elevenlabs", "test-eleven-key", db_session)
 
         monkeypatch.setattr(
-            "app.routers.generate.call_elevenlabs_tts",
+            "app.routers.generate.elevenlabs_service.synthesize",
             lambda *a, **k: b"eleven-tts-bytes",
         )
         monkeypatch.setattr(
-            "app.routers.generate.call_elevenlabs_sfx",
+            "app.routers.generate.elevenlabs_service.generate_sound_effect",
             lambda *a, **k: b"eleven-sfx-bytes",
         )
 

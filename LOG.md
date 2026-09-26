@@ -443,3 +443,23 @@
 - **Verification**:
   - Backend full suite: 329 passed, 2 skipped across all test files (100% green).
   - Frontend: `bun test src/utils/` (27 passed), `tsc --noEmit` (0 errors), `npm run build` (successful).
+
+## 2026-09-26: Sync pass — rebase map #71 onto `main` (prerequisite for map #73)
+
+### Iteration Status: Done
+
+**Why:** map #73 (Skin Enhancer) needs *both* the localml VRAM-guarded registry (`app/ml/`) and the upscaler's `MediaAsset.source_path` lineage + `BeforeAfterModal`. Before this pass the worktree had only the former; `main` had only the latter.
+
+**What changed:**
+- `git rebase origin/main` on `t3code/f166906d` — replayed all 22 localml commits (was 45 behind / 22 ahead; now 0 behind / 22 ahead). 6 conflict rounds.
+- `backend/app/routers/generate.py` rebuilt from `origin/main` + the three localml route rewrites. Deleted dead `load_flux_pipeline` / `load_sdxl_pipeline` / `load_xtts_pipeline` / `load_chattts_pipeline` / `_generate_local_tts_audio` (localml had removed them); kept `load_musicgen_pipeline` + `/api/generate/music` (main-only, still routed directly to transformers). Route list verified 11 in, 11 out.
+- `backend/app/tasks.py`: consolidated the duplicated import block, dropped the duplicate `process_multimedia_task` (kept the `**upscale_kwargs` superset, which the upscaler route needs).
+- `backend/app/routers/generate.py`: `/api/generate/tts` no longer returns `b"Mock elevenlabs generated audio bytes."`; missing key is now 503 via `_no_elevenlabs_key_http_503()`. `/api/generate/audio` ElevenLabs failures are wrapped as 502.
+- Tests repointed at the service-module seams (`elevenlabs_service.synthesize` / `.generate_sound_effect`, `gemini_service.call_gemini_generate_content`) and updated where they pinned the pre-#101 audio contract (no-key behaviour, stability/clarity passthrough moved to `/api/generate/tts`, `colab` key removed from the image response shape).
+
+**Verified:**
+- `backend`: 495 passed, 2 skipped (`test_semantic_search` skips without the fastembed model), 0 failed. 210s.
+- `frontend`: `npx tsc --noEmit` clean; 62 unit tests pass (`npx tsx --test src/utils/*.test.ts`).
+- `next lint` unavailable — the repo has no ESLint config (pre-existing; `next lint` offers to scaffold one interactively).
+
+**Not done / parked:** `main` and `master` are still separate lines. This branch is 22 commits ahead of `origin/main` and needs a PR to land. `TECH_DEBT.md` entry: duplicate `list_tasks` / `retry_task` in `app/routers/tasks.py` (pre-existing on `main`, causes FastAPI "Duplicate Operation ID" warnings).
