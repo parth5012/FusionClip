@@ -1,6 +1,7 @@
 import datetime
 import sqlalchemy
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, JSON, func
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, JSON, Table, ForeignKey, func
+from sqlalchemy.orm import relationship
 from app.database import Base
 
 try:
@@ -24,6 +25,24 @@ except ImportError:
             return value
 
 
+asset_tags = Table(
+    "asset_tags",
+    Base.metadata,
+    Column("asset_id", Integer, ForeignKey("media_assets.id", ondelete="CASCADE"), primary_key=True),
+    Column("tag_id", Integer, ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
+)
+
+
+class Tag(Base):
+    __tablename__ = "tags"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False, index=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    assets = relationship("MediaAsset", secondary=asset_tags, back_populates="tags")
+
+
 class MediaAsset(Base):
     __tablename__ = "media_assets"
 
@@ -40,6 +59,8 @@ class MediaAsset(Base):
     source_path = Column(String, nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    tags = relationship("Tag", secondary=asset_tags, back_populates="assets", lazy="selectin")
 
 
 class Configuration(Base):
