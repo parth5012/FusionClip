@@ -31,6 +31,7 @@ celery.conf.task_routes = {
     'app.tasks.process_media_fast': {'queue': 'media.fast'},
     'app.tasks.process_media_heavy': {'queue': 'media.heavy'},
     'app.tasks.generate_media_embedding': {'queue': 'media.fast'},
+    'app.tasks.extract_media_subtitles': {'queue': 'media.fast'},
 }
 
 # Register Celery task boundary lifecycle logging signals (#108)

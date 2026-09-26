@@ -130,7 +130,14 @@ def probe_subtitle_streams(file_path: str) -> List[dict]:
             "-of", "json",
             str(file_path),
         ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+            timeout=30,
+        )
         data = json.loads(result.stdout)
         streams = data.get("streams", [])
 
@@ -147,6 +154,9 @@ def probe_subtitle_streams(file_path: str) -> List[dict]:
                 "label": label,
             })
         return out
+    except subprocess.TimeoutExpired:
+        logger.warning(f"ffprobe timed out after 30s while probing {file_path}")
+        return []
     except FileNotFoundError:
         logger.warning("ffprobe not found on system; skipping embedded subtitle probing")
         return []
@@ -176,7 +186,13 @@ def extract_track_to_vtt(input_path: str, stream_info: dict, output_path: str) -
             "-c:s", "webvtt",
             str(output_path),
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+        )
         if res.returncode != 0:
             logger.warning(
                 "ffmpeg failed to extract subtitle stream %s: %s",
@@ -187,6 +203,13 @@ def extract_track_to_vtt(input_path: str, stream_info: dict, output_path: str) -
 
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             return True
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "ffmpeg timed out after 60s extracting subtitle stream %s from %s",
+            stream_info.get("index"),
+            input_path,
+        )
         return False
     except FileNotFoundError:
         logger.warning("ffmpeg not found on system; skipping subtitle extraction")
@@ -244,15 +267,30 @@ def extract_and_save_embedded_subtitles(
                     logger.error(f"Failed to upload extracted subtitle to {s3_key}")
                     continue
 
-                track = SubtitleTrack(
-                    asset_id=asset.id,
-                    label=stream["label"],
-                    language=stream["language"],
-                    file_path=s3_key,
-                    format="vtt",
-                    track_type="embedded",
+                existing = (
+                    db.query(SubtitleTrack)
+                    .filter(
+                        SubtitleTrack.asset_id == asset.id,
+                        SubtitleTrack.file_path == s3_key,
+                    )
+                    .first()
                 )
-                db.add(track)
+                if existing:
+                    existing.label = stream["label"]
+                    existing.language = stream["language"]
+                    existing.format = "vtt"
+                    existing.track_type = "embedded"
+                    track = existing
+                else:
+                    track = SubtitleTrack(
+                        asset_id=asset.id,
+                        label=stream["label"],
+                        language=stream["language"],
+                        file_path=s3_key,
+                        format="vtt",
+                        track_type="embedded",
+                    )
+                    db.add(track)
                 created_tracks.append(track)
             finally:
                 scratchpad.remove_path(temp_vtt)

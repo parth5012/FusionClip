@@ -1066,6 +1066,29 @@ def generate_media_embedding(self, asset_id: int):
         db.close()
 
 
+@celery.task(bind=True, name="app.tasks.extract_media_subtitles")
+def extract_media_subtitles(self, asset_id: int):
+    """Background extraction of embedded subtitle tracks into WebVTT (#109)."""
+    logger.info(f"Checking for embedded subtitles on MediaAsset id: {asset_id}")
+    db = SessionLocal()
+    try:
+        asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
+        if not asset:
+            logger.error(f"MediaAsset {asset_id} not found for subtitle extraction")
+            return []
+
+        from app.services.subtitles import extract_and_save_embedded_subtitles
+        tracks = extract_and_save_embedded_subtitles(db, asset)
+        logger.info(f"Extracted {len(tracks)} embedded subtitle track(s) for MediaAsset {asset_id}")
+        return [t.id for t in tracks]
+    except Exception as e:
+        logger.warning(f"Failed extracting subtitles for asset {asset_id}: {e}")
+        db.rollback()
+        return []
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     print("Starting manual backfill of missing embeddings...")
     db = SessionLocal()
