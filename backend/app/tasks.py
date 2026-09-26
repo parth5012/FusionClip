@@ -7,7 +7,7 @@ import json
 import redis
 from datetime import datetime, timezone
 from app.celery_app import celery
-from app.storage import upload_object, generate_url
+from app.storage import upload_object, generate_url, get_object_bytes
 from app.upscaler import TileUpscaler, calculate_tile_size
 from app.scratchpad import scratchpad
 from app.database import SessionLocal
@@ -1222,4 +1222,192 @@ def export_batch_zip(self, paths, export_format="original"):
     except Exception as e:
         logger.error(f"Batch export task {task_id} failed: {e}")
         self.update_state(state="FAILURE", meta={"error": str(e)})
+        raise
+
+
+@celery.task(bind=True, name="app.tasks.export_assets_zip")
+def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
+    """Zip the requested assets and their generated derivatives into a single archive.
+
+    - Queries MediaAsset records for the given asset IDs.
+    - If include_derivatives is True, finds any child assets where source_path
+      matches any parent asset's file_path.
+    - Collects all bytes from storage.
+    - Skips missing derivative files gracefully, noting them in skipped entries.
+    - Handles zero-byte/corrupt entries safely.
+    - Uploads the resulting archive to MinIO at exports/export_{task_id}.zip.
+    - Marks the Task record as COMPLETED with progress 100, or FAILED on error.
+    - Publishes progress updates to Redis task_updates channel.
+    """
+    import io as _io
+    import zipfile
+
+    task_id = self.request.id
+    logger.info(
+        f"Asset batch export task {task_id} started for {len(asset_ids)} asset(s), "
+        f"include_derivatives={include_derivatives}"
+    )
+
+    def _update_progress(percent, status_text, db_status):
+        self.update_state(
+            state="PROGRESS",
+            meta={"percent": percent, "status": status_text},
+        )
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = db_status
+                db_task.progress = percent
+                db.commit()
+        finally:
+            db.close()
+        redis_client.publish(
+            "task_updates",
+            json.dumps({"task_id": task_id, "status": db_status, "progress": percent}),
+        )
+
+    db = SessionLocal()
+    try:
+        parents = db.query(MediaAsset).filter(MediaAsset.id.in_(asset_ids)).all()
+        parent_paths = [p.file_path for p in parents if p.file_path]
+
+        children = []
+        if include_derivatives and parent_paths:
+            children = (
+                db.query(MediaAsset)
+                .filter(MediaAsset.source_path.in_(parent_paths))
+                .all()
+            )
+    finally:
+        db.close()
+
+    _update_progress(10, "Discovered assets and derivatives", "PROCESSING")
+
+    zip_buffer = _io.BytesIO()
+    processed = 0
+    skipped_files = []
+    used_arcnames = set()
+
+    def _get_unique_arcname(base_name):
+        if base_name not in used_arcnames:
+            used_arcnames.add(base_name)
+            return base_name
+        name_parts = base_name.rsplit(".", 1)
+        stem = name_parts[0]
+        ext = f".{name_parts[1]}" if len(name_parts) > 1 else ""
+        counter = 1
+        while True:
+            candidate = f"{stem}_{counter}{ext}"
+            if candidate not in used_arcnames:
+                used_arcnames.add(candidate)
+                return candidate
+            counter += 1
+
+    try:
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            total_items = len(parents) + len(children)
+            current_step = 0
+
+            # Process originals
+            for parent in parents:
+                current_step += 1
+                percent = int((current_step / max(total_items, 1)) * 80) + 10
+                _update_progress(
+                    percent,
+                    f"Zipping original {current_step}/{total_items}: {parent.title}",
+                    "PROCESSING",
+                )
+                if not parent.file_path:
+                    continue
+                try:
+                    data = get_object_bytes(parent.file_path)
+                    if data is None:
+                        data = b""
+                    filename = parent.file_path.split("/")[-1] or f"asset_{parent.id}.bin"
+                    arc_name = _get_unique_arcname(filename)
+                    zf.writestr(arc_name, data)
+                    processed += 1
+                except Exception as read_err:
+                    logger.warning(
+                        f"Failed to read asset {parent.id} ({parent.file_path}): {read_err}"
+                    )
+                    skipped_files.append({"id": parent.id, "path": parent.file_path, "reason": str(read_err)})
+
+            # Process derivatives
+            for child in children:
+                current_step += 1
+                percent = int((current_step / max(total_items, 1)) * 80) + 10
+                _update_progress(
+                    percent,
+                    f"Zipping derivative {current_step}/{total_items}: {child.title}",
+                    "PROCESSING",
+                )
+                if not child.file_path:
+                    continue
+                try:
+                    data = get_object_bytes(child.file_path)
+                    if data is None:
+                        data = b""
+                    child_filename = child.file_path.split("/")[-1] or f"derivative_{child.id}.bin"
+                    arc_name = _get_unique_arcname(f"derivatives/{child_filename}")
+                    zf.writestr(arc_name, data)
+                    processed += 1
+                except Exception as read_err:
+                    logger.warning(
+                        f"Skipping missing/unreadable derivative {child.id} ({child.file_path}): {read_err}"
+                    )
+                    skipped_files.append({"id": child.id, "path": child.file_path, "reason": str(read_err)})
+
+        zip_bytes = zip_buffer.getvalue()
+        export_key = f"exports/export_{task_id}.zip"
+        uploaded = upload_object(zip_bytes, export_key, content_type="application/zip")
+        if not uploaded:
+            raise RuntimeError(f"Storage upload failed for {export_key}")
+
+        download_url = generate_url(export_key)
+        result = {
+            "url": download_url,
+            "download_url": download_url,
+            "filename": f"export_{task_id}.zip",
+            "count": processed,
+            "skipped": skipped_files,
+        }
+        self.update_state(state="SUCCESS", meta=result)
+
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = "COMPLETED"
+                db_task.progress = 100
+                db.commit()
+        finally:
+            db.close()
+
+        redis_client.publish(
+            "task_updates",
+            json.dumps({"task_id": task_id, "status": "COMPLETED", "progress": 100}),
+        )
+        logger.info(f"Asset batch export task {task_id} completed: {processed} file(s) -> {export_key}")
+        return result
+
+    except Exception as e:
+        logger.error(f"Asset batch export task {task_id} failed: {e}")
+        db = SessionLocal()
+        try:
+            db_task = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_task:
+                db_task.status = "FAILED"
+                db_task.error = str(e)
+                db_task.error_type = categorize_error(str(e))
+                db.commit()
+        finally:
+            db.close()
+
+        self.update_state(state="FAILURE", meta={"error": str(e)})
+        redis_client.publish(
+            "task_updates",
+            json.dumps({"task_id": task_id, "status": "FAILED", "progress": 0, "error": str(e)}),
+        )
         raise
