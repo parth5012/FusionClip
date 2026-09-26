@@ -64,12 +64,12 @@ class TestTaskCountsEndpoint:
         # 1 from DB + 2 from celery + 1 from media.fast + 2 from media.heavy = 6
         assert data["pending"] == 6
 
-    def test_counts_case_insensitivity_and_unknown_status(self, client, db_session):
-        """Task statuses must be case-insensitive, and unknown statuses must not crash."""
+    def test_counts_unknown_status_excluded(self, client, db_session):
+        """Statuses outside the known set are excluded from count cards without crashing."""
         tasks = [
-            Task(task_id="t-lower-proc", name="transcode", status="processing", progress=50),
-            Task(task_id="t-lower-comp", name="transcode", status="completed", progress=100),
-            Task(task_id="t-lower-fail", name="transcode", status="failed", progress=0, error="err"),
+            Task(task_id="t-proc-1", name="transcode", status="PROCESSING", progress=50),
+            Task(task_id="t-comp-1", name="transcode", status="COMPLETED", progress=100),
+            Task(task_id="t-fail-1", name="transcode", status="FAILED", progress=0, error="err"),
             Task(task_id="t-unknown-1", name="transcode", status="UNKNOWN_STATE", progress=0),
             Task(task_id="t-unknown-2", name="transcode", status="CANCELLED", progress=0),
         ]
@@ -121,3 +121,44 @@ class TestTaskWebSocketContract:
             assert received["status"] == "PROCESSING"
             assert received["progress"] == 45
             assert received["error"] is None
+
+    def test_ws_tasks_drops_malformed_json_without_disconnect(self, client, stub_redis):
+        """Malformed JSON frame must be dropped with a warning, keeping the client connected."""
+        valid_frame = {
+            "task_id": "test-ws-task-valid",
+            "status": "COMPLETED",
+            "progress": 100,
+            "error": None,
+        }
+
+        with client.websocket_connect("/api/ws/tasks") as ws:
+            # Publish corrupt JSON first
+            stub_redis.publish("task_updates", "NOT_VALID_JSON{")
+            # Then publish a valid frame
+            stub_redis.publish("task_updates", json.dumps(valid_frame))
+
+            # The socket should still be alive and yield the valid frame
+            received = ws.receive_json()
+            assert received["task_id"] == "test-ws-task-valid"
+            assert received["status"] == "COMPLETED"
+
+    def test_ws_tasks_subscribe_failure_closes_with_1011(self, client, monkeypatch):
+        """If pubsub.subscribe fails, server must log error and close with code 1011."""
+        from fastapi import WebSocketDisconnect
+
+        class FailingPubSub:
+            def subscribe(self, *args, **kwargs):
+                raise RuntimeError("Redis connection broken during subscribe")
+
+            def unsubscribe(self, *args, **kwargs):
+                pass
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("app.routers.tasks.redis_client.pubsub", lambda: FailingPubSub())
+
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            with client.websocket_connect("/api/ws/tasks") as ws:
+                ws.receive_text()
+        assert excinfo.value.code == 1011

@@ -196,6 +196,7 @@ RUNNING_STATUSES = frozenset({"PROCESSING", "PROGRESS", "RUNNING", "RETRYING"})
 PENDING_STATUSES = frozenset({"PENDING", "PENDING_RETRY", "QUEUED", "WAITING"})
 FAILED_STATUSES = frozenset({"FAILED", "FAILURE"})
 COMPLETED_STATUSES = frozenset({"COMPLETED", "SUCCESS"})
+ALL_KNOWN_STATUSES = RUNNING_STATUSES | PENDING_STATUSES | FAILED_STATUSES | COMPLETED_STATUSES
 
 
 class TaskCountsResponse(BaseModel):
@@ -209,8 +210,9 @@ class TaskCountsResponse(BaseModel):
 def get_task_counts(db: Session = Depends(get_db)):
     """Retrieve running/pending/failed/completed counts across DB and Celery Redis queues."""
     status_counts = (
-        db.query(func.upper(Task.status), func.count(Task.id))
-        .group_by(func.upper(Task.status))
+        db.query(Task.status, func.count(Task.id))
+        .filter(Task.status.in_(ALL_KNOWN_STATUSES))
+        .group_by(Task.status)
         .all()
     )
     running = 0
@@ -220,14 +222,13 @@ def get_task_counts(db: Session = Depends(get_db)):
     for raw_status, count in status_counts:
         if not raw_status:
             continue
-        status = raw_status.strip()
-        if status in RUNNING_STATUSES:
+        if raw_status in RUNNING_STATUSES:
             running += count
-        elif status in PENDING_STATUSES:
+        elif raw_status in PENDING_STATUSES:
             pending += count
-        elif status in FAILED_STATUSES:
+        elif raw_status in FAILED_STATUSES:
             failed += count
-        elif status in COMPLETED_STATUSES:
+        elif raw_status in COMPLETED_STATUSES:
             completed += count
 
     # Redis Celery broker queue backlog
@@ -257,7 +258,15 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
     logger.info("WebSocket connection accepted for tasks subscription")
 
     pubsub = redis_client.pubsub()
-    pubsub.subscribe("task_updates")
+    try:
+        pubsub.subscribe("task_updates")
+    except Exception as e:
+        logger.error(f"Failed to subscribe to Redis task_updates channel: {e}")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+        return
 
     try:
         while True:
@@ -266,10 +275,14 @@ async def websocket_tasks_endpoint(websocket: WebSocket):
                 data = message.get("data")
                 if isinstance(data, bytes):
                     data = data.decode()
-                data = json.loads(data)
-                await websocket.send_json(data)
+                try:
+                    payload = json.loads(data)
+                except (json.JSONDecodeError, TypeError) as e:
+                    logger.warning(f"Dropping malformed task_updates frame: {e}")
+                    continue
+                await websocket.send_json(payload)
             else:
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.05)
     except WebSocketDisconnect:
         logger.info("WebSocket connection disconnected")
     except Exception as e:

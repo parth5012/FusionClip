@@ -35,6 +35,7 @@ test.describe('Smoke & Navigation', () => {
       { label: 'Generative AI', content: 'Generation' },
       { label: 'Media Players', content: 'Player' },
       { label: 'Configuration', content: 'System Integration Configuration' },
+      { label: 'Task Queue', content: 'Task Queue' },
     ];
 
     for (const tab of tabs) {
