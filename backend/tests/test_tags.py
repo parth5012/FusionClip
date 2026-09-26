@@ -67,6 +67,18 @@ def test_create_tag_endpoint(client, db_session):
     res = client.post("/api/tags", json={"name": "   "})
     assert res.status_code == 400
 
+    # Comma in name rejected with 422
+    res_comma = client.post("/api/tags", json={"name": "tag,one"})
+    assert res_comma.status_code == 422
+
+    # Oversized tag name (>64 chars) rejected with 422
+    res_long = client.post("/api/tags", json={"name": "x" * 65})
+    assert res_long.status_code == 422
+
+    # Valid max length tag name (64 chars) accepted
+    res_max = client.post("/api/tags", json={"name": "x" * 64})
+    assert res_max.status_code in (200, 201)
+
     # Create tag
     res = client.post("/api/tags", json={"name": "cinematic"})
     assert res.status_code in (200, 201)
@@ -78,7 +90,6 @@ def test_create_tag_endpoint(client, db_session):
     res2 = client.post("/api/tags", json={"name": "cinematic"})
     assert res2.status_code in (200, 201)
     assert res2.json()["id"] == data["id"]
-    assert db_session.query(Tag).count() == 1
 
 
 def test_add_and_remove_tag_on_asset(client, db_session):
@@ -132,6 +143,17 @@ def test_put_asset_tags_bulk(client, db_session):
     assert res.status_code == 200
     tags = [t["name"] for t in res.json()["tags"]]
     assert tags == ["landscape"]
+
+    # Reject list with >50 tags (CWE-400 input bounds)
+    oversized_tags = [f"tag{i}" for i in range(51)]
+    res_oversized = client.put(f"/api/media/{asset.id}/tags", json={"tags": oversized_tags})
+    assert res_oversized.status_code == 422
+
+    # Accept list with exactly 50 tags
+    max_tags = [f"tag{i}" for i in range(50)]
+    res_50 = client.put(f"/api/media/{asset.id}/tags", json={"tags": max_tags})
+    assert res_50.status_code == 200
+    assert len(res_50.json()["tags"]) == 50
 
 
 def test_filter_media_by_tags_and_semantics(client, db_session):

@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { filterAssetsByTags, extractAllTags } from './tags';
+import { filterAssetsByTags, extractAllTags, buildMediaCatalogUrl } from './tags';
 import type { MediaAsset } from './api';
 
 describe('filterAssetsByTags', () => {
@@ -110,5 +110,32 @@ describe('filterAssetsByTags', () => {
       { name: 'beach', count: 1 },
       { name: 'city', count: 1 },
     ]);
+  });
+});
+
+describe('buildMediaCatalogUrl', () => {
+  const base = 'http://localhost:8000';
+
+  it('builds standard catalog url when no query or tags provided', () => {
+    const url = buildMediaCatalogUrl(base);
+    assert.equal(url, 'http://localhost:8000/api/media');
+  });
+
+  it('appends tag query parameters for catalog listing', () => {
+    const url = buildMediaCatalogUrl(base, '', 20, ['sunset', 'drone']);
+    assert.equal(url, 'http://localhost:8000/api/media?tag=sunset&tag=drone');
+  });
+
+  it('builds search url with query, limit, and pre-filter tags', () => {
+    const url = buildMediaCatalogUrl(base, 'ocean sunset', 15, ['drone', '4k']);
+    assert.equal(
+      url,
+      'http://localhost:8000/api/media/search?query=ocean+sunset&limit=15&tag=drone&tag=4k'
+    );
+  });
+
+  it('strips empty or whitespace tags cleanly', () => {
+    const url = buildMediaCatalogUrl(base, 'nature', 20, [' ', 'forest', '']);
+    assert.equal(url, 'http://localhost:8000/api/media/search?query=nature&limit=20&tag=forest');
   });
 });

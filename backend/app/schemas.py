@@ -191,7 +191,7 @@ class GenerationImageOut(GenerationOut):
 
 
 class TagCreate(BaseModel):
-    name: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1, max_length=64, pattern=r"^[^,]+$")
 
 
 class TagOut(BaseModel):
@@ -200,7 +200,7 @@ class TagOut(BaseModel):
 
 
 class AssetTagsUpdate(BaseModel):
-    tags: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list, max_length=50)
 
 
 # --- Media -----------------------------------------------------------------

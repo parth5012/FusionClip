@@ -3,6 +3,7 @@ import {
   resolveTunnelStatus,
 } from './tunnel';
 import type { TunnelStatus } from './tunnel';
+import { buildMediaCatalogUrl } from './tags';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -244,18 +245,7 @@ export async function fetchMediaCatalog(
   limit = 20,
   tags: string[] = []
 ): Promise<MediaAsset[]> {
-  const params = new URLSearchParams();
-  if (query) {
-    params.set('query', query);
-    params.set('limit', String(limit));
-  }
-  for (const t of tags) {
-    params.append('tag', t);
-  }
-  const queryString = params.toString();
-  const url = query
-    ? `${API_BASE_URL}/api/media/search${queryString ? `?${queryString}` : ''}`
-    : `${API_BASE_URL}/api/media${queryString ? `?${queryString}` : ''}`;
+  const url = buildMediaCatalogUrl(API_BASE_URL, query, limit, tags);
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error('Failed to fetch media catalog');
