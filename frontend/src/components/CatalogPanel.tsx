@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Search, Volume2, Video, Image as ImageIcon, File, 
   Loader2, ArrowUpRight, Calendar, HardDrive, RefreshCw, X, Clock, ArrowLeftRight,
@@ -33,21 +33,29 @@ export default function CatalogPanel() {
   const [tagActionLoading, setTagActionLoading] = useState<number | null>(null);
   const [tagError, setTagError] = useState<{ assetId: number; message: string } | null>(null);
 
+  // Request sequencing guard (#131)
+  const catalogRequestId = useRef(0);
+
   // Before/after comparison (map #58): pairs a source asset with its upscaled output.
   const [compare, setCompare] = useState<{ beforeUrl: string; afterUrl: string; title: string } | null>(null);
 
   const loadCatalog = async (searchQuery = activeSearch, tagsToApply = selectedTags) => {
+    const requestId = ++catalogRequestId.current;
     setLoading(true);
     setError(null);
     try {
       const data = await fetchMediaCatalog(searchQuery, 20, tagsToApply);
+      if (catalogRequestId.current !== requestId) return;
       setMediaList(data);
       setActiveSearch(searchQuery);
     } catch (err: any) {
+      if (catalogRequestId.current !== requestId) return;
       console.error(err);
       setError(err.message || 'Failed to search or load catalog assets.');
     } finally {
-      setLoading(false);
+      if (catalogRequestId.current === requestId) {
+        setLoading(false);
+      }
     }
   };
 
@@ -140,6 +148,7 @@ export default function CatalogPanel() {
 
   const handleRemoveTag = async (assetId: number, tagId: number) => {
     setTagActionLoading(assetId);
+    setTagError(null);
     try {
       const res = await removeAssetTag(assetId, tagId);
       setMediaList(prev => prev.map(asset => {
@@ -148,8 +157,10 @@ export default function CatalogPanel() {
         }
         return asset;
       }));
+      setTagError(null);
     } catch (err: any) {
       console.error('Failed to remove tag:', err);
+      setTagError({ assetId, message: err.message || 'Failed to remove tag' });
     } finally {
       setTagActionLoading(null);
     }
@@ -627,12 +638,12 @@ export default function CatalogPanel() {
                               <X className="w-3 h-3" />
                             </button>
                           </div>
-                          {tagError && tagError.assetId === file.id && (
-                            <p className="text-[10px] text-rose-400 font-medium">{tagError.message}</p>
-                          )}
                         </div>
                       )}
                     </div>
+                    {tagError && tagError.assetId === file.id && (
+                      <p className="text-[10px] text-rose-400 font-medium">{tagError.message}</p>
+                    )}
                   </div>
 
                   <div className="pt-3 border-t border-slate-850 flex items-center justify-between text-slate-500 text-[10px]">
@@ -826,10 +837,10 @@ export default function CatalogPanel() {
                             <X className="w-3 h-3" />
                           </button>
                         </div>
-                        {tagError && tagError.assetId === file.id && (
-                          <p className="text-[10px] text-rose-400 font-medium">{tagError.message}</p>
-                        )}
                       </div>
+                    )}
+                    {tagError && tagError.assetId === file.id && (
+                      <p className="text-[10px] text-rose-400 font-medium">{tagError.message}</p>
                     )}
                   </div>
 

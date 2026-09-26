@@ -5,7 +5,7 @@ monolithic ``main.py``; field names and nesting must not change without also
 updating the Playwright suite in ``frontend/e2e``.
 """
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, RootModel
 
@@ -189,9 +189,11 @@ class GenerationImageOut(GenerationOut):
 
 # --- Tags ------------------------------------------------------------------
 
+TagName = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[^,]+$")]
+
 
 class TagCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=64, pattern=r"^[^,]+$")
+    name: TagName
 
 
 class TagOut(BaseModel):
@@ -200,7 +202,7 @@ class TagOut(BaseModel):
 
 
 class AssetTagsUpdate(BaseModel):
-    tags: List[str] = Field(default_factory=list, max_length=50)
+    tags: List[TagName] = Field(default_factory=list, max_length=50)
 
 
 # --- Media -----------------------------------------------------------------
