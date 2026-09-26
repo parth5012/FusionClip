@@ -42,14 +42,27 @@ import {
  * Draw (or redraw) the backend-attested markers on the waveform. Markers are
  * provenance overlays - e.g. a voice-clone reference - not user annotations, so
  * they are rebuilt from scratch on every call rather than accumulated.
+ *
+ * Wavesurfer v7 has no `addMarker`/`clearMarkers` (those were the v6 markers
+ * plugin, and the v7 WaveSurfer instance no longer carries them), so overlays are
+ * drawn with the Regions plugin: a region with no `end` renders as a vertical
+ * marker line rather than a span. Passing the WaveSurfer instance here made
+ * `addMarker` throw a TypeError that the catch below swallowed, so every marker
+ * was silently dropped from the waveform.
  */
-function applyMarkers(ws: any, markers?: AudioMarker[]) {
-  if (!ws) return;
+function applyMarkers(regions: any, markers?: AudioMarker[]) {
+  if (!regions) return;
   try {
-    ws.clearMarkers?.();
+    regions.clearRegions();
     (markers ?? []).forEach((m) => {
       if (typeof m?.time !== 'number') return;
-      ws.addMarker({ time: m.time, label: m.label, color: '#f43f5e' });
+      regions.addRegion({
+        start: m.time,
+        content: m.label,
+        color: '#f43f5e',
+        drag: false,
+        resize: false,
+      });
     });
   } catch (err) {
     console.warn('Failed to render waveform markers:', err);
@@ -70,6 +83,7 @@ export default function PlayersPanel() {
 
   const audioContainerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<any>(null);
+  const wsRegionsRef = useRef<any>(null);
   const audioBlobUrlRef = useRef<string | null>(null);
   const videoBlobUrlRef = useRef<string | null>(null);
   const subtitleBlobUrlsRef = useRef<string[]>([]);
@@ -166,6 +180,9 @@ export default function PlayersPanel() {
       try {
         setAudioError(null);
         const WaveSurfer = (await import('wavesurfer.js')).default;
+        // Regions is the v7 way to draw overlay markers; the plugin subpath is
+        // declared in wavesurfer.js's own `exports` map.
+        const { default: RegionsPlugin } = await import('wavesurfer.js/dist/plugins/regions.esm.js');
         
         if (!audioContainerRef.current) return;
         
@@ -186,6 +203,7 @@ export default function PlayersPanel() {
         });
 
         wsRef.current = ws;
+        wsRegionsRef.current = ws.registerPlugin(RegionsPlugin.create());
 
         ws.load(audioUrl);
 
@@ -198,7 +216,7 @@ export default function PlayersPanel() {
           setAudioCurrentTime(ws.getCurrentTime());
           ws.setVolume(isAudioMuted ? 0 : audioVolume);
           ws.setPlaybackRate(audioPlaybackRate);
-          applyMarkers(ws, waveAudioRef.current?.markers);
+          applyMarkers(wsRegionsRef.current, waveAudioRef.current?.markers);
         });
 
         ws.on('seek', () => {
@@ -219,6 +237,8 @@ export default function PlayersPanel() {
       if (ws) {
         ws.destroy();
       }
+      // destroy() tears down the registered Regions plugin with the instance.
+      wsRegionsRef.current = null;
     };
   }, [audioUrl]);
 
@@ -231,7 +251,7 @@ export default function PlayersPanel() {
 
   // Keep markers in sync when a new clip arrives for an already-created player.
   useEffect(() => {
-    applyMarkers(wsRef.current, waveAudio?.markers);
+    applyMarkers(wsRegionsRef.current, waveAudio?.markers);
   }, [waveAudio, audioUrl]);
 
   // Sync audio volume

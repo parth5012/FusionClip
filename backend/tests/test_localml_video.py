@@ -331,6 +331,90 @@ class TestVideoPipelineExecution:
         assert res.get("reason") == DegradedReason.LOAD_FAILED.value
         assert "failed to encode video frames" in res.get("message", "").lower()
 
+    def test_upload_failure_returns_degraded_not_completed(
+        self, monkeypatch, db_session, stub_storage
+    ):
+        """A failed storage upload is a degraded envelope, never COMPLETED.
+
+        Reporting COMPLETED here hands the caller a filename and a URL for an
+        object that does not exist, and process_gpu_task then publishes a terminal
+        COMPLETED event, so the panel renders "Video uploaded" for nothing. Same
+        rule run_local_audio_generation and run_skin_enhancement already follow.
+        """
+        from app.ml.video import run_local_image_to_video
+
+        monkeypatch.setattr(
+            vram_guard,
+            "check_vram",
+            lambda model_id, **kwargs: {"admitted": True, "model_id": "svd", "mode": "offload"},
+        )
+
+        pil_frames = [Image.new("RGB", (64, 64)) for _ in range(14)]
+        mock_pipe = MagicMock(frames=[pil_frames])
+        monkeypatch.setattr(model_registry, "load_model", lambda mid, **kwargs: mock_pipe)
+        monkeypatch.setattr(
+            "app.ml.video.encode_frames_to_mp4",
+            lambda frames, fps, progress_cb=None: b"\x00\x00fake-mp4-bytes",
+        )
+        monkeypatch.setattr("app.ml.video.upload_object", lambda *a, **k: False)
+
+        res = run_local_image_to_video(
+            create_test_png_bytes(), num_frames=14, fps=7, db=db_session
+        )
+
+        assert res.get("degraded") is True
+        assert res.get("reason") == DegradedReason.LOAD_FAILED.value
+        assert res.get("model_id") == "svd"
+        assert "upload" in res.get("message", "").lower()
+        assert res.get("status") != "COMPLETED"
+        assert "filename" not in res
+        assert "url" not in res
+        # No catalog row for an object that never made it to storage.
+        assert db_session.query(MediaAsset).count() == 0
+        assert stub_storage["uploaded"] == {}
+
+    def test_catalog_commit_failure_returns_degraded_not_completed(
+        self, monkeypatch, db_session, stub_storage
+    ):
+        """A failed MediaAsset commit is a degraded envelope, never COMPLETED.
+
+        The same consistency rule the audio executor and the skin enhancer
+        already apply: COMPLETED with no catalog row would claim an asset exists
+        in the library when it does not.
+        """
+        from app.ml.video import run_local_image_to_video
+
+        monkeypatch.setattr(
+            vram_guard,
+            "check_vram",
+            lambda model_id, **kwargs: {"admitted": True, "model_id": "svd", "mode": "offload"},
+        )
+
+        pil_frames = [Image.new("RGB", (64, 64)) for _ in range(14)]
+        mock_pipe = MagicMock(frames=[pil_frames])
+        monkeypatch.setattr(model_registry, "load_model", lambda mid, **kwargs: mock_pipe)
+        monkeypatch.setattr(
+            "app.ml.video.encode_frames_to_mp4",
+            lambda frames, fps, progress_cb=None: b"\x00\x00fake-mp4-bytes",
+        )
+
+        def _boom():
+            raise RuntimeError("catalog write failed")
+
+        monkeypatch.setattr(db_session, "commit", _boom)
+
+        res = run_local_image_to_video(
+            create_test_png_bytes(), num_frames=14, fps=7, db=db_session
+        )
+
+        assert res.get("degraded") is True
+        assert res.get("reason") == DegradedReason.LOAD_FAILED.value
+        assert res.get("status") != "COMPLETED"
+        assert "filename" not in res
+        assert db_session.query(MediaAsset).count() == 0
+        # The object did reach storage; the response simply must not claim success.
+        assert len(stub_storage["uploaded"]) == 1
+
     def test_encode_frames_to_mp4_real_ffmpeg_failure_captures_exit_code_and_stderr(self):
         """Genuine ffmpeg failure raises VideoEncodingError with exit code and stderr lines (F9)."""
         from app.ml.video import encode_frames_to_mp4, VideoEncodingError
