@@ -27,6 +27,20 @@ from app.services.secrets import set_secret
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+#: The guard's own no-device dict shape. Pinned wherever a test's expected
+#: outcome must not depend on whether the host running CI has a CUDA device.
+NO_GPU = {
+    "available": False,
+    "device_name": None,
+    "total_bytes": 0,
+    "free_bytes": 0,
+    "used_bytes": 0,
+    "total_gb": 0.0,
+    "free_gb": 0.0,
+    "used_gb": 0.0,
+    "vram_percent": 0.0,
+}
+
 
 class TestMockStringElimination:
     def test_mock_string_completely_removed_from_codebase(self):
@@ -642,6 +656,37 @@ class TestFix3ReferenceResolutionAndValidation:
         assert res.status_code == 400
         detail = res.json()["detail"].lower()
         assert "not found" in detail or "unreadable" in detail
+
+    def test_cwd_relative_reference_is_never_read_from_disk(
+        self, client, monkeypatch, stub_storage, db_session, tmp_path
+    ):
+        """A CWD-relative key is a 400, not a local file read (CWE-22).
+
+        `_validate_safe_reference` rejects `..`, a leading `/` and backslashes, but
+        a key like `.env` or `app/config.py` is an ordinary storage key shape *and*
+        resolves against the process working directory. Reading it would turn this
+        endpoint into an arbitrary local file reader whose bytes are then written
+        to storage as a WAV derivative. Source bytes come from storage and nowhere
+        else, the rule skin_enhancer already follows.
+        """
+        (tmp_path / ".env").write_bytes(b"SECRET=hunter2")
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "config.py").write_bytes(b"SECRET = 'hunter2'")
+        monkeypatch.chdir(tmp_path)
+        # Pinned so this test's outcome cannot depend on whether the host has a
+        # CUDA device: the reference is refused before admission either way.
+        monkeypatch.setattr(vram_guard, "get_gpu_info", lambda device=0: NO_GPU)
+
+        for key in (".env", "app/config.py"):
+            res = client.post(
+                f"/api/generate/audio?prompt=Clone&type=voice_clone&reference={key}&provider=local"
+            )
+            assert res.status_code == 400, f"Expected 400 for CWD-relative reference {key!r}"
+            assert "not found" in res.json()["detail"].lower()
+
+        # Nothing from the host filesystem was persisted or re-uploaded.
+        assert stub_storage["uploaded"] == {}
+        assert db_session.query(MediaAsset).count() == 0
 
     def test_reference_validation_rejects_traversal_and_accepts_slashes(
         self, client, monkeypatch, stub_storage, db_session

@@ -182,17 +182,20 @@ def run_local_audio_generation(
         # cannot occur while another request is mid-inference.
         ref_bytes = None
         if reference:
+            # Source bytes come from storage and nowhere else. `reference` is
+            # caller-controlled, and _validate_safe_reference only rejects '..', a
+            # leading '/' and backslashes - so a key like '.env' or 'app/config.py'
+            # is an entirely ordinary storage key shape that *also* resolves
+            # against the server's working directory. Probing the local filesystem
+            # with it would make this endpoint an arbitrary local file reader whose
+            # bytes are then re-uploaded to storage as a WAV derivative.
+            # app/ml/skin_enhancer.py already loads strictly from storage; this now
+            # matches it, as does the upscale router.
             ref_bytes = download_object(reference)
-            if ref_bytes is None and os.path.isfile(reference):
-                try:
-                    with open(reference, "rb") as f:
-                        ref_bytes = f.read()
-                except Exception:
-                    pass
             if ref_bytes is None:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Reference audio '{reference}' not found or unreadable in storage",
+                    detail=f"reference_not_found: Reference audio '{reference}' was not found in storage.",
                 )
 
         # 1. Admission check via VRAM guard

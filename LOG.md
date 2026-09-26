@@ -630,3 +630,111 @@ while the GFPGAN loader test actually called `engine.detect_faces(img)`.
   shared detector handle in the registry, not a smaller number.
 - Real-GPU behaviour of both engines is still unverified here; the loader tests exercise the
   adapters with fake modules, and `detect_faces` is now called for both.
+
+## 2026-09-26: CodeRabbit review fixes on PR #138 (branch `t3code/f166906d`)
+
+CodeRabbit left 7 inline comments on the PR. **4 applied, 3 deliberately parked** (no code, no
+comment, no dependency added for them; reported to the human separately). Nothing committed,
+nothing pushed, no GitHub access.
+
+**APPLY 1 — `backend/app/ml/audio.py:184` — CWD-relative reference was a local file read (CWE-22)**
+- Finding verified against the code: `reference` arrives from the `/api/generate/audio` query
+  string, `_validate_safe_reference` blocks `..` / leading `/` / backslashes, and the old
+  `os.path.isfile(reference)` + `open(reference, "rb")` fallback therefore accepted `.env` and
+  `app/config.py` — both real files relative to the server's CWD — and re-uploaded their bytes
+  to storage as a WAV derivative.
+- Fix: removed the local-filesystem fallback. `download_object(reference)` is the only source;
+  a miss raises the 400 (`reference_not_found: … was not found in storage.`), the same
+  storage-only rule `skin_enhancer._load_source_image` uses and the upscale router already used.
+  The video-refusal/HTTPException-400 behaviour ahead of it is unchanged. `os` is still imported
+  for the temp-file cleanup at `audio.py:278`/`:312`.
+- Test: `test_localml_audio.py::TestFix3ReferenceResolutionAndValidation::test_cwd_relative_reference_is_never_read_from_disk`
+  — `monkeypatch.chdir(tmp_path)` with `.env` and `app/config.py` created under it, asserts 400
+  for both plus nothing uploaded and no `MediaAsset`. Added the module-level `NO_GPU` guard dict
+  (same shape as `tests/test_skin_enhancer.py`) so the test cannot depend on the host either.
+
+**APPLY 2 — `backend/app/ml/video.py:343` — upload/commit failure still reported COMPLETED**
+- Finding verified: `if upload_success and db is not None:` skipped the catalog insert on upload
+  failure and then returned `status: "COMPLETED"` with a real `filename` and `""` as the url;
+  `process_gpu_task` marked the `Task` COMPLETED and published a terminal COMPLETED event, so
+  `GenerationPanel` rendered "Video uploaded: …" for an object that was never stored. The
+  `db.commit()` failure was logged and swallowed with the same result.
+- Fix: `upload_object` returning `False` now returns
+  `make_degraded_response(reason=DegradedReason.LOAD_FAILED.value, message="Failed to upload
+  generated video to storage", model_id="svd").model_dump()` **before** the `if db is not None:`
+  block, and a failed `db.commit()` returns the same envelope with the exception text. Video now
+  matches `run_local_audio_generation`, `run_local_image_generation` and `run_skin_enhancement`.
+  `DegradedReason` / `make_degraded_response` were **already imported** at `video.py:27-30`, so
+  the reviewer's "make sure they are imported" needed no change.
+- Tests: `test_localml_video.py::TestVideoPipelineExecution::test_upload_failure_returns_degraded_not_completed`
+  and `::test_catalog_commit_failure_returns_degraded_not_completed` — the first stubs
+  `app.ml.video.upload_object` to return `False`, the second makes `db.commit()` raise; both
+  assert `degraded is True`, `reason == "load_failed"`, `status != "COMPLETED"`, no `filename`
+  key, and no `MediaAsset` row.
+
+**APPLY 3 — `tests/test_generate_real_api.py`, `tests/test_elevenlabs_generate.py` — host-dependent assertions**
+- Finding verified: both tests asserted a degraded `no_gpu` result without stubbing
+  `vram_guard.get_gpu_info`, so on a CUDA host the guard admits the model and the loader fetches
+  real XTTS/FLUX weights. Proven load-bearing with a throwaway test (since deleted): with
+  `get_gpu_info` stubbed to a 24 GB RTX 4090 and `model_registry.load_model` replaced by a
+  raiser, `POST /api/generate/audio` answers `reason: "load_failed"` — the guard was passed and
+  the loader reached, so the un-pinned assertion would fail on such a host.
+- Fix: added the `NO_GPU` dict and one `monkeypatch.setattr(vram_guard, "get_gpu_info", …)` in
+  each test, before the audio call and before both the audio and image calls respectively.
+  Matches `tests/test_localml_image.py` / `tests/test_skin_enhancer.py`. No other restructuring.
+
+**APPLY 4 — `frontend/src/components/PlayersPanel.tsx:57` — `ws.addMarker` does not exist in wavesurfer v7**
+- Finding verified against the installed package: `wavesurfer.js` 7.12.11,
+  `WaveSurfer.prototype.addMarker` and `clearMarkers` are both `undefined`. `ws.clearMarkers?.()`
+  was a silent no-op, `ws.addMarker(...)` threw `TypeError`, and the surrounding `try/catch`
+  swallowed it into `console.warn` — every voice-clone marker was dropped from the waveform and
+  only the fuchsia badge list showed anything.
+- Fix: `applyMarkers(regions, markers)` now takes the Regions plugin instance, calls
+  `regions.clearRegions()` and `regions.addRegion({ start: m.time, content: m.label,
+  color: '#f43f5e', drag: false, resize: false })` — a region with no `end` renders as a
+  vertical marker line. `initWaveSurfer` registers the plugin:
+  `wsRegionsRef.current = ws.registerPlugin(RegionsPlugin.create())`, following the file's
+  existing dynamic-import convention for `wavesurfer.js`. Cleanup nulls the ref alongside
+  `ws.destroy()`.
+- Import path **verified, not guessed**: the package declares `"./dist/plugins/*.js"` and
+  `"./dist/plugins/*.esm.js"` in its own `exports` map, so
+  `wavesurfer.js/dist/plugins/regions.esm.js` resolves. `regions.d.ts` ships a **default**
+  export only, so the import is `{ default: RegionsPlugin }` — a named `{ RegionsPlugin }`
+  destructure would be `undefined` at runtime. Checked three ways: `tsc --noEmit` exit 0; a
+  probe file asserting `addRegion({ start: 'x' })` produced two real `TS2322` errors (so the
+  types resolved, not `any`); and `node --input-type=module` imported the file and reported
+  `default: function` with `create`/`clearRegions`/`addRegion` present.
+
+**Parked, not touched (per instruction):** `celery_app.py` `task_acks_late` (architecture
+decision), and in `skin_enhancer.py` both the GFPGAN/facexlib API usage and the
+`DiffBIRPipeline` call (each needs a new dependency / an architecture decision).
+
+**Verified (TDD — both behaviour changes genuinely red first):**
+- Red for APPLY 1: `AssertionError: Expected 400 for CWD-relative reference '.env'`,
+  `assert 200 == 400` — the request reached the VRAM guard (`Local audio inference refused:
+  no_gpu`), which is only possible if the file was read off disk.
+- Red for APPLY 2: 2 failed. The upload case returned
+  `{'status': 'COMPLETED', 'type': 'video', 'filename': 'gen_video_<ns>.mp4', 'url': '', …}`
+  and failed `assert None is True` on `degraded`; the commit case logged
+  `Failed to save generated video asset: catalog write failed` and still returned
+  `status: COMPLETED` with a real `url`, also failing `assert None is True` on `degraded`.
+  Green for all three after the fixes: `3 passed`.
+- `cd backend && .venv/bin/python -m pytest -q -p no:cacheprovider` → **562 passed, 2 skipped,
+  0 failed** in 205.78s. Pre-change baseline re-measured on this same tree: **559 passed,
+  2 skipped** in 215.12s. +3 = the 3 tests added by APPLY 1 and APPLY 2; nothing removed, so
+  the count does not drop below 559. Same 2 skips (`test_semantic_search`, needs the fastembed
+  model) and the same 3 pre-existing warnings (httpx/starlette deprecation + 2 duplicate
+  operation-ID warnings from `tasks.py`, already in TECH_DEBT.md). No new warnings.
+- `cd frontend && npx tsc --noEmit` → exit 0, clean.
+- `cd frontend && npx tsx --test src/utils/*.test.ts` → 62 tests, 62 pass, 0 fail.
+- `npx next lint` not run: the repo has no ESLint config, as recorded previously.
+
+**Not done / visible:**
+- APPLY 4 is verified by typecheck and by resolving the package's real exports, not by a
+  component test — the frontend suite is `src/utils/*.test.ts` only and has no React renderer,
+  so asserting the marker line is drawn would mean adding a test harness, which is out of scope
+  for a review-response pass.
+- `run_local_audio_generation`'s docstring step 4 mentions the upload; the storage-only
+  reference rule is now documented at the resolution site rather than in the numbered steps.
+- Real-GPU behaviour of any of this is still unverified here; the new tests pin the guard
+  explicitly rather than assuming a device.

@@ -7,15 +7,33 @@ considered configured when a test stores one via the secret store (or sends the
 """
 
 from app import tasks
+from app.ml.guard import vram_guard
 from app.models import Configuration, MediaAsset
 from app.services import elevenlabs as elevenlabs_service
 from app.services import secrets as secret_store
 from app.services.elevenlabs import DEFAULT_MODEL, DEFAULT_VOICE_ID
 
 
+#: The guard's no-device dict, pinned so the refusal asserted below is a property
+#: of this test rather than of the host: on a CUDA host the guard would admit the
+#: model and the loader would try to fetch real XTTS weights. Same shape as
+#: tests/test_localml_image.py.
+NO_GPU = {
+    "available": False,
+    "device_name": None,
+    "total_bytes": 0,
+    "free_bytes": 0,
+    "used_bytes": 0,
+    "total_gb": 0.0,
+    "free_gb": 0.0,
+    "used_gb": 0.0,
+    "vram_percent": 0.0,
+}
+
+
 class TestGenerateAudioNoKey:
     def test_no_key_degrades_to_local_pipeline_instead_of_inventing_bytes(
-        self, client, stub_storage, db_session
+        self, client, stub_storage, db_session, monkeypatch
     ):
         """No ElevenLabs key => fall through to the local XTTS pipeline.
 
@@ -23,6 +41,8 @@ class TestGenerateAudioNoKey:
         labeled degraded envelope (Decision #3). It must never persist or upload
         a fabricated mp3.
         """
+        monkeypatch.setattr(vram_guard, "get_gpu_info", lambda device=0: NO_GPU)
+
         res = client.post("/api/generate/audio?prompt=Hello+world&type=tts")
         assert res.status_code == 200
         body = res.json()

@@ -343,8 +343,20 @@ def run_local_image_to_video(
         # 6. Upload real MP4 bytes and persist MediaAsset
         filename = build_video_filename()
         upload_success = upload_object(mp4_bytes, filename, content_type="video/mp4")
+        if not upload_success:
+            # Reporting COMPLETED here would hand the caller a filename and a URL
+            # for an object that does not exist, and process_gpu_task would publish
+            # a terminal COMPLETED event, so the panel would render "Video
+            # uploaded" for nothing. Same rule run_local_audio_generation and
+            # run_skin_enhancement already follow.
+            logger.error(f"Failed to upload generated video asset '{filename}' to storage")
+            return make_degraded_response(
+                reason=DegradedReason.LOAD_FAILED.value,
+                message="Failed to upload generated video to storage",
+                model_id="svd",
+            ).model_dump()
 
-        if upload_success and db is not None:
+        if db is not None:
             try:
                 title_source = source_name or "image-to-video"
                 title = f"Local SVD: {title_source[:30]}..."
@@ -362,13 +374,21 @@ def run_local_image_to_video(
             except Exception as exc:
                 logger.error(f"Failed to save generated video asset: {exc}")
                 db.rollback()
+                # The object is in storage but the catalog row is not, so COMPLETED
+                # would claim a library asset that does not exist. Same rule the
+                # upload failure above follows.
+                return make_degraded_response(
+                    reason=DegradedReason.LOAD_FAILED.value,
+                    message=f"Failed to save generated video asset to the catalog: {str(exc)}",
+                    model_id="svd",
+                ).model_dump()
 
         # 7. Response matching typed contract
         return {
             "status": "COMPLETED",
             "type": "video",
             "filename": filename,
-            "url": generate_url(filename) if upload_success else "",
+            "url": generate_url(filename),
             "num_frames": num_frames,
             "fps": fps,
         }

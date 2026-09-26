@@ -3,8 +3,26 @@
 import base64
 import pytest
 import httpx
+from app.ml.guard import vram_guard
 from app.services.secrets import set_secret
 from app.models import MediaAsset
+
+
+#: The guard's no-device dict. Pinned into the two local-pipeline fallbacks below
+#: so their `no_gpu` assertion cannot depend on whether the host has a CUDA GPU:
+#: on a GPU host the guard would admit the model and the loader would fetch real
+#: XTTS/FLUX weights. Same shape as tests/test_localml_image.py.
+NO_GPU = {
+    "available": False,
+    "device_name": None,
+    "total_bytes": 0,
+    "free_bytes": 0,
+    "used_bytes": 0,
+    "total_gb": 0.0,
+    "free_gb": 0.0,
+    "used_gb": 0.0,
+    "vram_percent": 0.0,
+}
 
 
 class TestRealGeminiGeneration:
@@ -210,11 +228,16 @@ class TestRealElevenLabsGeneration:
 
 
 class TestUnconfiguredKeyMockFallback:
-    def test_no_keys_configured_falls_back_to_mock(self, client):
+    def test_no_keys_configured_falls_back_to_mock(self, client, monkeypatch):
         # Without any keys configured, should return legacy mock responses
         res_text = client.post("/api/generate/text?prompt=Mock+test")
         assert res_text.status_code == 200
         assert "mock Gemini response" in res_text.json()["output"]
+
+        # Pinned so the local-pipeline refusals below are a property of this test,
+        # not of the machine it runs on: with a CUDA GPU the guard would admit the
+        # model and the loader would try to fetch real XTTS/FLUX weights.
+        monkeypatch.setattr(vram_guard, "get_gpu_info", lambda device=0: NO_GPU)
 
         res_audio = client.post("/api/generate/audio?prompt=Mock+audio&type=tts")
         assert res_audio.status_code == 200
