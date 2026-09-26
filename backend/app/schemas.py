@@ -249,7 +249,7 @@ class BatchExportOut(BaseModel):
 
 
 class AssetBatchExportIn(BaseModel):
-    asset_ids: List[int] = Field(default_factory=list)
+    asset_ids: List[int] = Field(default_factory=list, max_length=100)
     include_derivatives: bool = True
 
 

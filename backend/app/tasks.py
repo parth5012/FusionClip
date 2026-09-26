@@ -1225,21 +1225,41 @@ def export_batch_zip(self, paths, export_format="original"):
         raise
 
 
+def sanitize_archive_entry_name(file_path: str, fallback_id: int) -> str:
+    """Sanitize a file path into a safe single filename without path separators or traversal (#106)."""
+    if not file_path:
+        return f"asset_{fallback_id}.bin"
+
+    # Normalize backslashes (Windows-style) to forward slashes
+    clean = str(file_path).replace("\\", "/")
+
+    # Extract only the base filename
+    base = os.path.basename(clean).strip()
+
+    # Reject traversal tokens, hidden roots, or empty basenames
+    if not base or base in (".", ".."):
+        return f"asset_{fallback_id}.bin"
+
+    return base
+
+
 @celery.task(bind=True, name="app.tasks.export_assets_zip")
 def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
     """Zip the requested assets and their generated derivatives into a single archive.
 
     - Queries MediaAsset records for the given asset IDs.
     - If include_derivatives is True, finds any child assets where source_path
-      matches any parent asset's file_path.
+      matches any parent asset's file_path, excluding already-selected IDs.
     - Collects all bytes from storage.
+    - Writes the zip to a temporary file on disk (preventing memory DoS).
+    - Sanitizes archive entry names against zip-slip directory traversal attacks.
     - Skips missing derivative files gracefully, noting them in skipped entries.
     - Handles zero-byte/corrupt entries safely.
     - Uploads the resulting archive to MinIO at exports/export_{task_id}.zip.
     - Marks the Task record as COMPLETED with progress 100, or FAILED on error.
-    - Publishes progress updates to Redis task_updates channel.
+    - Captures traceback on failure and publishes progress updates to Redis.
     """
-    import io as _io
+    import tempfile
     import zipfile
 
     task_id = self.request.id
@@ -1272,11 +1292,16 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
         parents = db.query(MediaAsset).filter(MediaAsset.id.in_(asset_ids)).all()
         parent_paths = [p.file_path for p in parents if p.file_path]
 
+        selected_ids_set = set(asset_ids)
         children = []
         if include_derivatives and parent_paths:
+            # Exclude already-selected IDs to prevent duplicate entries
             children = (
                 db.query(MediaAsset)
-                .filter(MediaAsset.source_path.in_(parent_paths))
+                .filter(
+                    MediaAsset.source_path.in_(parent_paths),
+                    ~MediaAsset.id.in_(selected_ids_set),
+                )
                 .all()
             )
     finally:
@@ -1284,7 +1309,9 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
 
     _update_progress(10, "Discovered assets and derivatives", "PROCESSING")
 
-    zip_buffer = _io.BytesIO()
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp_file:
+        tmp_path = tmp_file.name
+
     processed = 0
     skipped_files = []
     used_arcnames = set()
@@ -1305,7 +1332,7 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
             counter += 1
 
     try:
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
             total_items = len(parents) + len(children)
             current_step = 0
 
@@ -1324,7 +1351,7 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
                     data = get_object_bytes(parent.file_path)
                     if data is None:
                         data = b""
-                    filename = parent.file_path.split("/")[-1] or f"asset_{parent.id}.bin"
+                    filename = sanitize_archive_entry_name(parent.file_path, parent.id)
                     arc_name = _get_unique_arcname(filename)
                     zf.writestr(arc_name, data)
                     processed += 1
@@ -1349,7 +1376,7 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
                     data = get_object_bytes(child.file_path)
                     if data is None:
                         data = b""
-                    child_filename = child.file_path.split("/")[-1] or f"derivative_{child.id}.bin"
+                    child_filename = sanitize_archive_entry_name(child.file_path, child.id)
                     arc_name = _get_unique_arcname(f"derivatives/{child_filename}")
                     zf.writestr(arc_name, data)
                     processed += 1
@@ -1359,9 +1386,9 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
                     )
                     skipped_files.append({"id": child.id, "path": child.file_path, "reason": str(read_err)})
 
-        zip_bytes = zip_buffer.getvalue()
         export_key = f"exports/export_{task_id}.zip"
-        uploaded = upload_object(zip_bytes, export_key, content_type="application/zip")
+        with open(tmp_path, "rb") as fh:
+            uploaded = upload_object(fh, export_key, content_type="application/zip")
         if not uploaded:
             raise RuntimeError(f"Storage upload failed for {export_key}")
 
@@ -1401,6 +1428,7 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
                 db_task.status = "FAILED"
                 db_task.error = str(e)
                 db_task.error_type = categorize_error(str(e))
+                db_task.traceback = traceback.format_exc()
                 db.commit()
         finally:
             db.close()
@@ -1411,3 +1439,9 @@ def export_assets_zip(self, asset_ids: list, include_derivatives: bool = True):
             json.dumps({"task_id": task_id, "status": "FAILED", "progress": 0, "error": str(e)}),
         )
         raise
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception as rm_err:
+                logger.warning(f"Failed to remove temporary export file {tmp_path}: {rm_err}")
