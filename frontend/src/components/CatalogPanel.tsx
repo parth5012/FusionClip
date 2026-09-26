@@ -1,12 +1,12 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   Search, Volume2, Video, Image as ImageIcon, File, 
   Loader2, ArrowUpRight, Calendar, HardDrive, RefreshCw, X, Clock, ArrowLeftRight,
   Tag as TagIcon, LayoutGrid, List, Plus, Check
 } from 'lucide-react';
-import { fetchMediaCatalog, addAssetTag, removeAssetTag, MediaAsset, TagItem } from '../utils/api';
+import { fetchMediaCatalog, addAssetTag, removeAssetTag, MediaAsset } from '../utils/api';
 import { filterAssetsByTags, extractAllTags } from '../utils/tags';
 import BeforeAfterModal from './BeforeAfterModal';
 
@@ -31,15 +31,16 @@ export default function CatalogPanel() {
   const [addingTagAssetId, setAddingTagAssetId] = useState<number | null>(null);
   const [newTagName, setNewTagName] = useState('');
   const [tagActionLoading, setTagActionLoading] = useState<number | null>(null);
+  const [tagError, setTagError] = useState<{ assetId: number; message: string } | null>(null);
 
   // Before/after comparison (map #58): pairs a source asset with its upscaled output.
   const [compare, setCompare] = useState<{ beforeUrl: string; afterUrl: string; title: string } | null>(null);
 
-  const loadCatalog = async (searchQuery = '') => {
+  const loadCatalog = async (searchQuery = activeSearch, tagsToApply = selectedTags) => {
     setLoading(true);
     setError(null);
     try {
-      const data = await fetchMediaCatalog(searchQuery);
+      const data = await fetchMediaCatalog(searchQuery, 20, tagsToApply);
       setMediaList(data);
       setActiveSearch(searchQuery);
     } catch (err: any) {
@@ -51,17 +52,17 @@ export default function CatalogPanel() {
   };
 
   useEffect(() => {
-    loadCatalog();
+    loadCatalog('', []);
   }, []);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    loadCatalog(query);
+    loadCatalog(query, selectedTags);
   };
 
   const handleClearSearch = () => {
     setQuery('');
-    loadCatalog('');
+    loadCatalog('', selectedTags);
   };
 
   // Helper formatting size
@@ -84,13 +85,20 @@ export default function CatalogPanel() {
   // Tag filter handlers
   const toggleTagFilter = (tagName: string) => {
     const norm = tagName.trim().toLowerCase();
-    setSelectedTags(prev => 
-      prev.includes(norm) ? prev.filter(t => t !== norm) : [...prev, norm]
-    );
+    const nextTags = selectedTags.includes(norm)
+      ? selectedTags.filter(t => t !== norm)
+      : [...selectedTags, norm];
+    setSelectedTags(nextTags);
+    if (activeSearch) {
+      loadCatalog(activeSearch, nextTags);
+    }
   };
 
   const clearTagFilters = () => {
     setSelectedTags([]);
+    if (activeSearch) {
+      loadCatalog(activeSearch, []);
+    }
   };
 
   // Inline tag addition and removal
@@ -98,9 +106,19 @@ export default function CatalogPanel() {
     const trimmed = newTagName.trim();
     if (!trimmed) {
       setAddingTagAssetId(null);
+      setTagError(null);
+      return;
+    }
+    if (trimmed.includes(',')) {
+      setTagError({ assetId, message: 'Tag name cannot contain commas' });
+      return;
+    }
+    if (trimmed.length > 64) {
+      setTagError({ assetId, message: 'Tag name cannot exceed 64 characters' });
       return;
     }
     setTagActionLoading(assetId);
+    setTagError(null);
     try {
       const res = await addAssetTag(assetId, trimmed);
       setMediaList(prev => prev.map(asset => {
@@ -111,8 +129,10 @@ export default function CatalogPanel() {
       }));
       setNewTagName('');
       setAddingTagAssetId(null);
+      setTagError(null);
     } catch (err: any) {
       console.error('Failed to add tag:', err);
+      setTagError({ assetId, message: err.message || 'Failed to add tag' });
     } finally {
       setTagActionLoading(null);
     }
@@ -136,43 +156,51 @@ export default function CatalogPanel() {
   };
 
   // Filter 1: Type filter (audio, video, image)
-  const typeFiltered = mediaList.filter(item => {
-    const type = item.content_type.toLowerCase();
-    if (selectedFilter === 'audio') return type.startsWith('audio/');
-    if (selectedFilter === 'video') return type.startsWith('video/');
-    if (selectedFilter === 'image') return type.startsWith('image/');
-    return true;
-  });
+  const typeFiltered = useMemo(() => {
+    return mediaList.filter(item => {
+      const type = item.content_type.toLowerCase();
+      if (selectedFilter === 'audio') return type.startsWith('audio/');
+      if (selectedFilter === 'video') return type.startsWith('video/');
+      if (selectedFilter === 'image') return type.startsWith('image/');
+      return true;
+    });
+  }, [mediaList, selectedFilter]);
 
   // Extract all unique tags present across assets
-  const availableTags = extractAllTags(typeFiltered);
+  const availableTags = useMemo(() => {
+    return extractAllTags(typeFiltered);
+  }, [typeFiltered]);
 
   // Filter 2: Tag filter (AND semantics across selected tags)
-  const tagFiltered = filterAssetsByTags(typeFiltered, selectedTags);
+  const tagFiltered = useMemo(() => {
+    return filterAssetsByTags(typeFiltered, selectedTags);
+  }, [typeFiltered, selectedTags]);
 
   // Sort
-  const sortedList = [...tagFiltered].sort((a, b) => {
-    if (sortBy === 'newest') {
-      const tA = a.created_at ? new Date(a.created_at).getTime() : 0;
-      const tB = b.created_at ? new Date(b.created_at).getTime() : 0;
-      return tB - tA;
-    }
-    if (sortBy === 'oldest') {
-      const tA = a.created_at ? new Date(a.created_at).getTime() : 0;
-      const tB = b.created_at ? new Date(b.created_at).getTime() : 0;
-      return tA - tB;
-    }
-    if (sortBy === 'name-asc') {
-      return a.title.localeCompare(b.title);
-    }
-    if (sortBy === 'name-desc') {
-      return b.title.localeCompare(a.title);
-    }
-    if (sortBy === 'size-desc') {
-      return (b.file_size || 0) - (a.file_size || 0);
-    }
-    return 0;
-  });
+  const sortedList = useMemo(() => {
+    return [...tagFiltered].sort((a, b) => {
+      if (sortBy === 'newest') {
+        const tA = a.created_at ? new Date(a.created_at).getTime() : 0;
+        const tB = b.created_at ? new Date(b.created_at).getTime() : 0;
+        return tB - tA;
+      }
+      if (sortBy === 'oldest') {
+        const tA = a.created_at ? new Date(a.created_at).getTime() : 0;
+        const tB = b.created_at ? new Date(b.created_at).getTime() : 0;
+        return tA - tB;
+      }
+      if (sortBy === 'name-asc') {
+        return a.title.localeCompare(b.title);
+      }
+      if (sortBy === 'name-desc') {
+        return b.title.localeCompare(a.title);
+      }
+      if (sortBy === 'size-desc') {
+        return (b.file_size || 0) - (a.file_size || 0);
+      }
+      return 0;
+    });
+  }, [tagFiltered, sortBy]);
 
   // Calculate totals for badges
   const counts = {
@@ -326,7 +354,7 @@ export default function CatalogPanel() {
           </div>
 
           <button
-            onClick={() => loadCatalog(activeSearch)}
+            onClick={() => loadCatalog(activeSearch, selectedTags)}
             className="p-2 border border-slate-700 bg-slate-950/40 rounded text-slate-400 hover:bg-slate-800 transition text-xs flex items-center gap-1.5"
             title="Refresh catalog list"
           >
@@ -411,7 +439,7 @@ export default function CatalogPanel() {
           <p className="text-rose-400 font-semibold text-lg">Query Integration Failure</p>
           <p className="text-xs text-rose-350 mt-1 opacity-90">{error}</p>
           <button
-            onClick={() => loadCatalog(activeSearch)}
+            onClick={() => loadCatalog(activeSearch, selectedTags)}
             className="mt-4 px-4 py-2 bg-rose-900/40 hover:bg-rose-900/60 border border-rose-800 text-slate-200 rounded text-xs transition"
           >
             Retry Query
@@ -525,6 +553,7 @@ export default function CatalogPanel() {
                           onClick={() => {
                             setAddingTagAssetId(file.id);
                             setNewTagName('');
+                            setTagError(null);
                           }}
                           className="text-sky-400 hover:text-sky-300 text-[10px] flex items-center gap-0.5 font-medium transition"
                         >
@@ -557,38 +586,50 @@ export default function CatalogPanel() {
 
                       {/* Inline Input for New Tag */}
                       {isEditingTag && (
-                        <div className="flex items-center gap-1 w-full mt-1">
-                          <input
-                            type="text"
-                            autoFocus
-                            value={newTagName}
-                            onChange={(e) => setNewTagName(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault();
-                                handleAddTag(file.id);
-                              } else if (e.key === 'Escape') {
+                        <div className="w-full mt-1 space-y-1">
+                          <div className="flex items-center gap-1 w-full">
+                            <input
+                              type="text"
+                              autoFocus
+                              value={newTagName}
+                              onChange={(e) => {
+                                setNewTagName(e.target.value);
+                                if (tagError) setTagError(null);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault();
+                                  handleAddTag(file.id);
+                                } else if (e.key === 'Escape') {
+                                  setAddingTagAssetId(null);
+                                  setTagError(null);
+                                }
+                              }}
+                              placeholder="tag name..."
+                              className="flex-1 bg-slate-950 border border-sky-500 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none"
+                            />
+                            <button
+                              onClick={() => handleAddTag(file.id)}
+                              disabled={tagActionLoading === file.id}
+                              className="p-1 bg-sky-600 hover:bg-sky-500 text-white rounded text-xs transition"
+                              title="Confirm add tag"
+                            >
+                              <Check className="w-3 h-3" />
+                            </button>
+                            <button
+                              onClick={() => {
                                 setAddingTagAssetId(null);
-                              }
-                            }}
-                            placeholder="tag name..."
-                            className="flex-1 bg-slate-950 border border-sky-500 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none"
-                          />
-                          <button
-                            onClick={() => handleAddTag(file.id)}
-                            disabled={tagActionLoading === file.id}
-                            className="p-1 bg-sky-600 hover:bg-sky-500 text-white rounded text-xs transition"
-                            title="Confirm add tag"
-                          >
-                            <Check className="w-3 h-3" />
-                          </button>
-                          <button
-                            onClick={() => setAddingTagAssetId(null)}
-                            className="p-1 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded text-xs transition"
-                            title="Cancel"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
+                                setTagError(null);
+                              }}
+                              className="p-1 bg-slate-800 hover:bg-slate-750 text-slate-400 rounded text-xs transition"
+                              title="Cancel"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          </div>
+                          {tagError && tagError.assetId === file.id && (
+                            <p className="text-[10px] text-rose-400 font-medium">{tagError.message}</p>
+                          )}
                         </div>
                       )}
                     </div>
@@ -736,6 +777,7 @@ export default function CatalogPanel() {
                         onClick={() => {
                           setAddingTagAssetId(file.id);
                           setNewTagName('');
+                          setTagError(null);
                         }}
                         className="p-1 text-sky-400 hover:text-sky-300 rounded text-[10px] flex items-center gap-0.5 hover:bg-slate-800 transition"
                         title="Add tag"
@@ -743,37 +785,50 @@ export default function CatalogPanel() {
                         <Plus className="w-3 h-3" />
                       </button>
                     ) : (
-                      <div className="flex items-center gap-1">
-                        <input
-                          type="text"
-                          autoFocus
-                          value={newTagName}
-                          onChange={(e) => setNewTagName(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              e.preventDefault();
-                              handleAddTag(file.id);
-                            } else if (e.key === 'Escape') {
+                      <div className="space-y-1">
+                        <div className="flex items-center gap-1">
+                          <input
+                            type="text"
+                            autoFocus
+                            value={newTagName}
+                            onChange={(e) => {
+                              setNewTagName(e.target.value);
+                              if (tagError) setTagError(null);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault();
+                                handleAddTag(file.id);
+                              } else if (e.key === 'Escape') {
+                                setAddingTagAssetId(null);
+                                setTagError(null);
+                              }
+                            }}
+                            placeholder="tag name..."
+                            className="bg-slate-950 border border-sky-500 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-600 w-24 focus:outline-none"
+                          />
+                          <button
+                            onClick={() => handleAddTag(file.id)}
+                            disabled={tagActionLoading === file.id}
+                            className="p-0.5 bg-sky-600 hover:bg-sky-500 text-white rounded text-xs transition"
+                            title="Confirm"
+                          >
+                            <Check className="w-3 h-3" />
+                          </button>
+                          <button
+                            onClick={() => {
                               setAddingTagAssetId(null);
-                            }
-                          }}
-                          placeholder="tag name..."
-                          className="bg-slate-950 border border-sky-500 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-600 w-24 focus:outline-none"
-                        />
-                        <button
-                          onClick={() => handleAddTag(file.id)}
-                          className="p-0.5 bg-sky-600 hover:bg-sky-500 text-white rounded text-xs transition"
-                          title="Confirm"
-                        >
-                          <Check className="w-3 h-3" />
-                        </button>
-                        <button
-                          onClick={() => setAddingTagAssetId(null)}
-                          className="p-0.5 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded text-xs transition"
-                          title="Cancel"
-                        >
-                          <X className="w-3 h-3" />
-                        </button>
+                              setTagError(null);
+                            }}
+                            className="p-0.5 bg-slate-800 hover:bg-slate-700 text-slate-400 rounded text-xs transition"
+                            title="Cancel"
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </div>
+                        {tagError && tagError.assetId === file.id && (
+                          <p className="text-[10px] text-rose-400 font-medium">{tagError.message}</p>
+                        )}
                       </div>
                     )}
                   </div>

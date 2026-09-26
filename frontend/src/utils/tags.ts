@@ -1,4 +1,28 @@
-import type { MediaAsset, TagItem } from './api';
+import type { MediaAsset } from './api';
+
+/**
+ * Build the query URL for fetching media catalog with search and tag pre-filtering.
+ */
+export function buildMediaCatalogUrl(
+  apiBase: string,
+  query = '',
+  limit = 20,
+  tags: string[] = []
+): string {
+  const params = new URLSearchParams();
+  if (query) {
+    params.set('query', query);
+    params.set('limit', String(limit));
+  }
+  for (const t of tags) {
+    const trimmed = t.trim();
+    if (trimmed) params.append('tag', trimmed);
+  }
+  const queryString = params.toString();
+  return query
+    ? `${apiBase}/api/media/search${queryString ? `?${queryString}` : ''}`
+    : `${apiBase}/api/media${queryString ? `?${queryString}` : ''}`;
+}
 
 /**
  * Filter media assets by selected tags with AND semantics.
