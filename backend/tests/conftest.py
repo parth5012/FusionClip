@@ -104,6 +104,7 @@ def stub_storage(monkeypatch):
         "app.routers.storage",
         "app.routers.generate",
         "app.routers.media",
+        "app.routers.export",
         "app.tasks",
         "app.upscaler",
         "app.routers.upscale",

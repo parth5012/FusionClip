@@ -246,3 +246,23 @@ class BatchExportOut(BaseModel):
     message: str
     task_id: str
     status: str
+
+
+class AssetBatchExportIn(BaseModel):
+    asset_ids: List[int] = Field(default_factory=list)
+    include_derivatives: bool = True
+
+
+class AssetBatchExportOut(BaseModel):
+    message: str
+    task_id: str
+    status: str
+
+
+class ExportStatusOut(BaseModel):
+    task_id: str
+    status: str
+    progress: int
+    download_url: Optional[str] = None
+    filename: Optional[str] = None
+    error: Optional[str] = None

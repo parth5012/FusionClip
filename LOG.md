@@ -144,3 +144,28 @@
   - **3 parked verbatim for maintainers**: hash-fallback embedding persistence (data integrity, heavy), upscale job memory bounds >1.3 GB/job (architecture, heavy), Colab tunnel intent-vs-status separation (frontend redesign, heavy).
 - **GitGuardian check red (parked for human)**: scans all 22 PR commits; flags commit `6eb6f9d` for test placeholder `xi-stored-key-0001` in `"api_key":` context (incident 35968525, occurrences 299506848-50). Placeholders were renamed to `unit-test-placeholder-value*` at head (`0c30761`), but per-commit scanning keeps the historical finding — clearing requires marking the incident a false positive in the GitGuardian dashboard (needs repo owner access). `main` is branch-unprotected, so the red check does not block merge.
 - **Verification:** `pytest backend/tests/ -q` → **306 passed** (304 + 2 new); tsc/bun/e2e unaffected (backend-only changes; e2e green earlier this session at head `69411cd` frontend state).
+
+
+## 2026-09-26: Wayfinder Map #72 - Batch Select + Zip Export (#106)
+
+### Iteration Status: Done
+
+- **#106 Implement batch select + zip export with derivatives**
+  - **Backend (`POST /api/export/batch`, `GET /api/export/{task_id}`, `GET /api/export/download/{task_id}`)**:
+    - Added `app/routers/export.py` registered in `app/main.py`.
+    - Validates selection: rejects empty array/missing payload with 400 Bad Request; rejects unknown asset IDs with 400 Bad Request.
+    - Records job in existing `Task` model (`name="batch_export"`, `status="PENDING"`) enabling unified queue visibility (#107).
+    - Status endpoint returns presigned download URL when `COMPLETED`, progress updates during processing, and 404 for nonexistent tasks.
+    - Added Celery task `app.tasks.export_assets_zip` collecting original assets and all linked derivatives (`MediaAsset.source_path`), safely bundling them into `exports/export_{task_id}.zip` in MinIO/S3 with collision-resistant arcnames.
+    - Resilient failure handling: gracefully skips missing/unreadable derivatives, handles 0-byte entries safely, and fails task on storage upload error.
+  - **Frontend (`CatalogPanel.tsx`, `utils/api.ts`, `utils/export.ts`)**:
+    - Chose `CatalogPanel.tsx` as the primary UI surface where database-backed indexed assets and their generated derivatives reside (as opposed to `FileManager.tsx` which handles raw unindexed S3 buckets).
+    - Added multi-select checkboxes for both Grid and List layouts with Select All / Deselect All controls.
+    - Added selection toolbar showing dynamic file count including derivatives, toggle for derivative inclusion, and Export ZIP action.
+    - Implemented background status polling with real-time progress bar, ready badge, and automated browser download trigger.
+    - Added utility module `utils/export.ts` with comprehensive unit tests in `utils/export.test.ts`.
+- **Verification:**
+  - Backend: `HF_HUB_OFFLINE=1 pytest` → **327 passed, 2 skipped** (all 15 new batch export tests passed).
+  - Frontend: `bun test src/utils/` → **23 passed, 0 failed** (all 4 new export unit tests passed).
+  - Typecheck: `npx tsc --noEmit` → **0 errors**.
+  - Production build: `npm run build` → **Compiled successfully**.
