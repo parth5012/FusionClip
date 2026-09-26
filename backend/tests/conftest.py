@@ -111,6 +111,7 @@ def stub_storage(monkeypatch):
         "app.upscaler",
         "app.routers.upscale",
         "app.services.upscaler",
+        "app.services.subtitles",
     ):
         for name, impl in (
             ("upload_object", _upload_object),

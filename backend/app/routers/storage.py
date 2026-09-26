@@ -65,6 +65,18 @@ async def upload_file(
             generate_media_embedding.delay(asset.id)
         except Exception as celery_err:
             logger.error(f"Failed to schedule embedding task for asset {asset.id}: {celery_err}")
+
+        # Embedded subtitle track extraction (#109)
+        is_video = (file.content_type and file.content_type.startswith("video/")) or any(
+            (file.filename or "").lower().endswith(ext)
+            for ext in (".mp4", ".mkv", ".mov", ".webm", ".avi")
+        )
+        if is_video:
+            try:
+                from app.services.subtitles import extract_and_save_embedded_subtitles
+                await run_in_threadpool(extract_and_save_embedded_subtitles, db, asset, file_bytes)
+            except Exception as sub_err:
+                logger.warning(f"Embedded subtitle extraction skipped/failed for asset {asset.id}: {sub_err}")
     except Exception as e:
         logger.error(f"Failed to save asset to db: {e}")
         db.rollback()

@@ -11,31 +11,25 @@ from pydantic import BaseModel, Field, RootModel
 
 # --- Storage ---------------------------------------------------------------
 
-
 class UploadOut(BaseModel):
     message: str
     filename: str
     path: str
     url: str
 
-
 class MessageOut(BaseModel):
     message: str
-
 
 class FolderOut(BaseModel):
     message: str
     path: str
 
-
 # --- Tasks -----------------------------------------------------------------
-
 
 class TaskDispatchOut(BaseModel):
     message: str
     task_id: str
     status: str
-
 
 class TaskOut(BaseModel):
     """Runtime state of a Celery job as reported by GET /api/tasks/status/{id}."""
@@ -44,29 +38,23 @@ class TaskOut(BaseModel):
     state: str
     info: Any = None
 
-
 # --- Settings --------------------------------------------------------------
-
 
 class SettingsOut(RootModel[Dict[str, str]]):
     """Flat key/value settings map. Never contains `secret.`-prefixed keys."""
 
-
 class SettingsSaveOut(BaseModel):
     status: str
     message: str
-
 
 class ColabTunnelOut(BaseModel):
     status: str
     colab_url: str
     colab_status: str
 
-
 # --- Secrets ---------------------------------------------------------------
 
 SecretProvider = Literal["gemini", "elevenlabs"]
-
 
 class SecretsIn(BaseModel):
     """Plaintext provider keys, submitted once and never read back."""
@@ -74,40 +62,32 @@ class SecretsIn(BaseModel):
     gemini_api_key: Optional[str] = Field(default=None)
     elevenlabs_api_key: Optional[str] = Field(default=None)
 
-
 class SecretStatus(BaseModel):
     configured: bool = False
     last4: Optional[str] = None
-
 
 class SecretsStatusOut(BaseModel):
     gemini: SecretStatus = Field(default_factory=SecretStatus)
     elevenlabs: SecretStatus = Field(default_factory=SecretStatus)
 
-
 class SecretsMutationOut(BaseModel):
     status: str
     updated: List[str] = Field(default_factory=list)
-
 
 class SecretDeleteOut(BaseModel):
     status: str
     provider: str
     deleted: bool
 
-
 # --- Generation ------------------------------------------------------------
-
 
 class GenerationOut(BaseModel):
     """Common base for every /api/generate/* response."""
 
     status: str
 
-
 class GenerationTextOut(GenerationOut):
     output: str
-
 
 class GenerationAnalyzedFile(BaseModel):
     """One uploaded media file handed to the Gemini multimodal pipeline."""
@@ -119,14 +99,12 @@ class GenerationAnalyzedFile(BaseModel):
     gemini_file: Optional[str] = None
     gemini_uri: Optional[str] = None
 
-
 class GenerationMultimodalOut(GenerationOut):
     """Response from /api/generate/text when media files are attached."""
 
     output: str
     metadata: Dict[str, Any] = Field(default_factory=dict)
     analyzed_files: List[GenerationAnalyzedFile] = Field(default_factory=list)
-
 
 class GenerationGeminiImageOut(GenerationOut):
     prompt: str
@@ -135,7 +113,6 @@ class GenerationGeminiImageOut(GenerationOut):
     url: str
     content_type: str
 
-
 class GenerationGeminiVideoOut(GenerationOut):
     prompt: str
     model: str
@@ -143,12 +120,10 @@ class GenerationGeminiVideoOut(GenerationOut):
     url: Optional[str] = None
     filename: Optional[str] = None
 
-
 class GenerationAudioOut(GenerationOut):
     type: str
     filename: str
     url: str
-
 
 class GenerationTtsOut(GenerationOut):
     """Response from POST /api/generate/tts (real ElevenLabs synthesis)."""
@@ -161,7 +136,6 @@ class GenerationTtsOut(GenerationOut):
     url: str
     content_type: str
 
-
 class GenerationVoice(BaseModel):
     """One ElevenLabs voice surfaced by the voice-list endpoint."""
 
@@ -171,42 +145,33 @@ class GenerationVoice(BaseModel):
     category: Optional[str] = None
     preview_url: Optional[str] = None
 
-
 class GenerationVoiceListOut(GenerationOut):
     voices: List[GenerationVoice] = Field(default_factory=list)
-
 
 class GenerationImageParameters(BaseModel):
     steps: int
     scale: float
-
 
 class GenerationImageOut(GenerationOut):
     parameters: GenerationImageParameters
     filename: str
     url: str
 
-
 # --- Tags ------------------------------------------------------------------
 
 TagName = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[^,]+$")]
 
-
 class TagCreate(BaseModel):
     name: TagName
-
 
 class TagOut(BaseModel):
     id: int
     name: str
 
-
 class AssetTagsUpdate(BaseModel):
     tags: List[TagName] = Field(default_factory=list, max_length=50)
 
-
 # --- Media -----------------------------------------------------------------
-
 
 class UpscaledAssetOut(BaseModel):
     """A derived asset (e.g. an upscaled output) linked to a source asset."""
@@ -215,7 +180,6 @@ class UpscaledAssetOut(BaseModel):
     title: str
     file_path: str
     url: str
-
 
 class MediaAssetOut(BaseModel):
     id: int
@@ -233,31 +197,25 @@ class MediaAssetOut(BaseModel):
     tags: List[TagOut] = Field(default_factory=list)
     created_at: Optional[str] = None
 
-
 # --- Batch Export ---------------------------------------------------------
-
 
 class BatchExportIn(BaseModel):
     paths: list[str] = Field(..., min_length=1)
     format: str = "original"
-
 
 class BatchExportOut(BaseModel):
     message: str
     task_id: str
     status: str
 
-
 class AssetBatchExportIn(BaseModel):
     asset_ids: List[int] = Field(default_factory=list, max_length=100)
     include_derivatives: bool = True
-
 
 class AssetBatchExportOut(BaseModel):
     message: str
     task_id: str
     status: str
-
 
 class ExportStatusOut(BaseModel):
     task_id: str
@@ -266,3 +224,24 @@ class ExportStatusOut(BaseModel):
     download_url: Optional[str] = None
     filename: Optional[str] = None
     error: Optional[str] = None
+
+# --- Subtitles (#109) -----------------------------------------------------
+
+class SubtitleTrackOut(BaseModel):
+    id: int
+    asset_id: int
+    label: str
+    language: Optional[str] = None
+    file_path: str
+    url: str
+    format: str = "vtt"
+    track_type: str = "sidecar"
+    created_at: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class SubtitleExtractOut(BaseModel):
+    message: str
+    extracted_count: int
+    tracks: List[SubtitleTrackOut]

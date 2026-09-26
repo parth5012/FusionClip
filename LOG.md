@@ -95,7 +95,6 @@
 - Backend: 205 pytest unit & integration tests passing (`pytest backend/tests/` 205 passed in 45.19s).
 - Python compile check: clean.
 
-
 ## 2026-09-24: Wayfinder Map #70 - Magnific Core Upscaler (#96 ship)
 
 ### Iteration Status: Done
@@ -112,7 +111,6 @@
 - Unit: `bun test frontend/src/utils/` → 10 pass.
 - E2E: `09-upscaler.spec.ts` → **3 passed** (registries, FileManager flow, Magnific panel).
 - Issue #96 closed with resolution comment.
-
 
 ## 2026-09-25: Merge origin/main into the #96 branch (post-#96 integration)
 
@@ -133,7 +131,6 @@
   - E2E: `09-upscaler.spec.ts` → **3 passed** (first cold-run attempt failed a 20s upload-visibility timeout during Next/moto warm-up; warm re-run green, isolated re-run green).
 - **Flags for review:** main's CLIP hybrid search not ported (fastembed/384 kept); both upscale tabs in Sidebar (product cleanup); `aspect_ratio`/`provider` query params dropped from `generateImage` (frontend still sends them, FastAPI ignores); image-gemini/audio-key responses carry no `colab` key (matches both sides' existing key-sets); main's `09-upscaler-before-after.spec.ts` needs Redis+Celery worker — no redis binary/sudo in this env (docker stack covers it; API-level upscale paths covered by pytest).
 
-
 ## 2026-09-25: CodeRabbit review response on PR #129
 
 ### Iteration Status: Review
@@ -143,7 +140,6 @@
   - **3 parked verbatim for maintainers**: hash-fallback embedding persistence (data integrity, heavy), upscale job memory bounds >1.3 GB/job (architecture, heavy), Colab tunnel intent-vs-status separation (frontend redesign, heavy).
 - **GitGuardian check red (parked for human)**: scans all 22 PR commits; flags commit `6eb6f9d` for test placeholder `xi-stored-key-0001` in `"api_key":` context (incident 35968525, occurrences 299506848-50). Placeholders were renamed to `unit-test-placeholder-value*` at head (`0c30761`), but per-commit scanning keeps the historical finding — clearing requires marking the incident a false positive in the GitGuardian dashboard (needs repo owner access). `main` is branch-unprotected, so the red check does not block merge.
 - **Verification:** `pytest backend/tests/ -q` → **306 passed** (304 + 2 new); tsc/bun/e2e unaffected (backend-only changes; e2e green earlier this session at head `69411cd` frontend state).
-
 
 ## 2026-09-26: Wayfinder Map #72 - Batch Select + Zip Export (#106)
 
@@ -168,7 +164,6 @@
   - Frontend: `bun test src/utils/` → **23 passed, 0 failed** (all 4 new export unit tests passed).
   - Typecheck: `npx tsc --noEmit` → **0 errors**.
   - Production build: `npm run build` → **Compiled successfully**.
-
 
 ## 2026-09-26: Code review response on #106
 
@@ -203,7 +198,6 @@
 - Typecheck: `npx tsc --noEmit` → **clean (0 errors)**.
 - Build: `npm run build` → **compiled successfully**.
 
-
 ## 2026-09-26: Code Review on #108 - Task Logs & Error Viewer
 
 ### Iteration Status: Done
@@ -224,3 +218,32 @@
 - Typecheck: `npx tsc --noEmit` → **clean (0 errors)**.
 - Build: `npm run build` → **compiled successfully**.
 
+## 2026-09-26: Subtitle tracks - extract/upload and player support (#109)
+
+### Status: Done
+
+### Changes & Verification:
+- **Embedded-track extraction & Sidecar upload backend**:
+  - Added `SubtitleTrack` model in `backend/app/models.py` with foreign key cascade to `media_assets.id` and Alembic migration `c3d4e5f6a7b8_add_subtitle_tracks_table.py`.
+  - Added `backend/app/services/subtitles.py` providing probe with `ffprobe -select_streams s`, stream extraction to WebVTT with `ffmpeg -map 0:<stream> -c:s webvtt`, graceful skipping of bitmap codecs (e.g. PGS, DVD), error degradation when ffmpeg is missing, and `.srt` to `.vtt` conversion.
+  - Added subtitle endpoints in `backend/app/routers/media.py`:
+    - `GET /api/media/{asset_id}/subtitles` - list tracks
+    - `POST /api/media/{asset_id}/subtitles` - upload sidecar (.vtt / .srt) with size and cue validation
+    - `POST /api/media/{asset_id}/subtitles/extract` - on-demand embedded-track extraction
+    - `DELETE /api/media/{asset_id}/subtitles/{track_id}` - delete track from DB and S3
+    - `GET /api/media/{asset_id}/subtitles/{track_id}/content` - direct WebVTT stream
+  - Wired extraction into video upload ingest in `backend/app/routers/storage.py`.
+- **Frontend Player & Track Switching UX**:
+  - Added `frontend/src/utils/subtitles.ts` with VTT validation, SRT conversion, cue parsing, track label normalization, and native DOM `TextTrack` mode synchronization.
+  - Added API client helpers in `frontend/src/utils/api.ts` (`fetchAssetSubtitles`, `uploadAssetSubtitle`, `extractAssetSubtitles`, `deleteAssetSubtitle`).
+  - Updated `PlayersPanel.tsx` with:
+    - HTML5 `<track>` tags inside `<video crossOrigin="anonymous">`
+    - Subtitle track selector dropdown with explicit "Off" option
+    - Track error handler (`onError`) so 403 or network failure degrades gracefully
+    - Extract Subtitles action button for library videos
+    - Sidecar `.vtt` / `.srt` upload support
+- **Verification**:
+  - Backend: `pytest tests/test_subtitles.py` → **22 passed**.
+  - Frontend: `bun test src/utils/` → **25 passed** across 3 test files (15 new subtitle tests).
+  - Typecheck: `tsc --noEmit` → 0 errors.
+  - Build: `npm run build` → compiled successfully.

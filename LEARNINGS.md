@@ -41,7 +41,6 @@
 ### 10. Constant-Time Secret Verification
 - API token authentication in FastAPI handlers should use `secrets.compare_digest` rather than `!=` to eliminate timing side channels, and must check that both candidate and secret are non-empty strings.
 
-
 ## 2026-09-24: Magnific upscaler ship (#96)
 
 - **`task_id[:6]` is not unique enough**: two `upscale_*` ids sharing the first 6 chars cross-linked `file_path.contains(prefix)` status lookups → silent wrong-job results. Fix: per-job `uuid4().hex[:12]` token embedded in the output object path; status lookup contains the token (not the id prefix).
@@ -51,7 +50,6 @@
 - **No-Docker local e2e stack recipe**: moto server on :9000 + uvicorn :8001 (SQLITE DATABASE_URL, MINIO_ENDPOINT=127.0.0.1:9000, CORS_ORIGINS for the next dev origin) + `next dev` on :3001 with `NEXT_PUBLIC_API_URL` pointing at the backend. Ports 8000/3000 may be held by a sibling worktree — pick alternates.
 - **Playwright browser revision mismatch workaround**: when `npx playwright install` can't fetch (CDN redirect 400), symlink the expected revision dir (`chromium-1234 -> chromium-1243`) in `~/.cache/ms-playwright/`; binary layout matches on linux-x64.
 
-
 ## 2026-09-25: Merging divergent feature branches
 
 - **Shared-closer JSX conflicts: count EVERY closer line, including conditionals.** When both sides of a conflict end in identical closers (`))}`, `</div>`, `</div>`, `)}`), mirroring them around each side requires all four lines. Dropping the trailing `)}` (the `{cond && (` close) leaves the conditional open and the parser reports a misleading `')' expected` at the *next* block, far from the actual omission.
@@ -59,7 +57,6 @@
 - **Cold-start Playwright flakes masquerade as regressions**: the first e2e run after booting the stack pays Next.js compilation + moto first-put latency, which can blow a 20s visibility timeout even though the server-side operation succeeds (backend log shows the 200). Re-run isolated *and* full-suite warm before diagnosing.
 - **Local e2e without Redis**: the body-based `/api/upscale` flow dispatches via FastAPI `BackgroundTasks` (in-process, no broker), while `/api/tasks/*` dispatch goes through Celery `.delay()` and hard-fails without a broker. A no-Docker environment can verify the former fully; the latter needs the docker stack (no `redis-server` binary, no passwordless sudo).
 - **Dead-code audit during merges**: main's `startUpscale(path, params)` and its unused `useStore` destructure in FileManager had zero callers — keeping them would have created a duplicate-identifier (`setUpscaleTarget` local state vs store destructure) that `tsc` would reject. Grep call sites for both sides' symbols before choosing to union them.
-
 
 ## 2026-09-26: Batch select + zip export with derivatives (#106)
 
@@ -80,3 +77,8 @@
 - **Fail-Safe Celery Signal Handlers**: Celery signal handlers run synchronously in the worker lifecycle. Any uncaught exception in a signal handler aborts the task. Top-level `try/except Exception` blocks in every signal handler ensure logging failures never kill task execution.
 - **Lazy Loading Diagnostic Payloads**: Removing `logs` and `traceback` from the task list response in favor of an `event_count` summary and fetching detailed logs lazily on row expand (`GET /api/tasks/{task_id}/logs`) keeps list queries lean and fast.
 
+## 2026-09-26: Subtitle extraction and sidecar upload pipeline (#109)
+
+- **HTML5 `<video>` `<track>` elements and CORS**: `<track>` elements require `crossOrigin="anonymous"` on the `<video>` element when loading cross-origin URLs (e.g. S3 / MinIO presigned URLs on localhost:9000). If a track URL returns a 403 or network error, an `onError` listener on the `<track>` element marks the track as loaded with an error badge while preventing player crash.
+- **Embedded subtitle bitmap codecs vs WebVTT**: formats like `hdmv_pgs_subtitle` (Blu-ray PGS) or `dvd_subtitle` are rasterized bitmaps rather than text streams. Transcoding to WebVTT text via `ffmpeg -c:s webvtt` fails with bitmap codecs. Gracefully skip bitmap streams during probing/extraction without halting the pipeline.
+- **Degrading ffmpeg failures**: ffmpeg or ffprobe may fail or be missing in stripped runtime containers. The extraction pipeline must catch subprocess and parsing exceptions, log warnings, and degrade to 0 tracks rather than returning 500 error responses during media upload.

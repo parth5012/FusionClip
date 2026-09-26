@@ -24,14 +24,12 @@ except ImportError:
         def process_result_value(self, value, dialect):
             return value
 
-
 asset_tags = Table(
     "asset_tags",
     Base.metadata,
     Column("asset_id", Integer, ForeignKey("media_assets.id", ondelete="CASCADE"), primary_key=True),
     Column("tag_id", Integer, ForeignKey("tags.id", ondelete="CASCADE"), primary_key=True),
 )
-
 
 class Tag(Base):
     __tablename__ = "tags"
@@ -45,7 +43,6 @@ class Tag(Base):
     )
 
     assets = relationship("MediaAsset", secondary=asset_tags, back_populates="tags")
-
 
 class MediaAsset(Base):
     __tablename__ = "media_assets"
@@ -66,6 +63,7 @@ class MediaAsset(Base):
 
     tags = relationship("Tag", secondary=asset_tags, back_populates="assets", lazy="selectin")
 
+    subtitles = relationship("SubtitleTrack", back_populates="asset", cascade="all, delete-orphan")
 
 class Configuration(Base):
     __tablename__ = "configurations"
@@ -75,7 +73,6 @@ class Configuration(Base):
     value = Column(Text, nullable=False)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
-
 
 class Task(Base):
     __tablename__ = "tasks"
@@ -95,3 +92,17 @@ class Task(Base):
     last_retry_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+class SubtitleTrack(Base):
+    __tablename__ = "subtitle_tracks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    asset_id = Column(Integer, ForeignKey("media_assets.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(String, nullable=False)
+    language = Column(String, nullable=True)
+    file_path = Column(String, nullable=False)
+    format = Column(String, nullable=False, default="vtt")
+    track_type = Column(String, nullable=False, default="sidecar")  # "embedded" or "sidecar"
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    asset = relationship("MediaAsset", back_populates="subtitles")
