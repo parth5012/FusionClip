@@ -194,6 +194,22 @@ export async function fetchTasks(
   return res.json();
 }
 
+export interface TaskCountsResponse {
+  running: number;
+  pending: number;
+  failed: number;
+  completed: number;
+}
+
+export async function fetchTaskCounts(): Promise<TaskCountsResponse> {
+  const url = `${API_BASE_URL}/api/tasks/counts`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error('Failed to fetch task counts');
+  }
+  return res.json();
+}
+
 export async function retryTask(taskId: string): Promise<RetryResponse> {
   const url = `${API_BASE_URL}/api/tasks/${taskId}/retry`;
   const res = await fetch(url, {
