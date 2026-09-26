@@ -33,6 +33,7 @@ import {
   fetchAssetSubtitles,
   uploadAssetSubtitle,
   extractAssetSubtitles,
+  fetchMediaCatalog,
 } from '../utils/api';
 
 export default function PlayersPanel() {
@@ -49,6 +50,22 @@ export default function PlayersPanel() {
 
   const audioContainerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<any>(null);
+  const audioBlobUrlRef = useRef<string | null>(null);
+  const videoBlobUrlRef = useRef<string | null>(null);
+  const subtitleBlobUrlsRef = useRef<string[]>([]);
+
+  // Cleanup object URLs on unmount (#109)
+  useEffect(() => {
+    return () => {
+      if (audioBlobUrlRef.current) {
+        URL.revokeObjectURL(audioBlobUrlRef.current);
+      }
+      if (videoBlobUrlRef.current) {
+        URL.revokeObjectURL(videoBlobUrlRef.current);
+      }
+      subtitleBlobUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, []);
 
   // Video Custom Player states
   const [videoUrl, setVideoUrl] = useState<string>('https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4');
@@ -78,19 +95,20 @@ export default function PlayersPanel() {
     syncTextTrackModes(videoRef.current, activeSubtitleId, subtitlesEnabled);
   }, [activeSubtitleId, subtitlesEnabled, subtitleTracks]);
 
-  // Load catalog media assets to allow switching video in player
+  // Load catalog media assets to allow switching video in player (#109)
   useEffect(() => {
-    fetch('/api/media')
-      .then((res) => (res.ok ? res.json() : []))
+    fetchMediaCatalog()
       .then((data) => {
         if (Array.isArray(data)) {
           const videos = data
-            .filter((item: any) => item.content_type?.toLowerCase().startsWith('video/'))
-            .map((item: any) => ({ id: item.id, title: item.title, url: item.url }));
+            .filter((item) => item.content_type?.toLowerCase().startsWith('video/'))
+            .map((item) => ({ id: item.id, title: item.title, url: item.url }));
           setLibraryVideos(videos);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        console.warn('Failed to load media catalog for player:', err);
+      });
   }, []);
 
   // Load and destroy Wavesurfer instance
@@ -199,7 +217,11 @@ export default function PlayersPanel() {
   const handleAudioFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      if (audioBlobUrlRef.current) {
+        URL.revokeObjectURL(audioBlobUrlRef.current);
+      }
       const url = URL.createObjectURL(file);
+      audioBlobUrlRef.current = url;
       setAudioUrl(url);
     }
   };
@@ -296,7 +318,11 @@ export default function PlayersPanel() {
     const file = e.target.files?.[0];
     if (file) {
       setVideoError(null);
+      if (videoBlobUrlRef.current) {
+        URL.revokeObjectURL(videoBlobUrlRef.current);
+      }
       const url = URL.createObjectURL(file);
+      videoBlobUrlRef.current = url;
       setVideoUrl(url);
       setActiveAssetId(null);
       setSubtitleTracks([]);
@@ -421,6 +447,7 @@ export default function PlayersPanel() {
           const cues = parseSubtitleCues(vttContent);
           const blob = new Blob([vttContent], { type: 'text/vtt' });
           const url = URL.createObjectURL(blob);
+          subtitleBlobUrlsRef.current.push(url);
           const label = normalizeTrackLabel(file.name);
           const id = `local-${Date.now()}-${label}`;
           setSubtitleTracks((prev) => [...prev, { id, label, language: 'en', url, cues }]);
@@ -438,16 +465,6 @@ export default function PlayersPanel() {
       setVideoError(err?.message || 'Failed to upload subtitle file');
     }
   };
-
-  // Resolve the currently visible cue from the active track (for DOM fallback overlay)
-  const activeSubtitleTrack =
-    subtitleTracks.find((track) => track.id === activeSubtitleId) || null;
-  const activeSubtitleCue =
-    activeSubtitleTrack && subtitlesEnabled && activeSubtitleTrack.cues
-      ? activeSubtitleTrack.cues.find(
-          (cue) => videoCurrentTime >= cue.start && videoCurrentTime < cue.end
-        ) || null
-      : null;
 
   // Human friendly formatting
   const formatTime = (timeInSeconds: number) => {
@@ -715,7 +732,6 @@ export default function PlayersPanel() {
               <video
                 ref={videoRef}
                 src={videoUrl}
-                crossOrigin="anonymous"
                 onClick={handleVideoPlayPause}
                 onTimeUpdate={handleVideoTimeUpdate}
                 onLoadedMetadata={handleVideoLoadedMetadata}
@@ -742,15 +758,6 @@ export default function PlayersPanel() {
                   <div className="p-4 rounded-full bg-slate-950/80 border border-slate-800/80 text-indigo-400 hover:text-indigo-300 hover:scale-105 transition">
                   <Play className="w-6 h-6 fill-indigo-400/20" />
                   </div>
-                </div>
-              )}
-
-              {/* Subtitle overlay */}
-              {activeSubtitleCue && (
-                <div className="absolute bottom-4 left-0 right-0 flex justify-center px-6 pointer-events-none">
-                  <span className="bg-black/75 text-white text-base font-medium px-3 py-1.5 rounded-md text-center max-w-[90%] shadow-lg">
-                    {activeSubtitleCue.text}
-                  </span>
                 </div>
               )}
             </div>

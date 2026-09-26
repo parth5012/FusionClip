@@ -247,3 +247,30 @@
   - Frontend: `bun test src/utils/` → **25 passed** across 3 test files (15 new subtitle tests).
   - Typecheck: `tsc --noEmit` → 0 errors.
   - Build: `npm run build` → compiled successfully.
+
+## 2026-09-26: Code review fixes for #109 (subtitles)
+
+### Status: Done
+
+### Changes & Verification:
+- **Blocker 1 (Playback breakage / CORS)**:
+  - Removed `crossOrigin="anonymous"` from `<video>` element in `PlayersPanel.tsx` to prevent presigned MinIO URLs from failing with 404/CORS.
+  - Updated subtitle serialization `_serialize_subtitle` in `backend/app/routers/media.py` to emit relative proxy URL `/api/media/{asset_id}/subtitles/{track_id}/content`.
+  - Added `resolveSubtitleContentUrl()` in `frontend/src/utils/api.ts` to prepend `API_BASE_URL` when consuming subtitle track URLs, ensuring `<track src>` hits the CORS-ready FastAPI proxy endpoint.
+- **Blocker 2 (Async upload extraction via Celery)**:
+  - Added `@celery.task(name="app.tasks.extract_media_subtitles")` in `backend/app/tasks.py` and routed to `media.fast` queue in `backend/app/celery_app.py`.
+  - Updated `backend/app/routers/storage.py` to dispatch `extract_media_subtitles.delay(asset.id)` without passing file bytes or blocking request responses.
+- **Should-fix 3 (Subprocess timeouts)**:
+  - Added `timeout=30` to `ffprobe` and `timeout=60` to `ffmpeg` in `backend/app/services/subtitles.py`, catching `subprocess.TimeoutExpired` gracefully with logging.
+- **Should-fix 4 (Extraction idempotency)**:
+  - Updated `extract_and_save_embedded_subtitles()` to query existing `(asset_id, file_path)` records before insert, preventing duplicate rows on re-runs.
+- **Should-fix 5 (API catalog fetch)**:
+  - Replaced bare `fetch('/api/media')` in `PlayersPanel.tsx` with typed `fetchMediaCatalog()`.
+- **Should-fix 6 (Collision-safe sidecar keys)**:
+  - Included `uuid4().hex[:8]` in sidecar storage paths (`subtitles/{asset_id}/sidecar_{stem}_{token}.vtt`).
+- **Nits 7 & 8 (Memory leaks & DOM cleanup)**:
+  - Added `URL.revokeObjectURL()` cleanup in `PlayersPanel.tsx` on unmount/replaces for audio, video, and local subtitle blob URLs.
+  - Removed redundant custom DOM subtitle text overlay so native HTML5 text track rendering handles cue display.
+- **Verification**:
+  - Backend full suite: 329 passed, 2 skipped across all test files (100% green).
+  - Frontend: `bun test src/utils/` (27 passed), `tsc --noEmit` (0 errors), `npm run build` (successful).

@@ -13,6 +13,7 @@ from app.models import MediaAsset, Tag
 from app.schemas import AssetTagsUpdate, TagCreate, TagOut
 
 import re
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
@@ -366,7 +367,7 @@ def _serialize_subtitle(track: SubtitleTrack) -> dict:
         "label": track.label,
         "language": track.language,
         "file_path": track.file_path,
-        "url": generate_url(track.file_path) if track.file_path else "",
+        "url": f"/api/media/{track.asset_id}/subtitles/{track.id}/content",
         "format": track.format,
         "track_type": track.track_type,
         "created_at": track.created_at.isoformat() if track.created_at else None,
@@ -403,9 +404,10 @@ async def upload_asset_subtitle(
     track_label = label.strip() if label and label.strip() else stem
     track_lang = language.strip() if language and language.strip() else None
 
-    # Upload to MinIO
+    # Upload to MinIO with unique token to prevent collisions (#109)
     safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", stem)
-    s3_key = f"subtitles/{asset_id}/sidecar_{safe_stem}.vtt"
+    unique_token = uuid.uuid4().hex[:8]
+    s3_key = f"subtitles/{asset_id}/sidecar_{safe_stem}_{unique_token}.vtt"
     success = upload_object(vtt_content.encode("utf-8"), s3_key, content_type="text/vtt")
     if not success:
         raise HTTPException(status_code=500, detail="Failed to upload subtitle file to storage")

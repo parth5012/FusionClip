@@ -133,3 +133,24 @@ describe('normalizeTrackLabel', () => {
     assert.equal(normalizeTrackLabel('English CC'), 'English CC');
   });
 });
+
+describe('resolveSubtitleContentUrl', () => {
+  const { resolveSubtitleContentUrl } = require('./api');
+
+  it('prefixes relative API content URL with API_BASE_URL', () => {
+    const resolved = resolveSubtitleContentUrl('/api/media/1/subtitles/2/content');
+    assert.ok(resolved.endsWith('/api/media/1/subtitles/2/content'));
+    assert.ok(resolved.startsWith('http'));
+  });
+
+  it('preserves absolute and blob URLs unchanged', () => {
+    assert.equal(
+      resolveSubtitleContentUrl('https://cdn.example.com/subs.vtt'),
+      'https://cdn.example.com/subs.vtt'
+    );
+    assert.equal(
+      resolveSubtitleContentUrl('blob:http://localhost:3000/12345'),
+      'blob:http://localhost:3000/12345'
+    );
+  });
+});

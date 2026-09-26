@@ -855,12 +855,24 @@ export interface SubtitleTrackItem {
   created_at?: string | null;
 }
 
+export function resolveSubtitleContentUrl(relativeUrl: string): string {
+  if (!relativeUrl) return '';
+  if (relativeUrl.startsWith('http://') || relativeUrl.startsWith('https://') || relativeUrl.startsWith('blob:')) {
+    return relativeUrl;
+  }
+  return `${API_BASE_URL}${relativeUrl.startsWith('/') ? '' : '/'}${relativeUrl}`;
+}
+
 export async function fetchAssetSubtitles(assetId: number | string): Promise<SubtitleTrackItem[]> {
   const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/subtitles`);
   if (!res.ok) {
     throw new Error(await readErrorDetail(res, 'Failed to fetch subtitles'));
   }
-  return res.json();
+  const tracks: SubtitleTrackItem[] = await res.json();
+  return tracks.map((t) => ({
+    ...t,
+    url: resolveSubtitleContentUrl(t.url),
+  }));
 }
 
 export async function uploadAssetSubtitle(
@@ -881,7 +893,11 @@ export async function uploadAssetSubtitle(
   if (!res.ok) {
     throw new Error(await readErrorDetail(res, 'Failed to upload subtitle file'));
   }
-  return res.json();
+  const track: SubtitleTrackItem = await res.json();
+  return {
+    ...track,
+    url: resolveSubtitleContentUrl(track.url),
+  };
 }
 
 export async function extractAssetSubtitles(
@@ -893,7 +909,14 @@ export async function extractAssetSubtitles(
   if (!res.ok) {
     throw new Error(await readErrorDetail(res, 'Failed to extract embedded subtitles'));
   }
-  return res.json();
+  const data = await res.json();
+  return {
+    ...data,
+    tracks: (data.tracks || []).map((t: SubtitleTrackItem) => ({
+      ...t,
+      url: resolveSubtitleContentUrl(t.url),
+    })),
+  };
 }
 
 export async function deleteAssetSubtitle(

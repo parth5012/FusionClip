@@ -68,7 +68,7 @@ class TestSidecarUploadValidation:
         assert body["language"] == "en"
         assert body["format"] == "vtt"
         assert body["track_type"] == "sidecar"
-        assert body["url"].startswith("http://test-minio/")
+        assert body["url"] == f"/api/media/{sample_video_asset.id}/subtitles/{body['id']}/content"
         assert body["file_path"].endswith(".vtt")
 
     def test_upload_valid_srt_converted_to_vtt(self, client, db_session, sample_video_asset, stub_storage):
@@ -158,7 +158,7 @@ class TestSubtitleListAndDeletion:
         assert "English" in labels
         assert "Spanish Commentary" in labels
         for t in tracks:
-            assert t["url"].startswith("http://test-minio/")
+            assert t["url"] == f"/api/media/{sample_video_asset.id}/subtitles/{t['id']}/content"
 
     def test_list_subtitles_for_nonexistent_asset_returns_404(self, client):
         res = client.get("/api/media/99999/subtitles")
@@ -334,15 +334,84 @@ class TestEmbeddedTrackExtraction:
         res = client.delete(f"/api/media/{sample_video_asset.id}/subtitles/9999")
         assert res.status_code == 404
 
-    def test_video_upload_ingest_graceful_when_probe_fails(self, client, stub_storage):
+    def test_extract_twice_idempotency(self, client, db_session, sample_video_asset, stub_storage):
         from app.services import subtitles
 
-        with patch.object(subtitles, "probe_subtitle_streams", side_effect=RuntimeError("probe failed")):
+        probe_mock = [
+            {"index": 2, "codec_name": "subrip", "language": "eng", "label": "English"}
+        ]
+
+        def fake_extract(input_path, stream_info, output_path):
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_VTT)
+            return True
+
+        stub_storage["uploaded"][sample_video_asset.file_path] = {
+            "data": b"fake video data",
+            "content_type": "video/mp4",
+        }
+
+        with patch.object(subtitles, "probe_subtitle_streams", return_value=probe_mock), \
+             patch.object(subtitles, "extract_track_to_vtt", side_effect=fake_extract):
+            res1 = client.post(f"/api/media/{sample_video_asset.id}/subtitles/extract")
+            assert res1.status_code == 200
+            assert res1.json()["extracted_count"] == 1
+
+            # Run a second time
+            res2 = client.post(f"/api/media/{sample_video_asset.id}/subtitles/extract")
+            assert res2.status_code == 200
+            assert res2.json()["extracted_count"] == 1
+
+            # Assert DB has exactly one row for this asset
+            rows = db_session.query(SubtitleTrack).filter(SubtitleTrack.asset_id == sample_video_asset.id).all()
+            assert len(rows) == 1
+            assert rows[0].label == "English"
+
+    def test_video_upload_dispatches_celery_task_and_does_not_block(self, client, stub_storage):
+        with patch("app.tasks.extract_media_subtitles.delay") as mock_delay:
             res = client.post(
                 "/api/storage/upload",
-                files={"file": ("clip_no_sub.mp4", b"dummy video bytes", "video/mp4")},
+                files={"file": ("fast_upload.mp4", b"dummy video bytes", "video/mp4")},
             )
-            # Must succeed without 500 error
             assert res.status_code == 200
-            body = res.json()
-            assert body["filename"] == "clip_no_sub.mp4"
+            assert mock_delay.called
+            # Verify passed asset id as integer, NOT raw bytes
+            args, _ = mock_delay.call_args
+            assert isinstance(args[0], int)
+
+    def test_celery_task_extract_media_subtitles(self, db_session, sample_video_asset, stub_storage):
+        from app.services import subtitles
+        from app.tasks import extract_media_subtitles
+
+        probe_mock = [
+            {"index": 2, "codec_name": "subrip", "language": "eng", "label": "English"}
+        ]
+
+        def fake_extract(input_path, stream_info, output_path):
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(SAMPLE_VTT)
+            return True
+
+        stub_storage["uploaded"][sample_video_asset.file_path] = {
+            "data": b"fake video data",
+            "content_type": "video/mp4",
+        }
+
+        with patch.object(subtitles, "probe_subtitle_streams", return_value=probe_mock), \
+             patch.object(subtitles, "extract_track_to_vtt", side_effect=fake_extract):
+            # Run celery task synchronously via apply()
+            res = extract_media_subtitles.apply(args=(sample_video_asset.id,))
+            assert res.successful()
+            track_ids = res.result
+            assert len(track_ids) == 1
+
+    def test_subprocess_timeout_handled_gracefully(self):
+        from app.services.subtitles import probe_subtitle_streams, extract_track_to_vtt
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="ffprobe", timeout=30)):
+            streams = probe_subtitle_streams("/fake/path.mp4")
+            assert streams == []
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="ffmpeg", timeout=60)):
+            success = extract_track_to_vtt("/fake/in.mp4", {"index": 1, "codec_name": "subrip"}, "/fake/out.vtt")
+            assert success is False
