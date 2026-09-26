@@ -30,6 +30,12 @@ def export_batch_assets(payload: AssetBatchExportIn, db: Session = Depends(get_d
             detail="No assets selected for export. At least one asset id must be provided.",
         )
 
+    if len(payload.asset_ids) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot export more than 100 assets in a single batch.",
+        )
+
     # Validate that all requested assets exist in the database
     assets = db.query(MediaAsset).filter(MediaAsset.id.in_(payload.asset_ids)).all()
     found_ids = {a.id for a in assets}

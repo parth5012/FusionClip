@@ -254,8 +254,8 @@ export default function CatalogPanel() {
   };
 
   const exportSummary = useMemo(() => {
-    return computeExportAssetCount(sortedList, selectedAssetIds, includeDerivatives);
-  }, [sortedList, selectedAssetIds, includeDerivatives]);
+    return computeExportAssetCount(mediaList, selectedAssetIds, includeDerivatives);
+  }, [mediaList, selectedAssetIds, includeDerivatives]);
 
   const handleStartExport = async () => {
     if (selectedAssetIds.size === 0) return;
@@ -282,9 +282,13 @@ export default function CatalogPanel() {
   useEffect(() => {
     if (!activeExportTaskId) return;
 
+    let consecutiveFailures = 0;
+    const MAX_FAILURES = 5;
+
     const interval = setInterval(async () => {
       try {
         const status = await getExportStatus(activeExportTaskId);
+        consecutiveFailures = 0;
         setExportProgress(status.progress);
         if (status.status === 'COMPLETED') {
           setExportStatusText('ZIP archive ready!');
@@ -292,6 +296,7 @@ export default function CatalogPanel() {
           setExportFilename(status.filename ?? 'export.zip');
           setExporting(false);
           setActiveExportTaskId(null);
+          setSelectedAssetIds(new Set());
           if (status.download_url) {
             triggerDownload(status.download_url, status.filename ?? undefined);
           }
@@ -303,7 +308,13 @@ export default function CatalogPanel() {
           setExportStatusText(`Zipping archive... ${status.progress}%`);
         }
       } catch (err: any) {
-        console.error('Error polling export status:', err);
+        consecutiveFailures += 1;
+        console.error(`Error polling export status (${consecutiveFailures}/${MAX_FAILURES}):`, err);
+        if (consecutiveFailures >= MAX_FAILURES) {
+          setExportError('Lost connection to server while polling export status.');
+          setExporting(false);
+          setActiveExportTaskId(null);
+        }
       }
     }, 1500);
 
@@ -749,7 +760,7 @@ export default function CatalogPanel() {
                   )}
 
                   {/* Badges Overlay */}
-                  <div className="absolute top-2.5 left-2.5 flex items-center gap-1.5 z-10 pointer-events-none">
+                  <div className="absolute top-2.5 right-2.5 flex items-center gap-1.5 z-10 pointer-events-none">
                     {isVideo && (
                       <span className="bg-indigo-900/90 border border-indigo-850 text-indigo-300 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 shadow">
                         <Video className="w-3 h-3" /> Video
