@@ -187,6 +187,22 @@ class GenerationImageOut(GenerationOut):
     url: str
 
 
+# --- Tags ------------------------------------------------------------------
+
+
+class TagCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+
+
+class TagOut(BaseModel):
+    id: int
+    name: str
+
+
+class AssetTagsUpdate(BaseModel):
+    tags: List[str] = Field(default_factory=list)
+
+
 # --- Media -----------------------------------------------------------------
 
 
@@ -212,6 +228,7 @@ class MediaAssetOut(BaseModel):
     source_path: Optional[str] = None
     source_url: Optional[str] = None
     upscaled_assets: List[UpscaledAssetOut] = Field(default_factory=list)
+    tags: List[TagOut] = Field(default_factory=list)
     created_at: Optional[str] = None
 
 

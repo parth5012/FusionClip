@@ -94,6 +94,8 @@ test.describe('Generation & Catalog', () => {
       expect(asset).toHaveProperty('content_type');
       expect(asset).toHaveProperty('duration');
       expect(asset).toHaveProperty('url');
+      expect(asset).toHaveProperty('tags');
+      expect(Array.isArray(asset.tags)).toBeTruthy();
       expect(asset).toHaveProperty('created_at');
     }
   });
@@ -206,5 +208,28 @@ test.describe('Generation & Catalog', () => {
         await page.waitForTimeout(500);
       }
     }
+  });
+
+  test('catalog panel UI shows grid/list view switcher and tag filter section', async ({ page }) => {
+    await page.goto('/');
+    await navigateToTab(page, 'Catalog Search');
+    await page.waitForTimeout(1000);
+
+    // Grid and List switcher buttons should be visible
+    const gridBtn = page.getByRole('button', { name: /grid/i });
+    const listBtn = page.getByRole('button', { name: /list/i });
+    await expect(gridBtn).toBeVisible({ timeout: 5000 });
+    await expect(listBtn).toBeVisible({ timeout: 5000 });
+
+    // Switching to list view should update viewMode
+    await listBtn.click();
+    await page.waitForTimeout(300);
+
+    // Switch back to grid view
+    await gridBtn.click();
+    await page.waitForTimeout(300);
+
+    // Tag filter section should be visible
+    await expect(page.getByText('Filter by Tags', { exact: false })).toBeVisible({ timeout: 5000 });
   });
 });

@@ -396,6 +396,7 @@ class TestMediaRouter:
         "source_path",
         "source_url",
         "upscaled_assets",
+        "tags",
         "created_at",
     }
 

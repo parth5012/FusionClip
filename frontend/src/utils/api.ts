@@ -217,6 +217,11 @@ export async function getErrorTypes(): Promise<string[]> {
 
 
 
+export interface TagItem {
+  id: number;
+  name: string;
+}
+
 export interface MediaAsset {
   id: number;
   title: string;
@@ -230,16 +235,118 @@ export interface MediaAsset {
   source_path: string | null;
   source_url: string | null;
   upscaled_assets: UpscaledAsset[];
+  tags?: TagItem[];
   created_at: string | null;
 }
 
-export async function fetchMediaCatalog(query = '', limit = 20): Promise<MediaAsset[]> {
+export async function fetchMediaCatalog(
+  query = '',
+  limit = 20,
+  tags: string[] = []
+): Promise<MediaAsset[]> {
+  const params = new URLSearchParams();
+  if (query) {
+    params.set('query', query);
+    params.set('limit', String(limit));
+  }
+  for (const t of tags) {
+    params.append('tag', t);
+  }
+  const queryString = params.toString();
   const url = query
-    ? `${API_BASE_URL}/api/media/search?query=${encodeURIComponent(query)}&limit=${limit}`
-    : `${API_BASE_URL}/api/media`;
+    ? `${API_BASE_URL}/api/media/search${queryString ? `?${queryString}` : ''}`
+    : `${API_BASE_URL}/api/media${queryString ? `?${queryString}` : ''}`;
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error('Failed to fetch media catalog');
+  }
+  return res.json();
+}
+
+/* ── Tags API Endpoints (#105) ─────────────────────────────────────────── */
+
+export async function fetchTags(): Promise<TagItem[]> {
+  const res = await fetch(`${API_BASE_URL}/api/tags`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch tags');
+  }
+  return res.json();
+}
+
+export async function createTag(name: string): Promise<TagItem> {
+  const res = await fetch(`${API_BASE_URL}/api/tags`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to create tag');
+  }
+  return res.json();
+}
+
+export async function deleteTag(tagId: number): Promise<{ message: string; id: number }> {
+  const res = await fetch(`${API_BASE_URL}/api/tags/${tagId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to delete tag');
+  }
+  return res.json();
+}
+
+export async function fetchAssetTags(assetId: number): Promise<TagItem[]> {
+  const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/tags`);
+  if (!res.ok) {
+    throw new Error('Failed to fetch asset tags');
+  }
+  return res.json();
+}
+
+export async function addAssetTag(
+  assetId: number,
+  name: string
+): Promise<{ id: number; name: string; asset_id: number; tags: TagItem[] }> {
+  const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/tags`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to add tag to asset');
+  }
+  return res.json();
+}
+
+export async function removeAssetTag(
+  assetId: number,
+  tagId: number
+): Promise<{ message: string; asset_id: number; tag_id: number; tags: TagItem[] }> {
+  const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/tags/${tagId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to remove tag from asset');
+  }
+  return res.json();
+}
+
+export async function updateAssetTags(
+  assetId: number,
+  tags: string[]
+): Promise<{ asset_id: number; tags: TagItem[] }> {
+  const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/tags`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tags }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to update asset tags');
   }
   return res.json();
 }
