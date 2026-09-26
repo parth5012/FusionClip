@@ -124,6 +124,7 @@ def stub_storage(monkeypatch):
         "app.ml.image",
         "app.ml.audio",
         "app.ml.video",
+        "app.ml.skin_enhancer",
     ):
         for name, impl in (
             ("upload_object", _upload_object),

@@ -463,3 +463,170 @@
 - `next lint` unavailable — the repo has no ESLint config (pre-existing; `next lint` offers to scaffold one interactively).
 
 **Not done / parked:** `main` and `master` are still separate lines. This branch is 22 commits ahead of `origin/main` and needs a PR to land. `TECH_DEBT.md` entry: duplicate `list_tasks` / `retry_task` in `app/routers/tasks.py` (pre-existing on `main`, causes FastAPI "Duplicate Operation ID" warnings).
+
+## 2026-09-26: Skin-enhance backend endpoint + engine integration (#112, map #73)
+
+### Iteration Status: Done
+
+**Why:** the map's backend half. Faithful runs GFPGAN, Creative/Flexible run DiffBIR (both Apache-2.0), the five Magnific Flexible presets are a static prompt/guidance/noise table, and the output has to be a `skin_enhanced/<stem>_<token>.png` derivative with `MediaAsset.source_path` lineage so the existing `BeforeAfterModal` pairs it with no new UI.
+
+**What changed:**
+- `backend/app/ml/skin_enhancer.py` (new, ~880 lines). Ticket-citing module docstring; numbered-phase executor docstring; all torch / gfpgan / facexlib / diffusers imports confined to the loader closures so the app boots on a machine with none of them. Holds the pure parameter mapping (`map_skin_detail_to_guidance`, `map_skin_detail_to_texture_retention`, `map_sharpen_to_percent`, `map_smart_grain_to_sigma`), the pure `get_flexible_preset` table, the PIL post-filters, the two engine adapters, and `run_skin_enhancement` wrapped in `INFERENCE_LOCK` with the eviction-invariant comment. Every non-obvious number carries its reason.
+- `backend/app/routers/skin_enhance.py` (new). `POST /api/skin-enhance` + `GET /api/skin-enhance/presets`. Range/integrality/mode/preset/path validation lives in the route so out-of-range sliders are **400 with an actionable message** rather than pydantic's 422; every 400 detail leads with a machine-readable reason slug.
+- `backend/app/ml/registry.py`: added `gfpgan` (1.5 GB, Apache-2.0) and `diffbir` (8.0 GB, Apache-2.0) to `PINNED_ROSTER`; module docstring now records why CodeFormer/SUPIR/StableSR/GPEN are absent. The GFPGAN comment states plainly that the upstream repo publishes **no** numeric figure and that 1.5 GB is a conservative choice, not a citation.
+- `backend/app/ml/__init__.py`: exported the skin-enhance surface.
+- `backend/app/main.py`: registered the router.
+- `backend/tests/conftest.py`: added `app.ml.skin_enhancer` to the `stub_storage` module loop (miss this and tests silently hit the real S3 client).
+- `backend/tests/test_skin_enhancer.py` (new, 54 tests).
+- `backend/tests/test_localml_scaffold.py`: `test_pinned_roster_loaded_by_default` still asserts an **exact** roster set, so the two new ids were added and the four excluded engines were added as explicit negatives. The exactness was kept, not relaxed.
+
+**Verified:**
+- TDD: 52 tests written first, all 52 red (`52 failed in 6.73s`), then implemented to green.
+- `cd backend && .venv/bin/python -m pytest -q -p no:cacheprovider` → **549 passed, 2 skipped, 0 failed** in 217.13s. Baseline was 495 passed, 2 skipped, 0 failed (210s); +54 = exactly the new file. The 2 skips are `test_semantic_search` (needs the fastembed model).
+- `cd frontend && npx tsc --noEmit` → clean, exit 0 (no frontend files touched).
+- `cd frontend && npx tsx --test src/utils/*.test.ts` → 62 tests, 62 pass, 0 fail.
+- No `torch` / `diffusers` / `gfpgan` / `facexlib` installed in `.venv` and the whole new suite is green, which is the CI condition the ticket asked for.
+
+**Verified by construction (not runnable here):** the two engine adapters' calls into the real GFPGANer / DiffBIRPipeline. Their loaders are covered with fake `torch`/`gfpgan`/`facexlib`/`diffusers` modules injected into `sys.modules` (tiling + offload asserted, dtype-by-device asserted, unknown-engine refusal asserted), but the actual face restore on a real GPU is untested. `docs/research/skin-enhancers.md` is research only; the DiffBIR condition-noise unit differs between the upstream repo's webui (0..1) and the diffusers port (0..100) and the adapter converts explicitly.
+
+**Not done / visible gaps:**
+- Ticket #137 owns the panel; `GET /api/skin-enhance/presets` publishes the surface so it does not hardcode a second copy of the contract.
+- The endpoint is synchronous. Creative/Flexible can take up to ~60s per image per #111's budget while holding `INFERENCE_LOCK`, which blocks other local inference for that long. Chosen because the ticket asks for the derivative asset in the response and a background job would have to duplicate the degraded-envelope contract across a second status endpoint. Flagged here, not silently shipped.
+- `sharpen` and `smart_grain` default to 0 and `skin_detail` to 80. Magnific's own defaults for the two global sliders are not published in the research doc, so 0 (off) is the conservative choice, not a parity claim.
+
+## 2026-09-26: Skin-enhance review-gate fixes (#112, map #73)
+
+### Iteration Status: Done
+
+**Why:** the driver returned 11 verified findings on the #112 backend half — one of them
+disqualifying the feature. `make_diffbir_loader` built `DiffBIRFaceEngine(pipe, None)` while
+`detect_faces` calls `self.face_helper.align_wrtk(...)`, so **every Creative and Flexible
+request — the two modes carrying the whole value proposition, including all five Flexible
+presets — could only ever answer `LOAD_FAILED`** on real hardware. The 54-test suite stayed
+green because the DiffBIR loader test asserted plumbing (`pipe.enable_tiling` was called)
+while the GFPGAN loader test actually called `engine.detect_faces(img)`.
+
+**What changed:**
+
+*Source — `backend/app/ml/skin_enhancer.py`*
+1. **CRITICAL**: `make_diffbir_loader` now builds a real `FaceHelper` (`max_num=20`,
+   `min_size=MIN_FACE_DIMENSION`, `detection_model="s3fd"`) and hands it to the adapter, the
+   same configuration `make_gfpgan_loader` uses so a Faithful and a Creative run agree on what
+   a face is. Comment records *why* (the DiffBIR pipeline takes no `face_helper=` kwarg, so
+   there is nothing else to hand it) and that this is a second resident S3FD when both engines
+   are loaded.
+3. **HIGH**: deleted the `os.path.isfile(image_path)` + `open(image_path, "rb")` fallback in
+   `_load_source_image`. `image_path` is caller-controlled, so that was an arbitrary local
+   file read relative to the server CWD whose bytes then got re-uploaded to storage as a PNG
+   derivative. Source bytes now come from `download_object` only, matching
+   `app/routers/upscale.py`. Dropped the now-unused `import os`.
+5. **MEDIUM**: `_usable_faces` clamps each detector box into the canvas and re-applies
+   `MIN_FACE_DIMENSION` to the *clamped* box. S3FD returns `x0 = -4` / `y1 = height + 2` for
+   tight crops and selfies; those were being discarded, producing a false `no_face_detected`
+   400. A box with too little visible area, and one entirely off-canvas, are still dropped —
+   the log line and the 400 detail were reworded to say "visible area after clamping".
+6. **MEDIUM**: a failed `db.commit()` on the `MediaAsset` insert now returns
+   `make_degraded_response(reason=LOAD_FAILED, ...)` instead of falling through to
+   `COMPLETED`. The object is already in storage at that point, so `COMPLETED` handed the
+   caller a filename and URL for an object with no catalog row and no `source_path` lineage.
+7. **MEDIUM**: `INFERENCE_LOCK` scope narrowed. Source download/decode/cap moved **before**
+   the lock; PNG encode, S3 upload and the catalog insert moved **after** it. Phases 2-7
+   (parameter resolution, admission, lazy load, detection, restore, post-filters) stay inside,
+   because `app/ml/guard.py`'s eviction invariant depends on it. Docstring records the split.
+8. **LOW**: `_sanitize_output_stem` reduces the untrusted stem to `[A-Za-z0-9._-]`,
+   `strip("._")` on both ends, falling back to `portrait`; a source of `..` no longer mints
+   `skin_enhanced/.._<token>.png`.
+9. **LOW**: `apply_texture_retention(source, restored, strength)` now takes both crops and
+   computes `high = source - gaussian(source)`, adding `high * strength` to the restored
+   crop. The old single-image version unsharp-masked the already-smoothed GAN output, which
+   cannot recover pores, while its docstring claimed to. Call site passes the source crop;
+   docstring rewritten to describe what it does.
+
+*Source — `backend/app/routers/skin_enhance.py`*
+2. **HIGH**: `image_path` no longer has its own slash-free regex. It reuses
+   `SAFE_REFERENCE_PATTERN` imported from `app.routers.generate` (the pattern
+   `/api/generate/video` already uses) with `_validate_safe_image_path` mirroring
+   `_validate_safe_reference`'s rule list: `..`, a leading `/` and a backslash still refused.
+   Subfolder keys (`upscaled/foo.png`, `uploads/portrait.png`) now pass, which the #111
+   FileManager integration requires. One documented deviation: the shared pattern rejects
+   spaces, and `app/routers/storage.py` sets an upload's key to `f"{folder}/{file.filename}"`,
+   so `"my portrait.png"` is a real catalog row that this endpoint accepted before. Rather
+   than copy a widened regex (the drift the reuse prevents) or regress that input, the check
+   runs `SAFE_REFERENCE_PATTERN.match(value.replace(" ", ""))` — one source of truth for the
+   character class, with the widening stated and tested.
+4. **HIGH**: `_validate_slider` checks `math.isfinite` **before** the integrality test, with
+   its own message. `int(float('nan'))` raises `ValueError` and `int(float('inf'))` raises
+   `OverflowError`, so `NaN` / `Infinity` / `1e999` were unhandled 500s; they are now 400.
+
+*Tests — `backend/tests/test_skin_enhancer.py`* (54 → 64)
+- Extended `test_diffbir_loader_enables_tiling_and_offload` to fake `facexlib` and call
+  `engine.detect_faces(img)`, and asserted the helper's `detection_model` / `min_size`; the
+  CPU-only DiffBIR test got a `facexlib` fake too. **This is the test that let CRITICAL 1 ship.**
+- `test_non_finite_slider_is_400_not_500` sends raw bodies (`NaN`, `Infinity`, `-Infinity`,
+  `1e999`, `-1e999`) — `httpx` refuses to *encode* a non-finite float, so `json=` would have
+  tested the client, not the route — and re-asserts the finite-fractional case separately.
+- `test_subfolder_asset_key_is_accepted_and_traversal_is_still_refused`: `upscaled/foo.png`
+  completes end-to-end; `../../etc/passwd`, `/etc/passwd`, `..\secret.png`, `upscaled/../..`
+  all 400.
+- `test_source_is_never_read_from_the_local_filesystem`: `chdir` to a tmp dir holding a real
+  `portrait.png`, `download_object` stubbed to `None`, asserts 400 `source_not_found` and that
+  nothing was written to storage.
+- `TestFaceBoxClamping` (3): an overhanging box is clamped, reported clamped, and handed to
+  the engine as the clamped crop; a box that clamps below the floor and a fully off-canvas box
+  are both still dropped. The latter two passed before the fix too — they are guards that the
+  clamp does not over-accept.
+- `test_catalog_write_failure_degrades_and_withholds_the_filename`: `db.commit` raises →
+  degraded `LOAD_FAILED`, **no `filename`, no `url`**, no new `MediaAsset`.
+- `test_storage_io_runs_outside_the_inference_lock`: probes the lock from a second thread
+  (an `RLock` re-enters on the same thread, so a same-thread probe passes vacuously) and
+  asserts **both** states — held during `restore_face`, not held during `upload_object` — so
+  the assertion cannot pass by the probe being broken.
+- `test_output_stem_is_sanitised`: 9 stems including `..`, `.`, `...`, `$pecial!`, a spaced
+  name and a hidden file.
+- Texture retention: `test_texture_retention_restores_high_frequency_detail` (which asserted
+  more high-frequency energy than its own input — unachievable for a real high-pass, which
+  doubles the band) replaced by two tests: a blurred base must recover the source's texture,
+  and a **flat** base must come out textured — unsharp-masking a flat base can only return
+  flat, so any texture in the output came from the source crop.
+- `test_output_key_shape_and_lineage` now expects `my_portrait_` in the key (sanitiser) and
+  still asserts the `source_path` lineage is the spaced original.
+- Deleted `assert "enhance_skin" == "enhance_skin"`; the rest of that test is unchanged.
+
+*Tests — `backend/tests/test_localml_scaffold.py`*
+- `test_pinned_roster_loaded_by_default` now asserts per-model metadata for `gfpgan`
+  (image / fp32 / 1.5 GB / **Apache-2.0**) and `diffbir` (image / fp16 / 8.0 GB /
+  **Apache-2.0**), so the license gate is checked where the roster is read, not only in the
+  skin-enhance suite. The roster's exactness was not relaxed.
+
+**Verified (TDD, red before green for every source fix):**
+- Batch 1 red: `4 failed, 2 passed` — `assert None is not None` on `engine.face_helper`,
+  `ValueError: cannot convert float NaN to integer` escaping the endpoint,
+  `400 == 200` for `upscaled/foo.png`, and `200 == 400` because the local file *was* read
+  (degraded `no_gpu` instead of a 400). Green after: 57 passed.
+- Batch 2 red: `7 failed, 57 passed` — 3 × `TypeError: apply_texture_retention() takes 2
+  positional arguments but 3 were given`, `no_face_detected` 400 for an overhanging box,
+  `assert 'COMPLETED' != 'COMPLETED'` on a raised commit, `the storage upload must not run
+  while INFERENCE_LOCK is held`, and `'..' produced 'skin_enhanced/.._5a6427bce4f6.png'`.
+  In that same red run the lock test's `during_inference is True` assertion already passed,
+  which is what proves the probe is not vacuous. Green after: 64 passed.
+- `cd backend && .venv/bin/python -m pytest -q -p no:cacheprovider` → **559 passed, 2 skipped,
+  0 failed** in 204.74s (final run, re-run after the last two edits). Pre-change baseline
+  re-measured on the same tree: **549 passed, 2 skipped** in 217.25s. +10 = the 10 tests added; nothing removed. Same 2 skips
+  (`test_semantic_search`, needs the fastembed model) and the same 3 pre-existing warnings
+  (httpx/starlette deprecation + 2 duplicate-operation-ID warnings from `tasks.py`, already in
+  TECH_DEBT.md). No new warnings.
+- `cd frontend && npx tsc --noEmit` → exit 0, clean (no frontend file touched).
+- `cd frontend && npx tsx --test src/utils/*.test.ts` → 62 tests, 62 pass, 0 fail.
+- No `torch` / `diffusers` / `gfpgan` / `facexlib` in `.venv`; the suite is green without them.
+
+**Not done / visible:**
+- `image_path` spaces are still accepted here but refused by `/api/generate/video`, which
+  shares the pattern. Making the *shared* validator accept a space is a change to the video
+  route's contract and belongs in its own ticket; widening it there is a one-line follow-on
+  to `_is_safe_image_path_chars`.
+- The DiffBIR loader now holds a second resident S3FD when both skin engines are loaded
+  (1.5 GB GFPGAN tier + 8 GB DiffBIR). Eviction is the registry's job and the VRAM guard
+  admits against the 8 GB figure either way; if a host ever runs both, the honest fix is a
+  shared detector handle in the registry, not a smaller number.
+- Real-GPU behaviour of both engines is still unverified here; the loader tests exercise the
+  adapters with fake modules, and `detect_faces` is now called for both.

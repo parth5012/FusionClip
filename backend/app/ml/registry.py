@@ -7,6 +7,14 @@ Holds the pinned model roster from ticket #98:
 - MusicGen large (FP16, ~10.4 GB, CC-BY-NC-4.0 weights)
 - Stable Video Diffusion (FP16, ~16 GB resident / 8 GB offload, Stability AI Community)
 
+and, from ticket #112 (the two license-safe skin-enhance engines picked in #111):
+- GFPGAN v1.4 (1.5 GB, Apache-2.0) - Faithful-mode face restoration
+- DiffBIR v2.1 (8 GB tiled, Apache-2.0) - Creative + Flexible refinement
+
+CodeFormer, SUPIR, StableSR and GPEN are deliberately absent: all four are
+non-commercial or unlicensed, so they do not enter the roster at all - not even
+behind a flag.
+
 Loading is strictly lazy and idempotent.
 Unloading drops resident instances and invokes GPU cache release.
 Lifecycle mutations are serialized behind a lock so two concurrent Celery workers
@@ -125,6 +133,37 @@ PINNED_ROSTER: List[ModelMetadata] = [
         # Stability AI Community License - OpenRAIL++-M is SDXL's license, not SVD's.
         license="Stability-AI-Community",
         description="Stable Video Diffusion img2vid-xt (16 GB resident / 8 GB offload)",
+    ),
+    ModelMetadata(
+        model_id="gfpgan",
+        family="image",
+        dtype_quant="fp32",
+        # The TencentARC/GFPGAN repository publishes no numeric VRAM figure for the
+        # GAN tier: its README states the model is lightweight and single-pass over
+        # 512^2 face crops but never gives a GB number, and the research doc
+        # (docs/research/skin-enhancers.md, branch research/skin-enhancers) says so
+        # explicitly ("GAN-tier sizes are qualitative because those repos publish no
+        # VRAM numbers"). 1.5 GB is therefore a conservative *choice*, not a citation:
+        # it covers the GFPGANv1.4 generator (StyleGAN2 at channel_multiplier=2) plus
+        # the facexlib S3FD detector, both of which stay resident together. Do not go
+        # hunting for a source for this number.
+        approx_vram_gb=1.5,
+        license="Apache-2.0",
+        description="GFPGAN v1.4 face restoration (Faithful mode engine, face-crop only)",
+    ),
+    ModelMetadata(
+        model_id="diffbir",
+        family="image",
+        dtype_quant="fp16",
+        # 8 GB is the figure the DiffBIR v2.1 release notes publish, and it is only
+        # valid *with tiled inference*. app/ml/skin_enhancer.py's loader therefore
+        # calls enable_tiling() unconditionally; without it this number is wrong.
+        approx_vram_gb=8.0,
+        license="Apache-2.0",
+        description=(
+            "DiffBIR v2.1 two-stage blind restoration (Creative + Flexible engine, "
+            "8 GB with tiled inference)"
+        ),
     ),
 ]
 

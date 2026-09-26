@@ -8,7 +8,16 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.database import init_db
-from app.routers import export, generate, media, settings as settings_router, storage, tasks, upscale
+from app.routers import (
+    export,
+    generate,
+    media,
+    settings as settings_router,
+    skin_enhance,
+    storage,
+    tasks,
+    upscale,
+)
 from app.services.secrets import warn_if_dev_secret_key
 from app.storage import init_storage
 
@@ -73,4 +82,5 @@ app.include_router(settings_router.router)
 app.include_router(generate.router)
 app.include_router(media.router)
 app.include_router(upscale.router)
+app.include_router(skin_enhance.router)
 app.include_router(export.router)
