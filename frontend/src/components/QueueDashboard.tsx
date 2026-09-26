@@ -24,7 +24,7 @@ import {
   Check,
   Terminal,
 } from 'lucide-react';
-import { fetchTasks, fetchTaskCounts, retryTask } from '../utils/api';
+import { fetchTasks, fetchTaskCounts, fetchTaskLogs, retryTask, TaskLogsResponse } from '../utils/api';
 import {
   categorizeTaskStatus,
   applyTaskUpdate,
@@ -107,14 +107,23 @@ function formatTime(iso: string | null | undefined): string {
   return d.toLocaleString();
 }
 
-function TaskLogsViewer({ task }: { task: TaskItem }) {
+const MAX_TRACEBACK_RENDER_CHARS = 10000;
+
+function TaskLogsViewer({
+  task,
+  cachedLogs,
+  loading,
+  error,
+  onRetry,
+}: {
+  task: TaskItem;
+  cachedLogs?: TaskLogsResponse;
+  loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
+}) {
   const [expandedTracebacks, setExpandedTracebacks] = useState<Set<string>>(new Set());
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
-
-  const events = parseTaskLogs(task.logs);
-  const hasEventTraceback = events.some((e) => hasTraceback(e));
-  const showDirectTraceback =
-    !hasEventTraceback && typeof task.traceback === 'string' && task.traceback.trim().length > 0;
 
   const toggleTraceback = (key: string) => {
     setExpandedTracebacks((prev) => {
@@ -149,6 +158,43 @@ function TaskLogsViewer({ task }: { task: TaskItem }) {
     }
   };
 
+  if (loading) {
+    return (
+      <div className="border-t border-slate-800/80 pt-4 pb-2 flex items-center justify-center gap-2 text-xs text-slate-400">
+        <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
+        <span>Loading task execution logs...</span>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="border-t border-slate-800/80 pt-3">
+        <div className="flex items-center justify-between p-3 bg-rose-950/20 border border-rose-900/40 rounded-md text-xs text-rose-300">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+            <span>{error}</span>
+          </div>
+          {onRetry && (
+            <button
+              onClick={onRetry}
+              className="px-2.5 py-1 rounded border border-rose-800 bg-rose-950 text-rose-200 hover:bg-rose-900 transition text-[11px]"
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const rawLogs = cachedLogs?.logs !== undefined ? cachedLogs.logs : task.logs;
+  const rawTraceback = cachedLogs?.traceback !== undefined ? cachedLogs.traceback : task.traceback;
+  const events = parseTaskLogs(rawLogs);
+  const hasEventTraceback = events.some((e) => hasTraceback(e));
+  const showDirectTraceback =
+    !hasEventTraceback && typeof rawTraceback === 'string' && rawTraceback.trim().length > 0;
+
   if (events.length === 0 && !showDirectTraceback) {
     return (
       <div className="border-t border-slate-800/80 pt-3">
@@ -159,6 +205,13 @@ function TaskLogsViewer({ task }: { task: TaskItem }) {
       </div>
     );
   }
+
+  const directTb = rawTraceback || '';
+  const isDirectTbCapped = directTb.length > MAX_TRACEBACK_RENDER_CHARS;
+  const renderedDirectTb = isDirectTbCapped
+    ? directTb.slice(0, MAX_TRACEBACK_RENDER_CHARS) +
+      `\n\n... [Display truncated at 10,000 characters (${directTb.length} total bytes). Click 'Copy Trace' to copy the complete traceback.]`
+    : directTb;
 
   return (
     <div className="border-t border-slate-800/80 pt-3 space-y-3">
@@ -307,7 +360,7 @@ function TaskLogsViewer({ task }: { task: TaskItem }) {
               </span>
             </button>
             <button
-              onClick={() => handleCopyTraceback(task.traceback!, `${task.task_id}-direct-tb`)}
+              onClick={() => handleCopyTraceback(directTb, `${task.task_id}-direct-tb`)}
               className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border border-slate-700 bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700 transition"
               title="Copy traceback to clipboard"
             >
@@ -326,7 +379,7 @@ function TaskLogsViewer({ task }: { task: TaskItem }) {
           </div>
           {expandedTracebacks.has(`${task.task_id}-direct-tb`) && (
             <pre className="p-3 text-[11px] font-mono text-rose-300 overflow-x-auto whitespace-pre-wrap max-h-80 select-text leading-relaxed break-words bg-slate-950">
-              {task.traceback}
+              {renderedDirectTb}
             </pre>
           )}
         </div>
@@ -353,6 +406,9 @@ export default function QueueDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [retryingIds, setRetryingIds] = useState<Set<string>>(new Set());
   const [expandedTask, setExpandedTask] = useState<string | null>(null);
+  const [logsCache, setLogsCache] = useState<Record<string, TaskLogsResponse>>({});
+  const [logsLoading, setLogsLoading] = useState<Record<string, boolean>>({});
+  const [logsError, setLogsError] = useState<Record<string, string | null>>({});
   const [wsStatus, setWsStatus] = useState<'connected' | 'reconnecting' | 'disconnected'>('disconnected');
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -360,6 +416,31 @@ export default function QueueDashboard() {
   const reconnectAttemptsRef = useRef(0);
   const inFlightBackfillRef = useRef(false);
   const pendingBackfillRef = useRef(false);
+
+  const loadTaskLogs = useCallback(async (taskId: string) => {
+    setLogsLoading((prev) => ({ ...prev, [taskId]: true }));
+    setLogsError((prev) => ({ ...prev, [taskId]: null }));
+    try {
+      const data = await fetchTaskLogs(taskId);
+      setLogsCache((prev) => ({ ...prev, [taskId]: data }));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to fetch logs';
+      setLogsError((prev) => ({ ...prev, [taskId]: msg }));
+    } finally {
+      setLogsLoading((prev) => ({ ...prev, [taskId]: false }));
+    }
+  }, []);
+
+  const handleToggleExpand = (taskId: string) => {
+    if (expandedTask === taskId) {
+      setExpandedTask(null);
+    } else {
+      setExpandedTask(taskId);
+      if (!logsCache[taskId] && !logsLoading[taskId]) {
+        loadTaskLogs(taskId);
+      }
+    }
+  };
 
   // Backfill counts from REST endpoint
   const backfillCounts = useCallback(async () => {
@@ -767,7 +848,7 @@ export default function QueueDashboard() {
                           <div className="flex items-center gap-1">
                             {/* Toggle expandable details / logs section */}
                             <button
-                              onClick={() => setExpandedTask(isExpanded ? null : task.task_id)}
+                              onClick={() => handleToggleExpand(task.task_id)}
                               className="p-1.5 rounded border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-sky-400 transition"
                               title={isExpanded ? 'Hide details' : 'View details'}
                               aria-label="Toggle details"
@@ -824,10 +905,19 @@ export default function QueueDashboard() {
                                 {task.last_retry_at && <span>Last Retry: {formatTime(task.last_retry_at)}</span>}
                                 <span>Created: {formatTime(task.created_at)}</span>
                                 <span>Updated: {formatTime(task.updated_at)}</span>
+                                {task.event_count !== undefined && task.event_count > 0 && (
+                                  <span>Logs: <span className="font-mono text-slate-300">{task.event_count} event{task.event_count === 1 ? '' : 's'}</span></span>
+                                )}
                               </div>
 
                               {/* Execution logs & stack-trace viewer (#108) */}
-                              <TaskLogsViewer task={task} />
+                              <TaskLogsViewer
+                                task={task}
+                                cachedLogs={logsCache[task.task_id]}
+                                loading={logsLoading[task.task_id]}
+                                error={logsError[task.task_id]}
+                                onRetry={() => loadTaskLogs(task.task_id)}
+                              />
                             </div>
                           </td>
                         </tr>

@@ -21,6 +21,7 @@ export interface TaskItem {
   error_type?: string | null;
   traceback?: string | null;
   logs?: string | null;
+  event_count?: number;
   retry_count?: number;
   max_retries?: number;
   last_retry_at?: string | null;

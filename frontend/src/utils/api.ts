@@ -48,14 +48,22 @@ export interface TaskListItem {
   status: string;
   progress: number;
   error: string | null;
-  logs: string | null;
-  traceback: string | null;
+  logs?: string | null;
+  traceback?: string | null;
+  event_count?: number;
   error_type: string | null;
   retry_count: number;
   max_retries: number;
   last_retry_at: string | null;
   created_at: string | null;
   updated_at: string | null;
+}
+
+export interface TaskLogsResponse {
+  task_id: string;
+  logs: string | null;
+  traceback: string | null;
+  event_count: number;
 }
 
 export interface TaskListResponse {
@@ -206,6 +214,18 @@ export async function fetchTaskCounts(): Promise<TaskCountsResponse> {
   const res = await fetch(url);
   if (!res.ok) {
     throw new Error('Failed to fetch task counts');
+  }
+  return res.json();
+}
+
+export async function fetchTaskLogs(taskId: string): Promise<TaskLogsResponse> {
+  const url = `${API_BASE_URL}/api/tasks/${encodeURIComponent(taskId)}/logs`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    if (res.status === 404) {
+      return { task_id: taskId, logs: null, traceback: null, event_count: 0 };
+    }
+    throw new Error(`Failed to fetch task logs: ${res.statusText}`);
   }
   return res.json();
 }

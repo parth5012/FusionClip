@@ -85,7 +85,7 @@ async def trigger_upscale(
         db_task = Task(task_id=task_id, name="upscale", status="PROCESSING", progress=0)
         db.add(db_task)
         db.commit()
-        process_upscale_task.delay(task_id, path, legacy.model_dump())
+        process_upscale_task.apply_async(args=[task_id, path, legacy.model_dump()], task_id=task_id)
         return {
             "message": "Upscale task initiated successfully",
             "task_id": task_id,

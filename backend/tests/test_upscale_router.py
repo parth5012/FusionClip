@@ -2,8 +2,8 @@ import pytest
 from unittest.mock import MagicMock, patch
 from app.models import Task
 
-@patch("app.routers.tasks.process_upscale_task.delay")
-def test_upscale_endpoint_dispatches(mock_delay, client, db_session):
+@patch("app.routers.tasks.process_upscale_task.apply_async")
+def test_upscale_endpoint_dispatches(mock_apply_async, client, db_session):
     response = client.post(
         "/api/upscale?path=test_image.png",
         json={
@@ -27,10 +27,13 @@ def test_upscale_endpoint_dispatches(mock_delay, client, db_session):
     assert db_task.name == "upscale"
     assert db_task.status == "PROCESSING"
     
-    # Verify Celery delay params
-    mock_delay.assert_called_once_with(task_id, "test_image.png", {
-        "denoising_strength": 0.4,
-        "controlnet_weight": 1.2,
-        "preset": "Portraits",
-        "preview": False
-    })
+    # Verify Celery apply_async params
+    mock_apply_async.assert_called_once_with(
+        args=[task_id, "test_image.png", {
+            "denoising_strength": 0.4,
+            "controlnet_weight": 1.2,
+            "preset": "Portraits",
+            "preview": False
+        }],
+        task_id=task_id
+    )
