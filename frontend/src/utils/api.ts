@@ -704,6 +704,46 @@ export interface BatchExportResponse {
   status: string;
 }
 
+export interface ExportStatusResponse {
+  task_id: string;
+  status: string;
+  progress: number;
+  download_url?: string | null;
+  filename?: string | null;
+  error?: string | null;
+}
+
+/** Trigger batch export for database-backed assets by ID, including generated derivatives (#106). */
+export async function startAssetBatchExport(
+  assetIds: number[],
+  includeDerivatives: boolean = true
+): Promise<BatchExportResponse> {
+  const url = `${API_BASE_URL}/api/export/batch`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ asset_ids: assetIds, include_derivatives: includeDerivatives }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to start batch export');
+  }
+  return res.json();
+}
+
+/** Poll progress/result for an asset batch export job (#106). */
+export async function getExportStatus(taskId: string): Promise<ExportStatusResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/export/${encodeURIComponent(taskId)}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || 'Failed to fetch export status');
+  }
+  return res.json();
+}
+
 export async function startBatchExport(
   paths: string[],
   format: string = 'original'

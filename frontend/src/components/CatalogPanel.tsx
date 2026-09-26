@@ -4,10 +4,17 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Search, Volume2, Video, Image as ImageIcon, File, 
   Loader2, ArrowUpRight, Calendar, HardDrive, RefreshCw, X, Clock, ArrowLeftRight,
-  Tag as TagIcon, LayoutGrid, List, Plus, Check
+  Tag as TagIcon, LayoutGrid, List, Plus, Check, Download, CheckCircle2, AlertCircle
 } from 'lucide-react';
-import { fetchMediaCatalog, addAssetTag, removeAssetTag, MediaAsset } from '../utils/api';
+import { fetchMediaCatalog, addAssetTag, removeAssetTag, MediaAsset, startAssetBatchExport, getExportStatus, triggerDownload } from '../utils/api';
 import { filterAssetsByTags, extractAllTags } from '../utils/tags';
+import {
+  computeExportAssetCount,
+  formatExportCountLabel,
+  toggleItemSelection,
+  toggleSelectAllItems,
+  isAllItemsSelected,
+} from '../utils/export';
 import BeforeAfterModal from './BeforeAfterModal';
 
 export default function CatalogPanel() {
@@ -38,6 +45,17 @@ export default function CatalogPanel() {
 
   // Before/after comparison (map #58): pairs a source asset with its upscaled output.
   const [compare, setCompare] = useState<{ beforeUrl: string; afterUrl: string; title: string } | null>(null);
+
+  // Batch export selection state (#106)
+  const [selectedAssetIds, setSelectedAssetIds] = useState<Set<number>>(new Set());
+  const [includeDerivatives, setIncludeDerivatives] = useState<boolean>(true);
+  const [exporting, setExporting] = useState<boolean>(false);
+  const [exportProgress, setExportProgress] = useState<number>(0);
+  const [exportStatusText, setExportStatusText] = useState<string>('');
+  const [exportDownloadUrl, setExportDownloadUrl] = useState<string | null>(null);
+  const [exportFilename, setExportFilename] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [activeExportTaskId, setActiveExportTaskId] = useState<string | null>(null);
 
   const loadCatalog = async (searchQuery = activeSearch, tagsToApply = selectedTags) => {
     const requestId = ++catalogRequestId.current;
@@ -220,6 +238,77 @@ export default function CatalogPanel() {
     video: mediaList.filter(item => item.content_type.toLowerCase().startsWith('video/')).length,
     image: mediaList.filter(item => item.content_type.toLowerCase().startsWith('image/')).length,
   };
+
+  // Selection handlers (#106)
+  const handleToggleSelectAsset = (id: number) => {
+    setSelectedAssetIds((prev) => toggleItemSelection(prev, id));
+  };
+
+  const handleToggleSelectAll = () => {
+    const allIds = sortedList.map((a) => a.id);
+    setSelectedAssetIds((prev) => toggleSelectAllItems(prev, allIds));
+  };
+
+  const handleClearSelection = () => {
+    setSelectedAssetIds(new Set());
+  };
+
+  const exportSummary = useMemo(() => {
+    return computeExportAssetCount(sortedList, selectedAssetIds, includeDerivatives);
+  }, [sortedList, selectedAssetIds, includeDerivatives]);
+
+  const handleStartExport = async () => {
+    if (selectedAssetIds.size === 0) return;
+    setExporting(true);
+    setExportProgress(0);
+    setExportError(null);
+    setExportDownloadUrl(null);
+    setExportFilename(null);
+    setExportStatusText('Initiating export job...');
+    try {
+      const res = await startAssetBatchExport(
+        Array.from(selectedAssetIds),
+        includeDerivatives
+      );
+      setActiveExportTaskId(res.task_id);
+      setExportStatusText('Preparing ZIP archive in background...');
+    } catch (err: any) {
+      setExportError(err.message || 'Failed to initiate batch export');
+      setExporting(false);
+    }
+  };
+
+  // Poll export task status (#106)
+  useEffect(() => {
+    if (!activeExportTaskId) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const status = await getExportStatus(activeExportTaskId);
+        setExportProgress(status.progress);
+        if (status.status === 'COMPLETED') {
+          setExportStatusText('ZIP archive ready!');
+          setExportDownloadUrl(status.download_url ?? null);
+          setExportFilename(status.filename ?? 'export.zip');
+          setExporting(false);
+          setActiveExportTaskId(null);
+          if (status.download_url) {
+            triggerDownload(status.download_url, status.filename ?? undefined);
+          }
+        } else if (status.status === 'FAILED') {
+          setExportError(status.error || 'Batch export task failed');
+          setExporting(false);
+          setActiveExportTaskId(null);
+        } else if (status.status === 'PROCESSING') {
+          setExportStatusText(`Zipping archive... ${status.progress}%`);
+        }
+      } catch (err: any) {
+        console.error('Error polling export status:', err);
+      }
+    }, 1500);
+
+    return () => clearInterval(interval);
+  }, [activeExportTaskId]);
 
   return (
     <div className="space-y-6">
@@ -439,6 +528,134 @@ export default function CatalogPanel() {
         </div>
       )}
 
+      {/* Batch Export Progress / Status Banner (#106) */}
+      {(exporting || exportDownloadUrl || exportError) && (
+        <div className="rounded-lg overflow-hidden border border-slate-800 transition">
+          {exporting && (
+            <div className="bg-slate-900 border-sky-800/80 p-4 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-sm text-sky-300 font-medium">
+                  <Loader2 className="w-4 h-4 animate-spin text-sky-400" />
+                  <span>{exportStatusText}</span>
+                </div>
+                <span className="text-xs font-mono text-slate-400">{exportProgress}%</span>
+              </div>
+              <div className="w-full bg-slate-950 rounded-full h-1.5 overflow-hidden">
+                <div
+                  className="bg-sky-500 h-1.5 rounded-full transition-all duration-300"
+                  style={{ width: `${exportProgress}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {exportDownloadUrl && (
+            <div className="bg-emerald-950/40 border-emerald-800 p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 text-sm text-emerald-300 font-medium">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 flex-shrink-0" />
+                <div>
+                  <p>Batch export archive ready!</p>
+                  <p className="text-xs text-emerald-400/80 font-mono">{exportFilename}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 self-end sm:self-auto">
+                <button
+                  onClick={() => triggerDownload(exportDownloadUrl, exportFilename ?? undefined)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded text-xs font-semibold shadow transition"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download ZIP
+                </button>
+                <button
+                  onClick={() => {
+                    setExportDownloadUrl(null);
+                    setExportFilename(null);
+                  }}
+                  className="p-1.5 text-slate-400 hover:text-slate-200 transition"
+                  title="Dismiss"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {exportError && (
+            <div className="bg-rose-950/40 border-rose-800 p-4 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-sm text-rose-300">
+                <AlertCircle className="w-5 h-5 text-rose-400 flex-shrink-0" />
+                <span>{exportError}</span>
+              </div>
+              <button
+                onClick={() => setExportError(null)}
+                className="p-1 text-slate-400 hover:text-slate-200 transition"
+                title="Dismiss"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Batch Selection & Export Action Bar (#106) */}
+      {!loading && !error && sortedList.length > 0 && (
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 bg-slate-900/90 border border-slate-800 p-3 rounded-lg text-xs">
+          <div className="flex items-center gap-3 flex-wrap">
+            <label className="flex items-center gap-2 text-slate-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={isAllItemsSelected(selectedAssetIds, sortedList.map(a => a.id))}
+                onChange={handleToggleSelectAll}
+                className="w-4 h-4 rounded bg-slate-950 border-slate-700 text-sky-600 focus:ring-sky-500 cursor-pointer"
+              />
+              <span className="font-medium">Select All ({sortedList.length})</span>
+            </label>
+
+            {selectedAssetIds.size > 0 && (
+              <>
+                <span className="text-slate-600">|</span>
+                <span className="text-sky-400 font-semibold bg-sky-950/70 border border-sky-850 px-2.5 py-0.5 rounded-full">
+                  {formatExportCountLabel(exportSummary.selectedCount, exportSummary.derivativesCount, includeDerivatives)}
+                </span>
+                <button
+                  onClick={handleClearSelection}
+                  className="text-slate-400 hover:text-rose-300 transition underline underline-offset-2"
+                >
+                  Clear selection
+                </button>
+              </>
+            )}
+          </div>
+
+          <div className="flex items-center gap-3 w-full sm:w-auto justify-between sm:justify-end">
+            <label className="flex items-center gap-1.5 text-slate-400 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={includeDerivatives}
+                onChange={(e) => setIncludeDerivatives(e.target.checked)}
+                className="w-3.5 h-3.5 rounded bg-slate-950 border-slate-700 text-sky-600 focus:ring-sky-500 cursor-pointer"
+              />
+              <span>Include derivatives</span>
+            </label>
+
+            <button
+              onClick={handleStartExport}
+              disabled={selectedAssetIds.size === 0 || exporting}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-sky-600 hover:bg-sky-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded transition shadow-sm"
+              title={selectedAssetIds.size === 0 ? "Select assets to export" : "Export ZIP archive"}
+            >
+              {exporting ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              <span>Export ZIP {selectedAssetIds.size > 0 && `(${exportSummary.totalFiles})`}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Content: Grid or List */}
       {loading ? (
         <div className="flex flex-col items-center justify-center py-24 bg-slate-900/40 border border-slate-850 rounded-lg">
@@ -492,6 +709,16 @@ export default function CatalogPanel() {
               >
                 {/* Media Preview Card Area */}
                 <div className="h-44 w-full bg-slate-950 relative flex items-center justify-center overflow-hidden border-b border-slate-850">
+                  {/* Batch Select Checkbox (#106) */}
+                  <div className="absolute top-2.5 left-2.5 z-20">
+                    <input
+                      type="checkbox"
+                      checked={selectedAssetIds.has(file.id)}
+                      onChange={() => handleToggleSelectAsset(file.id)}
+                      className="w-4 h-4 rounded bg-slate-900/90 border-slate-600 text-sky-600 focus:ring-sky-500 cursor-pointer shadow-md"
+                      title={`Select ${file.title}`}
+                    />
+                  </div>
                   {isImage && file.url ? (
                     <img
                       src={file.url}
@@ -707,8 +934,17 @@ export default function CatalogPanel() {
         <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
           <div className="divide-y divide-slate-800">
             {/* Table Header */}
-            <div className="hidden md:grid grid-cols-12 gap-4 px-5 py-3 bg-slate-950 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-              <div className="col-span-4">Asset / Title</div>
+            <div className="hidden md:grid grid-cols-12 gap-4 px-5 py-3 bg-slate-950 text-xs font-semibold text-slate-400 uppercase tracking-wider items-center">
+              <div className="col-span-4 flex items-center gap-2.5">
+                <input
+                  type="checkbox"
+                  checked={isAllItemsSelected(selectedAssetIds, sortedList.map(a => a.id))}
+                  onChange={handleToggleSelectAll}
+                  className="w-4 h-4 rounded bg-slate-900 border-slate-700 text-sky-600 focus:ring-sky-500 cursor-pointer"
+                  title="Select all"
+                />
+                <span>Asset / Title</span>
+              </div>
               <div className="col-span-2">Type &amp; Size</div>
               <div className="col-span-4">Tags</div>
               <div className="col-span-2 text-right">Actions</div>
@@ -728,6 +964,13 @@ export default function CatalogPanel() {
                 >
                   {/* Col 1: Title & preview icon */}
                   <div className="col-span-4 flex items-center gap-3">
+                    <input
+                      type="checkbox"
+                      checked={selectedAssetIds.has(file.id)}
+                      onChange={() => handleToggleSelectAsset(file.id)}
+                      className="w-4 h-4 rounded bg-slate-900 border-slate-700 text-sky-600 focus:ring-sky-500 cursor-pointer flex-shrink-0"
+                      title={`Select ${file.title}`}
+                    />
                     <div className="w-10 h-10 rounded bg-slate-950 flex-shrink-0 flex items-center justify-center overflow-hidden border border-slate-800">
                       {isImage && file.url ? (
                         <img src={file.url} alt={file.title} className="w-full h-full object-cover" />
