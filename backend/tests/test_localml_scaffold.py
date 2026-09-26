@@ -42,13 +42,29 @@ class TestModelRegistry:
     def test_pinned_roster_loaded_by_default(self, clean_registry):
         """The pinned roster from Ticket #98 must be present by default:
         Flux-schnell -> SDXL -> XTTS v2 -> MusicGen -> SVD.
+
+        Ticket #112 added the two license-safe skin-enhance engines chosen in #111
+        (GFPGAN for Faithful, DiffBIR for Creative/Flexible). Both are Apache-2.0;
+        CodeFormer, SUPIR, StableSR and GPEN stay out on license grounds.
         """
         models = {m.model_id: m for m in clean_registry.list_models()}
-        expected_ids = {"flux-schnell", "sdxl", "xtts-v2", "musicgen", "svd"}
+        expected_ids = {
+            "flux-schnell",
+            "sdxl",
+            "xtts-v2",
+            "musicgen",
+            "svd",
+            "gfpgan",
+            "diffbir",
+        }
         # Exact roster: nothing extra, nothing missing (Decision #4 pins the roster).
         assert set(models.keys()) == expected_ids
         # Decision #4 explicitly excludes FLUX.1 [dev] (BFL non-commercial license).
         assert "flux-dev" not in models
+        # #111 decision 1: non-commercial / unlicensed enhancers never enter the
+        # roster, not even behind a flag.
+        for banned in ("codeformer", "supir", "stablesr", "gpen"):
+            assert banned not in models
 
         # 1. Flux-schnell (image, FP8, ~13.0 GB, Apache-2.0)
         flux = models["flux-schnell"]
@@ -84,6 +100,28 @@ class TestModelRegistry:
         assert svd.approx_vram_gb >= 16.0
         assert svd.offload_vram_gb == 8.0
         assert svd.license == "Stability-AI-Community"
+
+        # 6. GFPGAN (image, FP32, ~1.5 GB, Apache-2.0) - the Faithful-mode engine.
+        # The license is the headline #111 constraint, so it is asserted per model
+        # here and not only in the skin-enhance suite: the roster is what the
+        # product gate reads.
+        gfpgan = models["gfpgan"]
+        assert gfpgan.family == "image"
+        assert gfpgan.dtype_quant == "fp32"
+        assert gfpgan.approx_vram_gb > 0.0
+        assert gfpgan.license == "Apache-2.0"
+        # 1.5 GB is a deliberate conservative choice, not a published figure; pin it so
+        # a change has to be argued rather than typed.
+        assert gfpgan.approx_vram_gb == 1.5
+
+        # 7. DiffBIR (image, FP16, 8.0 GB, Apache-2.0) - the Creative/Flexible engine.
+        # 8.0 GB is the v2.1 release-note figure and is only valid with tiled
+        # inference, which its loader enables unconditionally.
+        diffbir = models["diffbir"]
+        assert diffbir.family == "image"
+        assert diffbir.dtype_quant == "fp16"
+        assert diffbir.approx_vram_gb == 8.0
+        assert diffbir.license == "Apache-2.0"
 
     def test_lazy_loading(self, clean_registry):
         """Model loader handle is NOT called at registration or inquiry time."""
