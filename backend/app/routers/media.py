@@ -11,17 +11,31 @@ from sqlalchemy.orm import Session
 from app.deps import get_db
 from app.models import MediaAsset, Tag
 from app.schemas import AssetTagsUpdate, TagCreate, TagOut
+
+import re
+from pathlib import Path
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from sqlalchemy.orm import Session
+
+from app.deps import get_db
+from app.models import MediaAsset, SubtitleTrack
+from app.schemas import SubtitleExtractOut, SubtitleTrackOut
 from app.services.embedding import (
     backfill_media_embeddings,
     compute_cosine_distance,
     get_embedding,
 )
-from app.storage import generate_url
+from app.services.subtitles import (
+    extract_and_save_embedded_subtitles,
+    validate_and_prepare_subtitle,
+)
+from app.storage import delete_object, generate_url, get_object_bytes, upload_object
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["media"])
-
 
 def _parse_tag_filters(tag: Optional[List[str]], tags: Optional[str]) -> List[str]:
     result = []
@@ -38,7 +52,6 @@ def _parse_tag_filters(tag: Optional[List[str]], tags: Optional[str]) -> List[st
             if cleaned and cleaned not in result:
                 result.append(cleaned)
     return result
-
 
 def _serialize_asset(asset: MediaAsset, upscaled_children: list = None, score: float = None) -> dict:
     res = {
@@ -72,7 +85,6 @@ def _serialize_asset(asset: MediaAsset, upscaled_children: list = None, score: f
         res["score"] = score
     return res
 
-
 def _serialize_catalog(db, assets) -> list:
     """Serialize a list of assets, attaching each asset's upscaled outputs."""
     if not assets:
@@ -85,7 +97,6 @@ def _serialize_catalog(db, assets) -> list:
     return [
         _serialize_asset(asset, children.get(asset.file_path, [])) for asset in assets
     ]
-
 
 def _serialize_search(db, ranked) -> list:
     """Serialize ranked (asset, score) pairs with upscaled-output children."""
@@ -100,7 +111,6 @@ def _serialize_search(db, ranked) -> list:
         for asset, score in ranked
     ]
 
-
 @router.get("/api/media")
 def list_media(
     tag: Optional[List[str]] = Query(None),
@@ -113,7 +123,6 @@ def list_media(
         query = query.filter(MediaAsset.tags.any(func.lower(Tag.name) == t_name.lower()))
     assets = query.all()
     return _serialize_catalog(db, assets)
-
 
 @router.get("/api/media/search")
 def search_media(
@@ -193,9 +202,7 @@ def search_media(
             db, [(asset, 1.0) for asset in assets if 1.0 >= threshold]
         )
 
-
 # --- Tag CRUD Endpoints ---------------------------------------------------
-
 
 def _get_or_create_tag(db: Session, name: str) -> Tag:
     clean_name = name.strip()
@@ -215,13 +222,11 @@ def _get_or_create_tag(db: Session, name: str) -> Tag:
             return tag
         raise
 
-
 @router.get("/api/tags", response_model=List[TagOut])
 def list_tags(db: Session = Depends(get_db)):
     """List all tags in alphabetical order."""
     tags = db.query(Tag).order_by(Tag.name.asc()).all()
     return [{"id": t.id, "name": t.name} for t in tags]
-
 
 @router.post("/api/tags", response_model=TagOut, status_code=201)
 def create_tag(payload: TagCreate, db: Session = Depends(get_db)):
@@ -241,7 +246,6 @@ def create_tag(payload: TagCreate, db: Session = Depends(get_db)):
         db.refresh(tag)
     return {"id": tag.id, "name": tag.name}
 
-
 @router.delete("/api/tags/{tag_id}")
 def delete_tag(tag_id: int, db: Session = Depends(get_db)):
     """Delete a tag globally, removing it from all associated media assets."""
@@ -252,7 +256,6 @@ def delete_tag(tag_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "Tag deleted", "id": tag_id}
 
-
 @router.get("/api/media/{asset_id}/tags", response_model=List[TagOut])
 def get_asset_tags(asset_id: int, db: Session = Depends(get_db)):
     """Get all tags for a specific media asset."""
@@ -260,7 +263,6 @@ def get_asset_tags(asset_id: int, db: Session = Depends(get_db)):
     if not asset:
         raise HTTPException(status_code=404, detail="Media asset not found")
     return [{"id": t.id, "name": t.name} for t in (asset.tags or [])]
-
 
 @router.post("/api/media/{asset_id}/tags", status_code=201)
 def add_asset_tag(asset_id: int, payload: TagCreate, db: Session = Depends(get_db)):
@@ -288,7 +290,6 @@ def add_asset_tag(asset_id: int, payload: TagCreate, db: Session = Depends(get_d
         "tags": [{"id": t.id, "name": t.name} for t in asset.tags],
     }
 
-
 @router.delete("/api/media/{asset_id}/tags/{tag_id}")
 def remove_asset_tag(asset_id: int, tag_id: int, db: Session = Depends(get_db)):
     """Remove a tag from a specific media asset."""
@@ -306,7 +307,6 @@ def remove_asset_tag(asset_id: int, tag_id: int, db: Session = Depends(get_db)):
         "tag_id": tag_id,
         "tags": [{"id": t.id, "name": t.name} for t in asset.tags],
     }
-
 
 @router.put("/api/media/{asset_id}/tags")
 def set_asset_tags(asset_id: int, payload: AssetTagsUpdate, db: Session = Depends(get_db)):
@@ -341,7 +341,6 @@ def set_asset_tags(asset_id: int, payload: AssetTagsUpdate, db: Session = Depend
         "tags": [{"id": t.id, "name": t.name} for t in asset.tags],
     }
 
-
 @router.post("/api/media/backfill-embeddings")
 def backfill_embeddings_endpoint(
     max_rows: int = 1000, db: Session = Depends(get_db)
@@ -357,3 +356,122 @@ def backfill_embeddings_endpoint(
         )
     count = backfill_media_embeddings(db, max_rows=max_rows)
     return {"status": "ok", "backfilled": count}
+
+# --- Subtitle endpoints (#109) --------------------------------------------
+
+def _serialize_subtitle(track: SubtitleTrack) -> dict:
+    return {
+        "id": track.id,
+        "asset_id": track.asset_id,
+        "label": track.label,
+        "language": track.language,
+        "file_path": track.file_path,
+        "url": generate_url(track.file_path) if track.file_path else "",
+        "format": track.format,
+        "track_type": track.track_type,
+        "created_at": track.created_at.isoformat() if track.created_at else None,
+    }
+
+@router.get("/api/media/{asset_id}/subtitles", response_model=List[SubtitleTrackOut])
+def list_asset_subtitles(asset_id: int, db: Session = Depends(get_db)):
+    """List all subtitle tracks (embedded and sidecar) associated with a media asset."""
+    asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail=f"MediaAsset {asset_id} not found")
+
+    tracks = db.query(SubtitleTrack).filter(SubtitleTrack.asset_id == asset_id).all()
+    return [_serialize_subtitle(t) for t in tracks]
+
+@router.post("/api/media/{asset_id}/subtitles", response_model=SubtitleTrackOut)
+async def upload_asset_subtitle(
+    asset_id: int,
+    file: UploadFile = File(...),
+    label: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Upload a sidecar subtitle file (.vtt or .srt) for a media asset."""
+    asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail=f"MediaAsset {asset_id} not found")
+
+    file_bytes = await file.read()
+    vtt_content, format_type = validate_and_prepare_subtitle(file.filename or "subtitles.vtt", file_bytes)
+
+    # Derive label from filename if omitted
+    stem = Path(file.filename or "subtitles").stem
+    track_label = label.strip() if label and label.strip() else stem
+    track_lang = language.strip() if language and language.strip() else None
+
+    # Upload to MinIO
+    safe_stem = re.sub(r"[^a-zA-Z0-9_-]", "_", stem)
+    s3_key = f"subtitles/{asset_id}/sidecar_{safe_stem}.vtt"
+    success = upload_object(vtt_content.encode("utf-8"), s3_key, content_type="text/vtt")
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to upload subtitle file to storage")
+
+    track = SubtitleTrack(
+        asset_id=asset.id,
+        label=track_label,
+        language=track_lang,
+        file_path=s3_key,
+        format=format_type,
+        track_type="sidecar",
+    )
+    db.add(track)
+    db.commit()
+    db.refresh(track)
+
+    return _serialize_subtitle(track)
+
+@router.post("/api/media/{asset_id}/subtitles/extract", response_model=SubtitleExtractOut)
+def extract_asset_subtitles(asset_id: int, db: Session = Depends(get_db)):
+    """Extract embedded subtitle tracks from the video asset into WebVTT tracks."""
+    asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail=f"MediaAsset {asset_id} not found")
+
+    tracks = extract_and_save_embedded_subtitles(db, asset)
+    return {
+        "message": f"Successfully extracted {len(tracks)} subtitle tracks" if tracks else "No embedded subtitle tracks found",
+        "extracted_count": len(tracks),
+        "tracks": [_serialize_subtitle(t) for t in tracks],
+    }
+
+@router.delete("/api/media/{asset_id}/subtitles/{track_id}")
+def delete_asset_subtitle(asset_id: int, track_id: int, db: Session = Depends(get_db)):
+    """Delete a subtitle track from an asset."""
+    track = (
+        db.query(SubtitleTrack)
+        .filter(SubtitleTrack.id == track_id, SubtitleTrack.asset_id == asset_id)
+        .first()
+    )
+    if not track:
+        raise HTTPException(status_code=404, detail=f"Subtitle track {track_id} not found for asset {asset_id}")
+
+    try:
+        delete_object(track.file_path)
+    except Exception as e:
+        logger.warning(f"Failed to delete subtitle object {track.file_path} from storage: {e}")
+
+    db.delete(track)
+    db.commit()
+    return {"message": "Subtitle track deleted successfully"}
+
+@router.get("/api/media/{asset_id}/subtitles/{track_id}/content")
+def get_subtitle_content(asset_id: int, track_id: int, db: Session = Depends(get_db)):
+    """Serve subtitle WebVTT content directly with CORS headers."""
+    track = (
+        db.query(SubtitleTrack)
+        .filter(SubtitleTrack.id == track_id, SubtitleTrack.asset_id == asset_id)
+        .first()
+    )
+    if not track:
+        raise HTTPException(status_code=404, detail=f"Subtitle track {track_id} not found for asset {asset_id}")
+
+    try:
+        content = get_object_bytes(track.file_path)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Subtitle file not found in storage")
+
+    return Response(content=content, media_type="text/vtt; charset=utf-8")

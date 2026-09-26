@@ -18,8 +18,22 @@ import {
   RotateCcw,
   Sliders,
   Settings,
-  HelpCircle
+  HelpCircle,
+  Sparkles,
+  Loader2
 } from 'lucide-react';
+import {
+  validateSubtitleFile,
+  convertSrtToVtt,
+  parseSubtitleCues,
+  normalizeTrackLabel,
+  syncTextTrackModes,
+} from '../utils/subtitles';
+import {
+  fetchAssetSubtitles,
+  uploadAssetSubtitle,
+  extractAssetSubtitles,
+} from '../utils/api';
 
 export default function PlayersPanel() {
   // Audio Wavefer states
@@ -49,12 +63,35 @@ export default function PlayersPanel() {
   const [videoError, setVideoError] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
-  // Subtitle track support (#46)
+  // Subtitle track support (#46, #109)
+  const [activeAssetId, setActiveAssetId] = useState<number | null>(null);
+  const [libraryVideos, setLibraryVideos] = useState<{ id: number; title: string; url: string }[]>([]);
   const [subtitleTracks, setSubtitleTracks] = useState<
-    { id: string; label: string; language: string; cues: { start: number; end: number; text: string }[] }[]
+    { id: string; label: string; language: string; url: string; cues?: { start: number; end: number; text: string }[]; isError?: boolean }[]
   >([]);
   const [activeSubtitleId, setActiveSubtitleId] = useState<string | null>(null);
   const [subtitlesEnabled, setSubtitlesEnabled] = useState<boolean>(false);
+  const [isExtractingSubtitles, setIsExtractingSubtitles] = useState<boolean>(false);
+
+  // Sync native HTML5 <video> textTracks modes
+  useEffect(() => {
+    syncTextTrackModes(videoRef.current, activeSubtitleId, subtitlesEnabled);
+  }, [activeSubtitleId, subtitlesEnabled, subtitleTracks]);
+
+  // Load catalog media assets to allow switching video in player
+  useEffect(() => {
+    fetch('/api/media')
+      .then((res) => (res.ok ? res.json() : []))
+      .then((data) => {
+        if (Array.isArray(data)) {
+          const videos = data
+            .filter((item: any) => item.content_type?.toLowerCase().startsWith('video/'))
+            .map((item: any) => ({ id: item.id, title: item.title, url: item.url }));
+          setLibraryVideos(videos);
+        }
+      })
+      .catch(() => {});
+  }, []);
 
   // Load and destroy Wavesurfer instance
   useEffect(() => {
@@ -261,69 +298,152 @@ export default function PlayersPanel() {
       setVideoError(null);
       const url = URL.createObjectURL(file);
       setVideoUrl(url);
+      setActiveAssetId(null);
+      setSubtitleTracks([]);
+      setActiveSubtitleId(null);
+      setSubtitlesEnabled(false);
       setIsVideoPlaying(false);
     }
   };
-  // Parse SRT or WebVTT subtitle content into cue objects
-  const parseSubtitleFile = (
-    text: string,
-    filename: string
-  ): { start: number; end: number; text: string }[] => {
-    const cues: { start: number; end: number; text: string }[] = [];
-    const timestampPattern =
-      /(\d{1,2}):(\d{2}):(\d{2})[,.]\d{1,3}\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.]\d{1,3}/;
-    const parseTime = (h: string, m: string, s: string, ms: string) =>
-      parseInt(h, 10) * 3600 + parseInt(m, 10) * 60 + parseInt(s, 10) + parseInt(ms.padEnd(3, '0'), 10) / 1000;
 
-    const blocks = text.split(/\r?\n\r?\n/);
-    blocks.forEach((block) => {
-      const blockLines = block.split(/\r?\n/);
-      const timingLine = blockLines.find((line) => line.includes('-->'));
-      if (!timingLine) return;
-      const match = timingLine.match(timestampPattern);
-      if (!match) return;
-      const start = parseTime(match[1], match[2], match[3], match[4]);
-      const end = parseTime(match[5], match[6], match[7], match[8]);
-      const textIndex = blockLines.indexOf(timingLine) + 1;
-      const cueText = blockLines
-        .slice(textIndex)
-        .filter((line) => line.trim() !== '')
-        .join(' ')
-        .replace(/<[^>]+>/g, '')
-        .trim();
-      if (cueText) {
-        cues.push({ start, end, text: cueText });
+  const handleSelectLibraryVideo = async (assetIdStr: string) => {
+    if (!assetIdStr) {
+      setActiveAssetId(null);
+      setVideoUrl('https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4');
+      setSubtitleTracks([]);
+      setActiveSubtitleId(null);
+      setSubtitlesEnabled(false);
+      return;
+    }
+    const assetId = parseInt(assetIdStr, 10);
+    const selected = libraryVideos.find((v) => v.id === assetId);
+    if (!selected) return;
+
+    setActiveAssetId(assetId);
+    setVideoUrl(selected.url);
+    setIsVideoPlaying(false);
+    setVideoError(null);
+
+    // Fetch existing subtitles for this asset
+    try {
+      const tracks = await fetchAssetSubtitles(assetId);
+      const mapped = tracks.map((t) => ({
+        id: String(t.id),
+        label: t.label,
+        language: t.language || 'en',
+        url: t.url,
+      }));
+      setSubtitleTracks(mapped);
+      if (mapped.length > 0) {
+        setActiveSubtitleId(mapped[0].id);
+        setSubtitlesEnabled(true);
+      } else {
+        setActiveSubtitleId(null);
+        setSubtitlesEnabled(false);
       }
-    });
-    return cues.sort((a, b) => a.start - b.start);
+    } catch (err) {
+      console.warn('Could not fetch subtitles for asset:', err);
+      setSubtitleTracks([]);
+      setActiveSubtitleId(null);
+      setSubtitlesEnabled(false);
+    }
+  };
+
+  const handleTrackLoadError = (trackId: string) => {
+    console.warn(`Subtitle track ${trackId} failed to load (e.g. 403 or CORS). Player continues.`);
+    setSubtitleTracks((prev) =>
+      prev.map((t) => (t.id === trackId ? { ...t, isError: true } : t))
+    );
+  };
+
+  const handleExtractSubtitles = async () => {
+    if (!activeAssetId) return;
+    setIsExtractingSubtitles(true);
+    setVideoError(null);
+    try {
+      const res = await extractAssetSubtitles(activeAssetId);
+      if (res.tracks && res.tracks.length > 0) {
+        const newTracks = res.tracks.map((t) => ({
+          id: String(t.id),
+          label: t.label,
+          language: t.language || 'en',
+          url: t.url,
+        }));
+        setSubtitleTracks((prev) => {
+          const ids = new Set(prev.map((p) => p.id));
+          return [...prev, ...newTracks.filter((nt) => !ids.has(nt.id))];
+        });
+        if (!activeSubtitleId && newTracks.length > 0) {
+          setActiveSubtitleId(newTracks[0].id);
+          setSubtitlesEnabled(true);
+        }
+      } else {
+        setVideoError('No embedded subtitle tracks found in this video.');
+      }
+    } catch (err: any) {
+      console.error('Failed to extract embedded subtitles:', err);
+      setVideoError(err?.message || 'Failed to extract embedded subtitles');
+    } finally {
+      setIsExtractingSubtitles(false);
+    }
   };
 
   // Add a subtitle track from an uploaded .srt / .vtt file
-  const handleSubtitleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSubtitleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const content = String(reader.result || '');
-      const cues = parseSubtitleFile(content, file.name);
-      const label = file.name.replace(/\.(srt|vtt)$/i, '') || file.name;
-      const id = `${Date.now()}-${label}`;
-      setSubtitleTracks((prev) => [...prev, { id, label, language: label, cues }]);
-      setActiveSubtitleId(id);
-      setSubtitlesEnabled(true);
-      setVideoError(null);
-    };
-    reader.onerror = () => {
-      setVideoError('Failed to read subtitle file');
-    };
-    reader.readAsText(file);
+
+    const validation = validateSubtitleFile(file.name, file.size);
+    if (!validation.valid) {
+      setVideoError(validation.error || 'Invalid subtitle file');
+      return;
+    }
+
+    try {
+      if (activeAssetId) {
+        const uploaded = await uploadAssetSubtitle(activeAssetId, file);
+        const newTrack = {
+          id: String(uploaded.id),
+          label: uploaded.label,
+          language: uploaded.language || 'en',
+          url: uploaded.url,
+        };
+        setSubtitleTracks((prev) => [...prev.filter((t) => t.id !== newTrack.id), newTrack]);
+        setActiveSubtitleId(newTrack.id);
+        setSubtitlesEnabled(true);
+        setVideoError(null);
+      } else {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const raw = String(reader.result || '');
+          const isSrt = file.name.toLowerCase().endsWith('.srt');
+          const vttContent = isSrt ? convertSrtToVtt(raw) : raw;
+          const cues = parseSubtitleCues(vttContent);
+          const blob = new Blob([vttContent], { type: 'text/vtt' });
+          const url = URL.createObjectURL(blob);
+          const label = normalizeTrackLabel(file.name);
+          const id = `local-${Date.now()}-${label}`;
+          setSubtitleTracks((prev) => [...prev, { id, label, language: 'en', url, cues }]);
+          setActiveSubtitleId(id);
+          setSubtitlesEnabled(true);
+          setVideoError(null);
+        };
+        reader.onerror = () => {
+          setVideoError('Failed to read subtitle file');
+        };
+        reader.readAsText(file);
+      }
+    } catch (err: any) {
+      console.error('Failed to upload subtitle file:', err);
+      setVideoError(err?.message || 'Failed to upload subtitle file');
+    }
   };
 
-  // Resolve the currently visible cue from the active track
+  // Resolve the currently visible cue from the active track (for DOM fallback overlay)
   const activeSubtitleTrack =
     subtitleTracks.find((track) => track.id === activeSubtitleId) || null;
   const activeSubtitleCue =
-    activeSubtitleTrack && subtitlesEnabled
+    activeSubtitleTrack && subtitlesEnabled && activeSubtitleTrack.cues
       ? activeSubtitleTrack.cues.find(
           (cue) => videoCurrentTime >= cue.start && videoCurrentTime < cue.end
         ) || null
@@ -518,23 +638,58 @@ export default function PlayersPanel() {
         {/* Video Scrubber Player Panel */}
         <div className="bg-slate-900/50 border border-slate-800 rounded-xl p-6 flex flex-col justify-between space-y-6 hover:border-slate-700/80 transition-all duration-300">
           <div>
-            <div className="flex items-center justify-between mb-4 border-b border-slate-800/60 pb-3">
+            <div className="flex flex-wrap items-center justify-between mb-4 border-b border-slate-800/60 pb-3 gap-2">
               <h3 className="text-md font-bold text-slate-100 flex items-center gap-2">
                 <Film className="w-4 h-4 text-indigo-400" />
                 Frame-by-Frame Video Scrubber
               </h3>
               
-              {/* Fileupload */}
-              <label className="cursor-pointer px-3 py-1 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded border border-slate-700 flex items-center gap-1.5 transition-colors">
-                <Upload className="w-3 h-3" />
-                Upload Video
-                <input 
-                  type="file" 
-                  accept="video/*" 
-                  className="hidden" 
-                  onChange={handleVideoFileUpload} 
-                />
-              </label>
+              <div className="flex items-center gap-2 flex-wrap">
+                {/* Library video picker if videos exist in catalog */}
+                {libraryVideos.length > 0 && (
+                  <select
+                    value={activeAssetId ? String(activeAssetId) : ''}
+                    onChange={(e) => handleSelectLibraryVideo(e.target.value)}
+                    className="bg-slate-800 border border-slate-700 text-xs text-slate-200 rounded px-2 py-1 focus:outline-none focus:border-indigo-500 max-w-[160px]"
+                    title="Select video from library"
+                  >
+                    <option value="">Demo Video</option>
+                    {libraryVideos.map((v) => (
+                      <option key={v.id} value={String(v.id)}>
+                        {v.title}
+                      </option>
+                    ))}
+                  </select>
+                )}
+
+                {/* Extract embedded tracks button (available when library asset selected) */}
+                {activeAssetId && (
+                  <button
+                    onClick={handleExtractSubtitles}
+                    disabled={isExtractingSubtitles}
+                    className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-xs text-amber-300 rounded border border-slate-700 flex items-center gap-1.5 transition-colors"
+                    title="Detect and extract embedded subtitle tracks via ffmpeg"
+                  >
+                    {isExtractingSubtitles ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <Sparkles className="w-3 h-3 text-amber-400" />
+                    )}
+                    Extract Subs
+                  </button>
+                )}
+
+                {/* Fileupload */}
+                <label className="cursor-pointer px-3 py-1 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded border border-slate-700 flex items-center gap-1.5 transition-colors">
+                  <Upload className="w-3 h-3" />
+                  Upload Video
+                  <input 
+                    type="file" 
+                    accept="video/*" 
+                    className="hidden" 
+                    onChange={handleVideoFileUpload} 
+                  />
+                </label>
                 {/* Subtitle upload */}
                 <label className="cursor-pointer px-3 py-1 bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 rounded border border-slate-700 flex items-center gap-1.5 transition-colors">
                   <Captions className="w-3 h-3" />
@@ -546,6 +701,7 @@ export default function PlayersPanel() {
                     onChange={handleSubtitleFileUpload}
                   />
                 </label>
+              </div>
             </div>
 
             {videoError && (
@@ -559,12 +715,26 @@ export default function PlayersPanel() {
               <video
                 ref={videoRef}
                 src={videoUrl}
+                crossOrigin="anonymous"
                 onClick={handleVideoPlayPause}
                 onTimeUpdate={handleVideoTimeUpdate}
                 onLoadedMetadata={handleVideoLoadedMetadata}
                 className="w-full h-full object-contain cursor-pointer"
                 playsInline
-              />
+              >
+                {subtitleTracks.map((track) => (
+                  <track
+                    key={track.id}
+                    id={`track-${track.id}`}
+                    kind="subtitles"
+                    label={track.label}
+                    srcLang={track.language || 'en'}
+                    src={track.url}
+                    default={activeSubtitleId === track.id && subtitlesEnabled}
+                    onError={() => handleTrackLoadError(track.id)}
+                  />
+                ))}
+              </video>
               
               {/* Pause overlay Indicator */}
               {!isVideoPlaying && (
@@ -695,10 +865,16 @@ export default function PlayersPanel() {
                   <Captions className="w-4 h-4" />
                 </button>
                 <select
-                  value={activeSubtitleId || ''}
+                  value={subtitlesEnabled && activeSubtitleId ? activeSubtitleId : ''}
                   onChange={(e) => {
-                    setActiveSubtitleId(e.target.value || null);
-                    if (e.target.value) setSubtitlesEnabled(true);
+                    const val = e.target.value;
+                    if (val) {
+                      setActiveSubtitleId(val);
+                      setSubtitlesEnabled(true);
+                    } else {
+                      setActiveSubtitleId(null);
+                      setSubtitlesEnabled(false);
+                    }
                   }}
                   disabled={subtitleTracks.length === 0}
                   className="bg-slate-950 border border-slate-800 rounded px-1.5 py-0.5 text-[11px] text-slate-300 focus:outline-none focus:border-amber-500 max-w-[140px]"
@@ -707,7 +883,7 @@ export default function PlayersPanel() {
                   <option value="">Off</option>
                   {subtitleTracks.map((track) => (
                     <option key={track.id} value={track.id}>
-                      {track.label}
+                      {track.label}{track.isError ? ' (load error)' : ''}
                     </option>
                   ))}
                 </select>

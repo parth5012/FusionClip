@@ -22,7 +22,7 @@ def init_db():
         logger.error(f"Failed to enable pgvector extension or connect to database: {e}")
 
     # Import and mount models, automatically run base schema creation engine metadata
-    from app.models import MediaAsset, Configuration, Task
+    from app.models import MediaAsset, Configuration, Task, SubtitleTrack
     Base.metadata.create_all(bind=engine)
     logger.info("Successfully auto-created all database schemas.")
 

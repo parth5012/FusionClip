@@ -840,3 +840,71 @@ export function triggerDownload(url: string, filename?: string) {
   a.click();
   document.body.removeChild(a);
 }
+
+/* ── Subtitle Tracks API (#109) ────────────────────────────────────────── */
+
+export interface SubtitleTrackItem {
+  id: number | string;
+  asset_id?: number;
+  label: string;
+  language?: string | null;
+  file_path?: string;
+  url: string;
+  format?: string;
+  track_type?: string;
+  created_at?: string | null;
+}
+
+export async function fetchAssetSubtitles(assetId: number | string): Promise<SubtitleTrackItem[]> {
+  const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/subtitles`);
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to fetch subtitles'));
+  }
+  return res.json();
+}
+
+export async function uploadAssetSubtitle(
+  assetId: number | string,
+  file: File,
+  label?: string,
+  language?: string
+): Promise<SubtitleTrackItem> {
+  const formData = new FormData();
+  formData.append('file', file);
+  if (label) formData.append('label', label);
+  if (language) formData.append('language', language);
+
+  const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/subtitles`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to upload subtitle file'));
+  }
+  return res.json();
+}
+
+export async function extractAssetSubtitles(
+  assetId: number | string
+): Promise<{ message: string; extracted_count: number; tracks: SubtitleTrackItem[] }> {
+  const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/subtitles/extract`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to extract embedded subtitles'));
+  }
+  return res.json();
+}
+
+export async function deleteAssetSubtitle(
+  assetId: number | string,
+  trackId: number | string
+): Promise<{ message: string }> {
+  const res = await fetch(`${API_BASE_URL}/api/media/${assetId}/subtitles/${trackId}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to delete subtitle track'));
+  }
+  return res.json();
+}
