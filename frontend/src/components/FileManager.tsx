@@ -1,6 +1,14 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+// PROTOTYPE: Three structurally different variants of the remove-background flow, switchable via ?variant=, mounted inside the existing Media Library page (frontend/src/components/FileManager.tsx).
+// Wayfinder ticket #117 / Grilling ticket #115 binding decisions:
+// 1. Placement: Library only — action button on asset rows/cards in Media Library (FileManager.tsx)
+// 2. Two tiers: u2net default ("Fast") + birefnet behind Quality toggle
+// 3. Output: PNG RGBA, transparent cut-out
+// 4. Flow: preview-before-accept -> Accept saves additive derivative, Reject discards, re-run produces sibling derivative.
+
+import React, { useState, useEffect, useRef, Suspense } from 'react';
+import { useSearchParams } from 'next/navigation';
 import {
   Folder, File, Upload, Trash2, Plus, Play, RefreshCw,
   ChevronRight, Volume2, Video as VideoIcon, Image as ImageIcon,
@@ -13,6 +21,38 @@ import {
   startBatchExport, triggerDownload
 } from '../utils/api';
 import { isUpscalableImage } from '../utils/upscale';
+
+import PrototypeSwitcher, { PrototypeVariantId } from './bgremove-prototype/PrototypeSwitcher';
+import PanelVariant from './bgremove-prototype/PanelVariant';
+import ModalVariant from './bgremove-prototype/ModalVariant';
+import InlineVariantStrip from './bgremove-prototype/InlineVariant';
+
+export const PROTOTYPE_SAMPLE_FILES: StorageItem[] = [
+  {
+    name: 'portrait_studio.png',
+    path: 'sample_assets/portrait_studio.png',
+    type: 'file',
+    size: 2450000,
+    last_modified: new Date().toISOString(),
+    url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=800&q=80',
+  },
+  {
+    name: 'product_sneaker.jpg',
+    path: 'sample_assets/product_sneaker.jpg',
+    type: 'file',
+    size: 1820000,
+    last_modified: new Date().toISOString(),
+    url: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?auto=format&fit=crop&w=800&q=80',
+  },
+  {
+    name: 'puppy_golden.png',
+    path: 'sample_assets/puppy_golden.png',
+    type: 'file',
+    size: 3100000,
+    last_modified: new Date().toISOString(),
+    url: 'https://images.unsplash.com/photo-1543466835-00a7907e9de1?auto=format&fit=crop&w=800&q=80',
+  },
+];
 
 const UPSCALE_SCALES = [2, 4, 8, 16] as const;
 const UPSCALE_PRESETS = [
@@ -32,12 +72,71 @@ const UPSCALE_CATEGORIES = [
 
 import UpscalerPanel from './UpscalerPanel';
 
-export default function FileManager() {
+function FileManagerContent() {
   const [currentDir, setCurrentDir] = useState<string>('');
   const [directories, setDirectories] = useState<StorageItem[]>([]);
   const [files, setFiles] = useState<StorageItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+
+  // BgRemove Prototype State (Wayfinder #117 / Grilling #115)
+  const searchParams = useSearchParams();
+  const rawVariant = searchParams?.get('variant')?.toLowerCase();
+  const currentVariant: PrototypeVariantId =
+    rawVariant === 'modal' || rawVariant === 'b'
+      ? 'modal'
+      : rawVariant === 'inline' || rawVariant === 'c'
+      ? 'inline'
+      : 'panel'; // default variant when no param: panel
+
+  const [panelTarget, setPanelTarget] = useState<StorageItem | null>(null);
+  const [modalTarget, setModalTarget] = useState<StorageItem | null>(null);
+  const [inlineTarget, setInlineTarget] = useState<StorageItem | null>(null);
+  const [panelProcessingTarget, setPanelProcessingTarget] = useState<string | null>(null);
+  const [panelProcessingPercent, setPanelProcessingPercent] = useState<number>(0);
+
+  const handleTriggerBgRemove = (file: StorageItem) => {
+    if (currentVariant === 'panel') {
+      setPanelTarget(file);
+      setModalTarget(null);
+      setInlineTarget(null);
+    } else if (currentVariant === 'modal') {
+      setModalTarget(file);
+      setPanelTarget(null);
+      setInlineTarget(null);
+    } else {
+      setInlineTarget((prev) => (prev?.path === file.path ? null : file));
+      setPanelTarget(null);
+      setModalTarget(null);
+    }
+  };
+
+  const handleAcceptDerivative = (derivative: StorageItem) => {
+    // Generate sibling derivative name if already exists (Grilling #115)
+    const originalRoot = derivative.name.replace(/\.[^/.]+$/, '').replace(/_nobg.*$/, '');
+    const candidate = `${originalRoot}_nobg.png`;
+    const existingNames = new Set(files.map((f) => f.name));
+    let finalName = candidate;
+    if (existingNames.has(candidate)) {
+      let count = 1;
+      while (existingNames.has(`${originalRoot}_nobg_${count}.png`)) {
+        count++;
+      }
+      finalName = `${originalRoot}_nobg_${count}.png`;
+    }
+
+    const newDerivative: StorageItem = {
+      ...derivative,
+      name: finalName,
+      path: derivative.path.replace(/[^/]+$/, finalName),
+    };
+
+    setFiles((prev) => [newDerivative, ...prev]);
+    setPanelTarget(null);
+    setModalTarget(null);
+    setInlineTarget(null);
+    setPanelProcessingTarget(null);
+  };
 
   // Folder inputs
   const [newFolderName, setNewFolderName] = useState<string>('');
@@ -102,9 +201,11 @@ export default function FileManager() {
       const data = await fetchFiles(dir);
       setCurrentDir(data.current_dir);
       setDirectories(data.directories);
-      setFiles(data.files);
+      setFiles(data.files.length > 0 ? data.files : PROTOTYPE_SAMPLE_FILES);
     } catch (err: any) {
       setError(err.message || 'Failed to populate files list.');
+      // When backend is offline, populate sample files for prototype evaluation
+      setFiles(PROTOTYPE_SAMPLE_FILES);
     } finally {
       setLoading(false);
     }
@@ -780,7 +881,7 @@ export default function FileManager() {
           <Loader2 className="w-8 h-8 animate-spin text-sky-500" />
           <p className="text-slate-400 text-sm mt-3">Syncing with MinIO S3 storage buckets...</p>
         </div>
-      ) : error ? (
+      ) : error && files.length === 0 ? (
         <div className="bg-rose-950/20 border border-rose-800/80 rounded-lg p-6 text-center text-rose-300">
           <p className="font-semibold text-lg">Communication error</p>
           <p className="text-sm opacity-90 mt-1">{error}</p>
@@ -799,6 +900,19 @@ export default function FileManager() {
         </div>
       ) : (
         <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
+          {error && (
+            <div className="flex items-center justify-between gap-3 px-6 py-2.5 bg-amber-950/40 border-b border-amber-800/70 text-amber-200 text-xs">
+              <span>
+                Backend unreachable — showing prototype sample assets.
+              </span>
+              <button
+                onClick={() => loadDirectory(currentDir)}
+                className="px-3 py-1 bg-amber-900/50 hover:bg-amber-900 border border-amber-700 rounded transition"
+              >
+                Retry
+              </button>
+            </div>
+          )}
           <div className="grid grid-cols-1 divide-y divide-slate-800">
             {/* Headers (desktop) */}
             <div className="hidden md:grid grid-cols-12 gap-4 px-6 py-3 bg-slate-950 text-xs font-semibold text-slate-400 uppercase tracking-wider">
@@ -838,105 +952,156 @@ export default function FileManager() {
 
             {/* File rows */}
             {files.map(file => (
-              <div 
-                key={file.path} 
-                className="grid grid-cols-1 md:grid-cols-12 items-center gap-4 px-6 py-3.5 hover:bg-slate-850/50 transition text-sm"
-              >
-                {/* File Title */}
-                <div className="col-span-6 flex items-center gap-3">
-                  <input
-                    type="checkbox"
-                    checked={selectedPaths.has(file.path)}
-                    onChange={() => toggleSelect(file.path)}
-                    onClick={(e) => e.stopPropagation()}
-                    className="rounded bg-slate-950 border-slate-700 text-sky-500 focus:ring-0 cursor-pointer"
-                    title="Select for batch export"
-                  />
-                  <div className="p-1.5 bg-slate-950 rounded">
-                    {getFileIcon(file.name)}
+              <React.Fragment key={file.path}>
+                <div 
+                  className="grid grid-cols-1 md:grid-cols-12 items-center gap-4 px-6 py-3.5 hover:bg-slate-850/50 transition text-sm"
+                >
+                  {/* File Title */}
+                  <div className="col-span-6 flex items-center gap-3">
+                    <input
+                      type="checkbox"
+                      checked={selectedPaths.has(file.path)}
+                      onChange={() => toggleSelect(file.path)}
+                      onClick={(e) => e.stopPropagation()}
+                      className="rounded bg-slate-950 border-slate-700 text-sky-500 focus:ring-0 cursor-pointer"
+                      title="Select for batch export"
+                    />
+                    <div className="p-1.5 bg-slate-950 rounded">
+                      {getFileIcon(file.name)}
+                    </div>
+                    <div className="truncate max-w-[85%]">
+                      <div className="flex items-center gap-2">
+                        <p className="font-medium text-slate-300 truncate" title={file.name}>{file.name}</p>
+                        {panelProcessingTarget === file.path && (
+                          <span className="inline-flex items-center gap-1 text-[10px] font-mono text-sky-400 bg-sky-950/90 border border-sky-800/80 px-2 py-0.5 rounded-full animate-pulse flex-shrink-0">
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                            Removing BG ({panelProcessingPercent}%)
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-slate-500 font-mono truncate">{file.path}</p>
+                    </div>
                   </div>
-                  <div className="truncate max-w-[85%]">
-                    <p className="font-medium text-slate-300 truncate" title={file.name}>{file.name}</p>
-                    <p className="text-[10px] text-slate-500 font-mono truncate">{file.path}</p>
+
+                  {/* Size / Metadata */}
+                  <div className="col-span-2 text-slate-400 text-xs">
+                    {formatSize(file.size)}
                   </div>
-                </div>
 
-                {/* Size / Metadata */}
-                <div className="col-span-2 text-slate-400 text-xs">
-                  {formatSize(file.size)}
-                </div>
-
-                {/* File Actions */}
-                <div className="col-span-4 flex items-center justify-end gap-2.5">
-                  {/* Task launch dropdown/triggers */}
-                  <div className="flex items-center gap-1.5 border border-slate-700 bg-slate-950/60 p-1 rounded-md">
-                    <button
-                      onClick={() => handleTriggerTask(file.path, 'transcode')}
-                      className="text-xs hover:bg-slate-800 text-slate-300 hover:text-sky-400 p-1 px-1.5 rounded transition flex items-center gap-1"
-                      title="Transcode video/audio via Celery worker"
-                    >
-                      <Play className="w-3 h-3 text-sky-500" /> Transcode
-                    </button>
-                    <div className="w-[1px] h-3.5 bg-slate-850" />
-                    <button
-                      onClick={() => {
-                        if (isUpscalableImage(file.name)) {
-                          setUpscaleError(null);
-                          setUpscaleTarget(file);
+                  {/* File Actions */}
+                  <div className="col-span-4 flex items-center justify-end gap-2.5">
+                    {/* Task launch dropdown/triggers */}
+                    <div className="flex items-center gap-1.5 border border-slate-700 bg-slate-950/60 p-1 rounded-md">
+                      <button
+                        onClick={() => handleTriggerTask(file.path, 'transcode')}
+                        className="text-xs hover:bg-slate-800 text-slate-300 hover:text-sky-400 p-1 px-1.5 rounded transition flex items-center gap-1"
+                        title="Transcode video/audio via Celery worker"
+                      >
+                        <Play className="w-3 h-3 text-sky-500" /> Transcode
+                      </button>
+                      <div className="w-[1px] h-3.5 bg-slate-850" />
+                      <button
+                        onClick={() => {
+                          if (isUpscalableImage(file.name)) {
+                            setUpscaleError(null);
+                            setUpscaleTarget(file);
+                          }
+                        }}
+                        disabled={!isUpscalableImage(file.name)}
+                        aria-disabled={!isUpscalableImage(file.name)}
+                        aria-label={`Upscale ${file.name}`}
+                        className={`text-xs p-1 px-1.5 rounded flex items-center gap-1 transition ${
+                          isUpscalableImage(file.name)
+                            ? 'text-slate-300 hover:bg-slate-800 hover:text-emerald-400'
+                            : 'opacity-50 cursor-not-allowed text-slate-500'
+                        }`}
+                        title={
+                          isUpscalableImage(file.name)
+                            ? 'Magnific generative upscale (2x–16x)'
+                            : 'Upscale supports image files only'
                         }
-                      }}
-                      disabled={!isUpscalableImage(file.name)}
-                      aria-disabled={!isUpscalableImage(file.name)}
-                      aria-label={`Upscale ${file.name}`}
-                      className={`text-xs p-1 px-1.5 rounded flex items-center gap-1 transition ${
-                        isUpscalableImage(file.name)
-                          ? 'text-slate-300 hover:bg-slate-800 hover:text-emerald-400'
-                          : 'opacity-50 cursor-not-allowed text-slate-500'
-                      }`}
-                      title={
-                        isUpscalableImage(file.name)
-                          ? 'Magnific generative upscale (2x–16x)'
-                          : 'Upscale supports image files only'
-                      }                    >
-                      <Cpu className={`w-3 h-3 ${isUpscalableImage(file.name) ? 'text-emerald-500' : 'text-slate-600'}`} /> Upscale
-                    </button>
-                    {isVideoFile(file.name) && (
-                      <>
-                        <div className="w-[1px] h-3.5 bg-slate-850" />
-                        <button
-                          onClick={() => handleTriggerTask(file.path, 'video_upscale', { temporal_strength: 0.25 })}
-                          className="text-xs hover:bg-slate-800 text-slate-300 hover:text-emerald-400 p-1 px-1.5 rounded transition flex items-center gap-1"
-                          title="Frame-by-frame video upscale with motion-aware temporal blending (flicker reduction)"
-                        >
-                          <Cpu className="w-3 h-3 text-emerald-500" /> Video Upscale
-                        </button>
-                      </>
+                      >
+                        <Cpu className={`w-3 h-3 ${isUpscalableImage(file.name) ? 'text-emerald-500' : 'text-slate-600'}`} /> Upscale
+                      </button>
+
+                      {/* Remove Background Action Button (Wayfinder #117 Prototype) */}
+                      <div className="w-[1px] h-3.5 bg-slate-850" />
+                      <button
+                        data-testid={`bgremove-btn-${file.name}`}
+                        onClick={() => {
+                          if (isUpscalableImage(file.name)) {
+                            handleTriggerBgRemove(file);
+                          }
+                        }}
+                        disabled={!isUpscalableImage(file.name)}
+                        aria-disabled={!isUpscalableImage(file.name)}
+                        aria-label={`Remove background from ${file.name} [Prototype #117]`}
+                        className={`text-xs p-1 px-1.5 rounded flex items-center gap-1 transition ${
+                          isUpscalableImage(file.name)
+                            ? 'text-slate-300 hover:bg-slate-800 hover:text-sky-400'
+                            : 'opacity-50 cursor-not-allowed text-slate-500'
+                        }`}
+                        title={
+                          isUpscalableImage(file.name)
+                            ? `Remove background [Prototype #117 - ${currentVariant}]`
+                            : 'Background removal supports image files only'
+                        }
+                      >
+                        <Sparkles className={`w-3 h-3 ${isUpscalableImage(file.name) ? 'text-sky-400' : 'text-slate-600'}`} />
+                        Remove BG
+                        <span className="text-[9px] px-1 py-0.2 rounded bg-sky-950/80 text-sky-400 font-mono border border-sky-800/40">
+                          proto
+                        </span>
+                      </button>
+
+                      {isVideoFile(file.name) && (
+                        <>
+                          <div className="w-[1px] h-3.5 bg-slate-850" />
+                          <button
+                            onClick={() => handleTriggerTask(file.path, 'video_upscale', { temporal_strength: 0.25 })}
+                            className="text-xs hover:bg-slate-800 text-slate-300 hover:text-emerald-400 p-1 px-1.5 rounded transition flex items-center gap-1"
+                            title="Frame-by-frame video upscale with motion-aware temporal blending (flicker reduction)"
+                          >
+                            <Cpu className="w-3 h-3 text-emerald-500" /> Video Upscale
+                          </button>
+                        </>
+                      )}
+                    </div>
+
+                    {/* Playback / Pre-signed direct link */}
+                    {file.url && (
+                      <a 
+                        href={file.url} 
+                        target="_blank" 
+                        rel="noopener noreferrer" 
+                        className="p-1.5 bg-slate-800 border border-slate-700 rounded text-slate-300 hover:bg-slate-700 hover:text-white transition"
+                        title="Open file URL directly"
+                      >
+                        <ArrowUpRight className="w-4 h-4" />
+                      </a>
                     )}
-                  </div>
 
-                  {/* Playback / Pre-signed direct link */}
-                  {file.url && (
-                    <a 
-                      href={file.url} 
-                      target="_blank" 
-                      rel="noopener noreferrer" 
-                      className="p-1.5 bg-slate-800 border border-slate-700 rounded text-slate-300 hover:bg-slate-700 hover:text-white transition"
-                      title="Open file URL directly"
+                    {/* Delete file */}
+                    <button
+                      onClick={() => handleDelete(file.path)}
+                      className="p-1.5 bg-slate-950/80 hover:bg-rose-950/60 border border-slate-855 text-slate-400 hover:text-rose-400 rounded transition"
+                      title="Delete object"
                     >
-                      <ArrowUpRight className="w-4 h-4" />
-                    </a>
-                  )}
-
-                  {/* Delete file */}
-                  <button
-                    onClick={() => handleDelete(file.path)}
-                    className="p-1.5 bg-slate-950/80 hover:bg-rose-950/60 border border-slate-855 text-slate-400 hover:text-rose-400 rounded transition"
-                    title="Delete object"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
-              </div>
+
+                {/* Variant C: Inline preview strip beneath asset row */}
+                {currentVariant === 'inline' && inlineTarget?.path === file.path && (
+                  <InlineVariantStrip
+                    target={file}
+                    onClose={() => setInlineTarget(null)}
+                    onAccept={handleAcceptDerivative}
+                    onReject={() => setInlineTarget(null)}
+                  />
+                )}
+              </React.Fragment>
             ))}
           </div>
         </div>
@@ -1067,7 +1232,48 @@ export default function FileManager() {
             </div>
           </div>
         </div>
-      )}    </div>
+      )}
 
+      {/* Variant A: Slide-over Panel (Wayfinder #117 Prototype) */}
+      {currentVariant === 'panel' && (
+        <PanelVariant
+          target={panelTarget}
+          onClose={() => {
+            setPanelTarget(null);
+            setPanelProcessingTarget(null);
+          }}
+          onAccept={handleAcceptDerivative}
+          onReject={() => {
+            setPanelTarget(null);
+            setPanelProcessingTarget(null);
+          }}
+          onProcessingStateChange={(path, pct) => {
+            setPanelProcessingTarget(path);
+            setPanelProcessingPercent(pct);
+          }}
+        />
+      )}
+
+      {/* Variant B: Centered Modal Wizard (Wayfinder #117 Prototype) */}
+      {currentVariant === 'modal' && (
+        <ModalVariant
+          target={modalTarget}
+          onClose={() => setModalTarget(null)}
+          onAccept={handleAcceptDerivative}
+          onReject={() => setModalTarget(null)}
+        />
+      )}
+
+      {/* Floating Prototype Switcher Pill */}
+      <PrototypeSwitcher currentVariant={currentVariant} />
+    </div>
+  );
+}
+
+export default function FileManager() {
+  return (
+    <Suspense fallback={<div className="py-20 text-center text-slate-500 text-xs">Loading Media Library...</div>}>
+      <FileManagerContent />
+    </Suspense>
   );
 }
