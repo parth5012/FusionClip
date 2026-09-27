@@ -41,6 +41,39 @@ class Settings(BaseSettings):
         "FUSIONCLIP_SECRET_KEY", DEV_DEFAULT_SECRET_KEY
     )
 
+    # --- Skin enhancement: operator-supplied third-party checkouts -------------
+    #
+    # Both engines in app/ml/skin_enhancer.py are local-only, and neither is fully
+    # installable from PyPI into this app's environment:
+    #
+    # * XPixelGroup/DiffBIR (Apache-2.0) is NOT on PyPI. It is a research repo that
+    #   has to be cloned with its submodules (`git clone --recursive`) and run from
+    #   its own root, because inference.py loads its configs with the
+    #   CWD-relative `OmegaConf.load("configs/inference/swinir.yaml")`. Its pinned
+    #   torch is `2.2.2+cu118` with `xformers==0.0.25.post1+cu118`, which normally
+    #   cannot coexist with this app's own torch, hence DIFFBIR_PYTHON below.
+    # * GFPGAN *is* on PyPI and is a normal dependency (see requirements.txt). The
+    #   model path is configurable only so an air-gapped operator can point at a
+    #   pre-downloaded checkpoint instead of letting GFPGANer fetch the release
+    #   asset over the network on first load.
+    #
+    # When DIFFBIR_REPO_PATH is unset or wrong, Creative/Flexible requests return
+    # the labeled degraded envelope naming this setting. Nothing is fabricated.
+    DIFFBIR_REPO_PATH: str = os.getenv("DIFFBIR_REPO_PATH", "")
+    #: Interpreter used to run DiffBIR's inference.py. Defaults to this app's own
+    #: interpreter, which is only correct when DiffBIR's deps happen to be
+    #: installed alongside ours - in practice they live in their own venv.
+    DIFFBIR_PYTHON: str = os.getenv("DIFFBIR_PYTHON", "")
+    #: Hard wall-clock ceiling on one DiffBIR invocation. INFERENCE_LOCK
+    #: serialises every inference request in the process, so a wedged subprocess
+    #: with no timeout would stall all of image, audio and skin work. Generous
+    #: because a cold start loads five models (SwinIR x2, ControlLDM, SD 2.1,
+    #: the diffusion schedule) and fetches their weights on first run.
+    DIFFBIR_TIMEOUT_SECONDS: float = float(
+        os.getenv("DIFFBIR_TIMEOUT_SECONDS", "600")
+    )
+    GFPGAN_MODEL_PATH: str = os.getenv("GFPGAN_MODEL_PATH", "")
+
     @property
     def CORS_ORIGINS_LIST(self) -> List[str]:
         """CORS_ORIGINS parsed into a list of individual origins.

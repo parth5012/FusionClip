@@ -19,16 +19,21 @@ Tests:
 9. Background outside every face box is pixel-identical to the source (face-crop only),
    and source bytes come from storage only - never the server's local filesystem.
 10. Engine loaders build *working* adapters with heavy imports confined to the closure:
-    each test calls the adapter's method, not just the constructor.
+    each test calls the adapter's method, not just the constructor. The fakes they use are
+    the contract mirrors in tests/test_skin_engine_contracts.py, not locally invented
+    stand-ins - the distinction is the whole point of the #138 fix.
 11. Lock scope: admission, model load, inference and post-filters run inside
     INFERENCE_LOCK; the storage upload does not.
+
+The real third-party API contracts live in tests/test_skin_engine_contracts.py. They used
+to be implied by the fakes in this file, which is how every mode of this endpoint shipped
+non-functional behind a green suite.
 """
 
 import io
 import re
 import sys
 import types
-from unittest.mock import MagicMock
 from pathlib import Path
 
 import numpy as np
@@ -117,6 +122,41 @@ class FakeFaceEngine:
         self.restore_calls.append(dict(params))
         self.crop_sizes.append(crop.size)
         return Image.new("RGB", crop.size, (255, 0, 0))
+
+
+class FakeBatchFaceEngine:
+    """Duck-typed stand-in for an engine that can restore a whole request in one call.
+
+    DiffBIR is the only real one: its CLI takes a *folder*, and every invocation loads
+    SwinIR + the conditional diffusion model + SD 2.1 from scratch, so N per-face calls
+    on a group shot mean N model loads. This fake exists so the executor's *dispatch* can
+    be asserted without a subprocess, a GPU or a DiffBIR checkout.
+
+    `drop_results` is the dishonest engine: it hands back fewer images than it was given,
+    which is what the executor's own guard is there to catch.
+    """
+
+    def __init__(self, faces=((8, 8, 56, 56),), raises=None, drop_results=0):
+        self._faces = list(faces)
+        self._raises = raises
+        self._drop_results = drop_results
+        self.batch_calls = []
+        self.restore_calls = []
+
+    def detect_faces(self, image):
+        return list(self._faces)
+
+    def restore_face(self, crop, **params):
+        self.restore_calls.append(dict(params))
+        return Image.new("RGB", crop.size, (255, 0, 0))
+
+    def restore_faces(self, crops, **params):
+        if self._raises is not None:
+            raise self._raises
+        self.batch_calls.append({"params": dict(params), "sizes": [c.size for c in crops]})
+        return [Image.new("RGB", crop.size, (0, 255, 0)) for crop in crops][
+            : len(crops) - self._drop_results
+        ]
 
 
 def _install_source(storage, name="portrait.png", data=None):
@@ -1118,206 +1158,441 @@ class TestDerivativeOutput:
         assert len(engine.restore_calls) == 3
 
 
+class TestBatchRestoreDispatch:
+    """One restore call per request when the engine can take one, and the per-face
+    loop kept intact for the engines that cannot.
+
+    The seam is `restore_faces`. DiffBIR needs it: its CLI takes a folder and every
+    invocation reloads five models, so a per-face loop on an N-face group shot pays the
+    model load N times against #111's 60s Creative/Flexible budget. GFPGAN does not
+    have it - `model_registry` caches the loaded instance, so its second face is a
+    forward pass on a resident model, not a reload - and it must keep working exactly
+    as before.
+
+    What must not change because of the dispatch: the reported counts and boxes, the
+    background-untouched guarantee, and the degraded envelope on failure.
+    """
+
+    def test_engine_with_restore_faces_is_asked_once_for_the_whole_request(
+        self, client, monkeypatch, stub_storage
+    ):
+        """Three faces, one call. The assertion is on the call count *and* on the
+        crops handed over, because an executor that batched the crops but then looped
+        over the results would satisfy the first and not the second."""
+        stub_storage["uploaded"]["portrait.png"] = {
+            "data": gradient_png(128, 128),
+            "content_type": "image/png",
+        }
+        boxes = [(4, 4, 40, 40), (44, 44, 80, 80), (84, 84, 120, 120)]
+        engine = _install_engine(monkeypatch, FakeBatchFaceEngine(faces=boxes))
+
+        res = client.post("/api/skin-enhance", json={"image_path": "portrait.png"})
+        assert res.status_code == 200, res.text
+        assert len(engine.batch_calls) == 1, (
+            f"one restore call per face means {len(engine.restore_calls)} model loads"
+        )
+        assert engine.restore_calls == [], "the per-face entry point must not be used"
+        assert engine.batch_calls[0]["sizes"] == [(36, 36)] * 3
+
+    def test_a_group_shot_reports_every_face_through_the_batch_path(
+        self, client, monkeypatch, stub_storage
+    ):
+        """`faces_enhanced` / `face_boxes` / `faces_skipped` are computed from the
+        detected boxes, not from how many engine calls it took - so a batched run must
+        report the same numbers a per-face run would, in detected order."""
+        stub_storage["uploaded"]["portrait.png"] = {
+            "data": gradient_png(128, 128),
+            "content_type": "image/png",
+        }
+        boxes = [(4, 4, 40, 40), (44, 44, 80, 80), (200, 200, 240, 240)]
+        engine = _install_engine(monkeypatch, FakeBatchFaceEngine(faces=boxes))
+
+        res = client.post(
+            "/api/skin-enhance", json={"image_path": "portrait.png", "mode": "creative"}
+        )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["faces_enhanced"] == 2
+        assert body["face_boxes"] == [[4, 4, 40, 40], [44, 44, 80, 80]]
+        assert body["faces_skipped"] == 1, "the off-canvas box is still counted as skipped"
+        assert len(engine.batch_calls) == 1
+        assert engine.batch_calls[0]["params"]["prompt"], "creative params must still be forwarded"
+
+    def test_engine_without_restore_faces_keeps_the_per_face_loop(
+        self, client, monkeypatch, stub_storage
+    ):
+        """`FakeFaceEngine` is the GFPGAN shape: `restore_face` and nothing else. It
+        must be called once per face, in order, and the response must be identical."""
+        stub_storage["uploaded"]["portrait.png"] = {
+            "data": gradient_png(128, 128),
+            "content_type": "image/png",
+        }
+        boxes = [(4, 4, 40, 40), (44, 44, 80, 80), (84, 84, 120, 120)]
+        engine = _install_engine(monkeypatch, FakeFaceEngine(faces=boxes))
+
+        res = client.post("/api/skin-enhance", json={"image_path": "portrait.png"})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert len(engine.restore_calls) == 3
+        assert engine.crop_sizes == [(36, 36)] * 3
+        assert body["faces_enhanced"] == 3
+        assert body["face_boxes"] == [list(b) for b in boxes]
+        assert body["faces_skipped"] == 0
+
+    def test_the_real_gfpgan_adapter_has_no_batch_entry_point(self):
+        """The dispatch keys off `restore_faces`, so it matters that the one engine
+        that must stay on the per-face loop genuinely lacks it - and that it lacks it on
+        purpose: `GFPGANer.enhance` re-detects faces *inside* the image it is given, so
+        N crops stacked into one image is a different operation, not a batched one."""
+        from app.ml.skin_enhancer import DiffBIRFaceEngine, GFPGANFaceEngine
+
+        assert not hasattr(GFPGANFaceEngine, "restore_faces")
+        assert hasattr(DiffBIRFaceEngine, "restore_faces")
+
+    def test_a_failed_batch_degrades_the_whole_request_and_writes_nothing(
+        self, client, monkeypatch, stub_storage, db_session
+    ):
+        """One subprocess owns every crop, so a failure is every face's failure. The
+        answer is still the labelled LOAD_FAILED envelope at HTTP 200 with the engine's
+        own message, and nothing is written to storage or the catalog."""
+        stub_storage["uploaded"]["portrait.png"] = {
+            "data": png_bytes(),
+            "content_type": "image/png",
+        }
+        _install_engine(
+            monkeypatch,
+            FakeBatchFaceEngine(faces=[(8, 8, 40, 40), (48, 48, 80, 80)], raises=RuntimeError("DiffBIR exited 1: no lpips")),
+        )
+        before_assets = db_session.query(MediaAsset).count()
+
+        res = client.post(
+            "/api/skin-enhance", json={"image_path": "portrait.png", "mode": "flexible"}
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["degraded"] is True
+        assert body["reason"] == DegradedReason.LOAD_FAILED.value
+        assert "no lpips" in body["message"]
+        assert "filename" not in body and "url" not in body
+        assert len(stub_storage["uploaded"]) == 1, "only the source may exist"
+        assert db_session.query(MediaAsset).count() == before_assets
+
+    def test_a_batch_that_returns_fewer_images_than_crops_is_refused(
+        self, client, monkeypatch, stub_storage
+    ):
+        """Shortening the list would shift every later face's result onto the wrong
+        face box. The engine refuses this itself; the executor refuses it anyway,
+        because the seam is duck-typed and a future engine need not be careful."""
+        stub_storage["uploaded"]["portrait.png"] = {
+            "data": png_bytes(),
+            "content_type": "image/png",
+        }
+        _install_engine(
+            monkeypatch,
+            FakeBatchFaceEngine(
+                faces=[(8, 8, 40, 40), (48, 48, 80, 80)], drop_results=1
+            ),
+        )
+
+        res = client.post(
+            "/api/skin-enhance", json={"image_path": "portrait.png", "mode": "creative"}
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["degraded"] is True
+        assert body["reason"] == DegradedReason.LOAD_FAILED.value
+        assert "filename" not in body
+
+    def test_the_batch_path_leaves_the_background_untouched(
+        self, client, monkeypatch, stub_storage
+    ):
+        """#111 decision 4 under the batched executor: batching changes how the crops
+        travel, never which pixels they cover. Every pixel outside every box is
+        bit-identical to the source, and every box is visibly restored."""
+        raw = gradient_png(96, 96)
+        stub_storage["uploaded"]["portrait.png"] = {"data": raw, "content_type": "image/png"}
+        boxes = [(8, 8, 40, 40), (48, 48, 80, 80)]
+        _install_engine(monkeypatch, FakeBatchFaceEngine(faces=boxes))
+
+        res = client.post(
+            "/api/skin-enhance", json={"image_path": "portrait.png", "mode": "creative"}
+        )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["faces_enhanced"] == 2
+
+        out = np.array(
+            Image.open(io.BytesIO(stub_storage["uploaded"][body["filename"]]["data"])).convert("RGB")
+        )
+        src = np.array(Image.open(io.BytesIO(raw)).convert("RGB"))
+        mask = np.ones(src.shape[:2], dtype=bool)
+        for x0, y0, x1, y1 in boxes:
+            mask[y0:y1, x0:x1] = False
+        assert np.array_equal(out[mask], src[mask]), "background pixels changed"
+        assert not np.array_equal(out[10:20, 10:20], src[10:20, 10:20]), "face was not restored"
+        assert not np.array_equal(out[50:60, 50:60], src[50:60, 50:60]), (
+            "the second face was not restored; results were shifted onto the wrong box"
+        )
+
+
+def _fake_torch(cuda_available: bool) -> types.ModuleType:
+    """A stand-in for `torch` with only what the loaders touch.
+
+    Real torch is not installable in CI here, and the loaders need exactly three
+    things from it: `cuda.is_available()`, `device(...)` and nothing else. Note what
+    is *absent*: no `float16`, no `autocast`, no `nn` - because nothing in the
+    loaders uses them any more. The first cut referenced `torch.float16` and
+    `torch.float32` for a `DiffBIRPipeline` that does not exist.
+    """
+
+    class _Device:
+        def __init__(self, spec):
+            self.type = spec
+
+        def __eq__(self, other):
+            return isinstance(other, _Device) and other.type == self.type
+
+        def __repr__(self):
+            return f"device(type={self.type!r})"
+
+    module = types.ModuleType("torch")
+    module.cuda = types.SimpleNamespace(is_available=lambda: cuda_available)
+    module.device = _Device
+    module.__version__ = "0.0.0-fake"
+    return module
+
+
+def _fake_repo(tmp_path) -> Path:
+    """A directory shaped like a DiffBIR checkout: `inference.py` at the root plus
+    the `configs/inference/` tree its CWD-relative `OmegaConf.load(...)` calls need."""
+    root = Path(tmp_path) / "DiffBIR"
+    (root / "configs" / "inference").mkdir(parents=True, exist_ok=True)
+    (root / "inference.py").write_text("# not executed in tests\n", encoding="utf-8")
+    return root
+
+
+def _install_gfpgan(monkeypatch, restorer_cls, cuda_available: bool = True) -> list:
+    """Install fake `gfpgan` + `torch` and return the list of restorers built."""
+    built: list = []
+
+    class _Recording(restorer_cls):  # type: ignore[misc, valid-type]
+        def __init__(self, *args, **kwargs):
+            self.init_args = args
+            self.init_kwargs = dict(kwargs)
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    fake_gfpgan = types.ModuleType("gfpgan")
+    # gfpgan 1.3.8 exports exactly this class from its top level and nothing else
+    # engine-related - in particular no GFPGAN_VERSION_* constants.
+    fake_gfpgan.GFPGANer = _Recording
+    fake_gfpgan.__version__ = "1.3.8-fake"
+    monkeypatch.setitem(sys.modules, "gfpgan", fake_gfpgan)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda_available))
+    return built
+
+
 class TestLoaderFactories:
-    def test_gfpgan_loader_builds_adapter_without_touching_torch_at_module_scope(
+    """The loaders, exercised through contract mirrors of the real API.
+
+    Every fake in this class is a *contract mirror* of the installed package -
+    `ContractMirrorGFPGANer` and `ContractMirrorFaceRestoreHelper` in
+    tests/test_skin_engine_contracts.py, whose signatures are asserted against
+    gfpgan 1.3.8 and facexlib 0.3.0 there. They are not definitions of what the
+    production code is allowed to call, which is precisely the mistake that let
+    #112 ship five invented symbols behind a green suite.
+    """
+
+    def test_gfpgan_loader_uses_the_real_constructor_signature(self, monkeypatch):
+        """`GFPGANer(model_path, upscale, arch, channel_multiplier, bg_upsampler,
+        device)`. The device is a *constructor argument*: `GFPGANer` is a plain
+        class, so there is nothing to `.to()` and no `enhance_model()` to call."""
+        from app.ml.skin_enhancer import (
+            GFPGAN_ARCH,
+            GFPGAN_ARCH_CHANNEL_MULTIPLIER,
+            GFPGAN_MODEL_URL,
+            GFPGAN_UPSCALE,
+            make_gfpgan_loader,
+        )
+
+        from .test_skin_engine_contracts import ContractMirrorGFPGANer
+
+        built = _install_gfpgan(monkeypatch, ContractMirrorGFPGANer, cuda_available=True)
+        make_gfpgan_loader("gfpgan")()
+
+        assert len(built) == 1
+        kwargs = built[0].init_kwargs
+        assert kwargs["model_path"] == GFPGAN_MODEL_URL
+        assert kwargs["upscale"] == GFPGAN_UPSCALE == 1
+        assert kwargs["arch"] == GFPGAN_ARCH == "clean"
+        assert kwargs["channel_multiplier"] == GFPGAN_ARCH_CHANNEL_MULTIPLIER == 2
+        assert kwargs["bg_upsampler"] is None, (
+            "bg_upsampler=None plus upscale=1 is what keeps the background "
+            "untouched (#111 decision 4)"
+        )
+        assert kwargs["device"].type == "cuda"
+        # The device reached the model, and no offload API was faked into existence.
+        assert built[0].device.type == "cuda"
+
+    def test_gfpgan_adapter_detects_and_restores_through_the_real_sequence(
         self, monkeypatch
     ):
-        """The heavy imports live inside the closure so the app boots torch-free.
-        facexlib does the detection, GFPGAN the restore, and CPU-offload replaces
-        `to('cuda')` exactly as app/ml/image.py does for FLUX."""
-        from app.ml.skin_enhancer import make_gfpgan_loader
+        """detect_faces -> read_image(BGR) -> get_face_landmarks_5 -> det_faces;
+        restore_face -> enhance(paste_back=True) -> third element of the 3-tuple.
 
-        created = []
-
-        class FakeGFPGANer:
-            def __init__(self, model_path="GFPGANv1.4.pth", **kwargs):
-                self.model_path = model_path
-                self.kwargs = kwargs
-                self.offload_calls = 0
-                self.to_calls = []
-                created.append(self)
-
-            def enhance_model(self, *args, **kwargs):
-                self.offload_calls += 1
-
-            def to(self, *args, **kwargs):
-                self.to_calls.append(args)
-                return self
-
-        class FakeFaceHelper:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
-
-            def align_wrtk(self, *args, **kwargs):
-                # Real facexlib returns (all_landmarks, all_boxes) with float boxes.
-                return ([], [np.array([8.0, 8.0, 40.0, 40.0])])
-
-        fake_gfpgan = types.ModuleType("gfpgan")
-        fake_gfpgan.GFPGANer = FakeGFPGANer
-        fake_gfpgan.GFPGAN_VERSION_1_4 = "GFPGANv1.4"
-        fake_gfpgan.GFPGAN_VERSION_1_3 = "GFPGANv1.3"
-        fake_face_helper = types.ModuleType("facexlib.face_helper")
-        fake_face_helper.FaceHelper = FakeFaceHelper
-        fake_facexlib = types.ModuleType("facexlib")
-        fake_facexlib.face_helper = fake_face_helper
-        fake_torch = types.ModuleType("torch")
-        fake_torch.cuda = MagicMock()
-        fake_torch.cuda.is_available.return_value = True
-
-        monkeypatch.setitem(sys.modules, "gfpgan", fake_gfpgan)
-        monkeypatch.setitem(sys.modules, "facexlib", fake_facexlib)
-        monkeypatch.setitem(sys.modules, "facexlib.face_helper", fake_face_helper)
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
-
-        engine = make_gfpgan_loader("gfpgan")()
-        assert engine.face_helper is not None
-        assert created and created[0].offload_calls == 1, "expected enhance_model() offload"
-        assert created[0].to_calls == [], f"to() must not be used on CUDA: {created[0].to_calls}"
-
-        img = Image.new("RGB", (64, 64))
-        assert engine.detect_faces(img) == [(8, 8, 40, 40)]
-
-    def test_gfpgan_loader_falls_back_to_v1_3_on_cpu(self, monkeypatch):
-        """v1.4 pulls a heavier model; on a CPU-only host we never reach inference anyway
-        (the guard refuses first), so the loader only has to be constructible."""
-        from app.ml.skin_enhancer import make_gfpgan_loader
-
-        seen = {}
-
-        class FakeGFPGANer:
-            def __init__(self, model_path=None, **kwargs):
-                seen["model_path"] = model_path
-                seen["upscale"] = kwargs.get("upscale")
-
-            def enhance_model(self, *a, **k):
-                return None
-
-            def to(self, *a, **k):
-                return self
-
-        fake_gfpgan = types.ModuleType("gfpgan")
-        fake_gfpgan.GFPGANer = FakeGFPGANer
-        fake_gfpgan.GFPGAN_VERSION_1_4 = "v1.4"
-        fake_gfpgan.GFPGAN_VERSION_1_3 = "v1.3"
-        fake_face_helper = types.ModuleType("facexlib.face_helper")
-        fake_face_helper.FaceHelper = lambda **kw: types.SimpleNamespace(
-            align_wrtk=lambda *a, **k: ([], None)
-        )
-        fake_facexlib = types.ModuleType("facexlib")
-        fake_facexlib.face_helper = fake_face_helper
-        fake_torch = types.ModuleType("torch")
-        fake_torch.cuda = MagicMock()
-        fake_torch.cuda.is_available.return_value = False
-
-        monkeypatch.setitem(sys.modules, "gfpgan", fake_gfpgan)
-        monkeypatch.setitem(sys.modules, "facexlib", fake_facexlib)
-        monkeypatch.setitem(sys.modules, "facexlib.face_helper", fake_face_helper)
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
-
-        make_gfpgan_loader("gfpgan")()
-        assert seen["upscale"] == 1, "no model upscale: restores happen per native face crop"
-
-    def test_diffbir_loader_enables_tiling_and_offload(self, monkeypatch):
-        """DiffBIR's 8 GB figure from the v2.1 release notes only holds with tiled
-        inference, so enable_tiling() is not optional.
-
-        This test also has to *use* the adapter it builds: DiffBIR's pipeline does
-        no face detection, so `detect_faces` depends on a FaceHelper the loader
-        constructs itself. Asserting only that `pipe.enable_tiling` was called let a
-        None face_helper ship, which turned every Creative and Flexible request into
-        a LOAD_FAILED degraded envelope on real hardware.
+        Both methods are *called*, not merely constructed, because a loader test
+        that only checks the constructor received its arguments is what shipped
+        `DiffBIRFaceEngine(pipe, None)` green.
         """
-        from app.ml.skin_enhancer import make_diffbir_loader
+        from app.ml.skin_enhancer import make_gfpgan_loader
 
-        pipe = MagicMock()
+        from .test_skin_engine_contracts import ContractMirrorGFPGANer
 
-        class FakePipeline:
-            @classmethod
-            def from_pretrained(cls, *args, **kwargs):
-                pipe.from_pretrained_args = args
-                pipe.dtype = kwargs.get("torch_dtype")
-                return pipe
+        _install_gfpgan(monkeypatch, ContractMirrorGFPGANer, cuda_available=True)
+        engine = make_gfpgan_loader("gfpgan")()
 
-        helper_kwargs = {}
+        image = Image.new("RGB", (64, 64), (40, 80, 120))
+        assert engine.detect_faces(image) == [(0, 0, 32, 32)]
 
-        class FakeFaceHelper:
-            def __init__(self, **kwargs):
-                helper_kwargs.update(kwargs)
+        # A BGR ndarray reached the helper, not a PIL image: the mirror's
+        # `read_image` raises TypeError on a PIL image precisely so this cannot
+        # regress silently.
+        helper = engine.face_helper
+        assert isinstance(helper.input_img, np.ndarray)
+        assert helper.input_img.shape == (64, 64, 3)
 
-            def align_wrtk(self, *args, **kwargs):
-                # Real facexlib returns (all_landmarks, all_boxes) with float boxes.
-                return ([], [np.array([8.0, 8.0, 40.0, 40.0])])
+        crop = image.crop((0, 0, 32, 32))
+        restored = engine.restore_face(crop)
+        assert isinstance(restored, Image.Image)
+        assert restored.size == crop.size
+        # The mirror adds 32 levels to every channel, so a real change is visible.
+        assert restored.getpixel((5, 5)) != crop.getpixel((5, 5))
 
-        fake_diffusers = types.ModuleType("diffusers")
-        fake_diffusers.DiffBIRPipeline = FakePipeline
-        fake_face_helper = types.ModuleType("facexlib.face_helper")
-        fake_face_helper.FaceHelper = FakeFaceHelper
-        fake_facexlib = types.ModuleType("facexlib")
-        fake_facexlib.face_helper = fake_face_helper
-        fake_torch = types.ModuleType("torch")
-        fake_torch.float32 = "float32"
-        fake_torch.float16 = "float16"
-        fake_torch.cuda = MagicMock()
-        fake_torch.cuda.is_available.return_value = True
+    def test_gfpgan_restore_refuses_prompt_parameters(self, monkeypatch):
+        """Faithful has no semantic control. A prompt reaching GFPGAN would mean the
+        mode had silently stopped being Faithful."""
+        from app.ml.skin_enhancer import make_gfpgan_loader
 
-        monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
-        monkeypatch.setitem(sys.modules, "facexlib", fake_facexlib)
-        monkeypatch.setitem(sys.modules, "facexlib.face_helper", fake_face_helper)
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        from .test_skin_engine_contracts import ContractMirrorGFPGANer
+
+        _install_gfpgan(monkeypatch, ContractMirrorGFPGANer, cuda_available=True)
+        engine = make_gfpgan_loader("gfpgan")()
+
+        with pytest.raises(ValueError) as exc:
+            engine.restore_face(Image.new("RGB", (32, 32)), prompt="a prompt")
+        assert "prompt" in str(exc.value)
+
+    def test_gfpgan_loader_falls_back_to_cpu_device_without_cuda(self, monkeypatch):
+        """A CPU-only host never reaches inference (the VRAM guard refuses first),
+        so the loader only has to be constructible - but it must be constructible
+        *without* a `.to()` call, because there is no such method."""
+        from app.ml.skin_enhancer import make_gfpgan_loader
+
+        from .test_skin_engine_contracts import ContractMirrorGFPGANer
+
+        built = _install_gfpgan(monkeypatch, ContractMirrorGFPGANer, cuda_available=False)
+        make_gfpgan_loader("gfpgan")()
+        assert built[0].init_kwargs["device"].type == "cpu"
+        assert built[0].init_kwargs["upscale"] == 1
+
+    def test_diffbir_loader_does_not_import_a_pipeline_that_does_not_exist(
+        self, monkeypatch, tmp_path
+    ):
+        """`from diffusers import DiffBIRPipeline` cannot work - DiffBIR is a repo,
+        not a package. The loader must not even try, and must resolve the
+        operator's checkout instead."""
+        import builtins
+
+        import app.ml.skin_enhancer as skin_mod
+        from app.ml.skin_enhancer import DiffBIRFaceEngine, make_diffbir_loader
+
+        real_import = builtins.__import__
+
+        def guard(name, *args, **kwargs):
+            if name.split(".")[0] in {"diffusers", "gfpgan"}:
+                raise AssertionError(f"the DiffBIR loader must not import {name!r}")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", guard)
+        monkeypatch.setitem(sys.modules, "diffusers", None)
+        monkeypatch.setitem(sys.modules, "gfpgan", None)
+        monkeypatch.setattr(skin_mod.settings, "DIFFBIR_REPO_PATH", str(_fake_repo(tmp_path)))
 
         engine = make_diffbir_loader("diffbir")()
-        pipe.enable_tiling.assert_called()
-        pipe.enable_model_cpu_offload.assert_called_once()
-        assert engine.pipeline is pipe
-        assert engine.face_helper is not None, (
-            "DiffBIR's pipeline has no face helper, so the loader must build one: "
-            "without it every Creative/Flexible request dies in detect_faces"
-        )
-        # Same detector configuration as the GFPGAN loader, so a Creative run and a
-        # Faithful run agree on what a face is and what is too small to align.
-        assert helper_kwargs.get("detection_model") == "s3fd"
-        assert helper_kwargs.get("min_size") == 32
+        assert isinstance(engine, DiffBIRFaceEngine)
+        assert engine.repo_root == _fake_repo(tmp_path)
+        # No `pipeline` attribute any more: there is nothing to wrap.
+        assert not hasattr(engine, "pipeline")
 
-        img = Image.new("RGB", (64, 64))
-        assert engine.detect_faces(img) == [(8, 8, 40, 40)]
+    def test_diffbir_loader_uses_the_configured_interpreter_and_timeout(
+        self, monkeypatch, tmp_path
+    ):
+        """DiffBIR pins torch 2.2.2+cu118 and xformers 0.0.25.post1+cu118, which does
+        not coexist with this app's torch in practice, so the interpreter is the
+        operator's to choose."""
+        import app.ml.skin_enhancer as skin_mod
 
-    def test_diffbir_loader_uses_float16_only_on_cuda(self, monkeypatch):
-        from app.ml.skin_enhancer import make_diffbir_loader
+        monkeypatch.setattr(skin_mod.settings, "DIFFBIR_REPO_PATH", str(_fake_repo(tmp_path)))
+        monkeypatch.setattr(skin_mod.settings, "DIFFBIR_PYTHON", "/opt/diffbir-venv/bin/python")
+        monkeypatch.setattr(skin_mod.settings, "DIFFBIR_TIMEOUT_SECONDS", 42.0)
 
-        pipe = MagicMock()
+        engine = skin_mod.make_diffbir_loader("diffbir")()
+        assert engine.python_executable == "/opt/diffbir-venv/bin/python"
+        assert engine.timeout_seconds == 42.0
 
-        class FakePipeline:
-            @classmethod
-            def from_pretrained(cls, *args, **kwargs):
-                pipe.dtype = kwargs.get("torch_dtype")
-                return pipe
+    def test_diffbir_loader_falls_back_to_this_interpreter_when_none_is_configured(
+        self, monkeypatch, tmp_path
+    ):
+        import app.ml.skin_enhancer as skin_mod
 
-        fake_diffusers = types.ModuleType("diffusers")
-        fake_diffusers.DiffBIRPipeline = FakePipeline
-        fake_face_helper = types.ModuleType("facexlib.face_helper")
-        fake_face_helper.FaceHelper = lambda **kw: types.SimpleNamespace(
-            align_wrtk=lambda *a, **k: ([], None)
-        )
+        monkeypatch.setattr(skin_mod.settings, "DIFFBIR_REPO_PATH", str(_fake_repo(tmp_path)))
+        monkeypatch.setattr(skin_mod.settings, "DIFFBIR_PYTHON", "")
+        engine = skin_mod.make_diffbir_loader("diffbir")()
+        assert engine.python_executable == sys.executable
+
+    def test_diffbir_detector_uses_a_detector_facexlib_implements(self, monkeypatch, tmp_path):
+        """The adapter builds its own `FaceRestoreHelper` because the route needs
+        boxes before it can decide whether to refuse with `no_face_detected`. Its
+        detector must be one facexlib 0.3.0 actually implements: only
+        `retinaface_resnet50` and `retinaface_mobile0.25` exist, and `s3fd` raises
+        NotImplementedError."""
+        import app.ml.skin_enhancer as skin_mod
+        from app.ml.skin_enhancer import DETECT_MODEL
+
+        from .test_skin_engine_contracts import ContractMirrorFaceRestoreHelper
+
+        captured: dict = {}
+
+        class _Recording(ContractMirrorFaceRestoreHelper):
+            def __init__(self, *args, **kwargs):
+                captured["args"] = args
+                captured["kwargs"] = dict(kwargs)
+                super().__init__(*args, **kwargs)
+
+        fake_module = types.ModuleType("facexlib.utils.face_restoration_helper")
+        fake_module.FaceRestoreHelper = _Recording
         fake_facexlib = types.ModuleType("facexlib")
-        fake_facexlib.face_helper = fake_face_helper
-        fake_torch = types.ModuleType("torch")
-        fake_torch.float32 = "float32"
-        fake_torch.float16 = "float16"
-        fake_torch.cuda = MagicMock()
+        fake_facexlib.utils = types.ModuleType("facexlib.utils")
+        fake_facexlib.utils.face_restoration_helper = fake_module
 
-        monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
+        monkeypatch.setitem(sys.modules, "torch", _fake_torch(cuda_available=True))
         monkeypatch.setitem(sys.modules, "facexlib", fake_facexlib)
-        monkeypatch.setitem(sys.modules, "facexlib.face_helper", fake_face_helper)
-        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "facexlib.utils", fake_facexlib.utils)
+        monkeypatch.setitem(
+            sys.modules, "facexlib.utils.face_restoration_helper", fake_module
+        )
+        monkeypatch.setattr(
+            skin_mod.settings, "DIFFBIR_REPO_PATH", str(_fake_repo(tmp_path=tmp_path))
+        )
 
-        fake_torch.cuda.is_available.return_value = False
-        make_diffbir_loader("diffbir")()
-        assert pipe.dtype == "float32"
-        pipe.to.assert_called_with("cpu")
-
-        fake_torch.cuda.is_available.return_value = True
-        make_diffbir_loader("diffbir")()
-        assert pipe.dtype == "float16"
+        engine = skin_mod.make_diffbir_loader("diffbir")()
+        assert engine.detect_faces(Image.new("RGB", (64, 64), (5, 5, 5))) == [(0, 0, 32, 32)]
+        assert captured["kwargs"]["det_model"] == DETECT_MODEL == "retinaface_resnet50"
+        assert captured["args"][0] == 1, "upscale_factor=1: paste back at native size"
+        assert "detection_model" not in captured["kwargs"], (
+            "facexlib 0.3.0's FaceRestoreHelper has no `detection_model` argument; "
+            "the argument is `det_model`"
+        )
 
     def test_unknown_engine_has_no_loader(self):
         """CodeFormer / SUPIR / StableSR / GPEN are excluded on license grounds (#111);
@@ -1403,6 +1678,14 @@ class TestRoster:
             assert banned not in ids, f"{banned} is excluded on license grounds"
 
     def test_diffbir_vram_figure_is_eight_gb(self):
-        """DiffBIR v2.1 release notes: 8 GB with tiled inference. The loader enables
-        tiling, so the registry number and the runtime configuration agree."""
+        """DiffBIR v2.1 release notes: 8 GB *for tiled inference*. The engine always
+        passes `--cleaner_tiled` and `--cldm_tiled`, so the registry number and the
+        runtime configuration agree on that much.
+
+        What the number does not cover: the app runs DiffBIR per face crop at
+        `--upscale 1`, which should be no worse than the whole-image case the figure
+        describes. That is an inference, not a measurement, and it has not been checked
+        against a real GPU - so the figure stays at the published whole-image value
+        rather than being lowered on the strength of a hunch.
+        """
         assert model_registry.get("diffbir").approx_vram_gb == 8.0

@@ -144,25 +144,36 @@ PINNED_ROSTER: List[ModelMetadata] = [
         # (docs/research/skin-enhancers.md, branch research/skin-enhancers) says so
         # explicitly ("GAN-tier sizes are qualitative because those repos publish no
         # VRAM numbers"). 1.5 GB is therefore a conservative *choice*, not a citation:
-        # it covers the GFPGANv1.4 generator (StyleGAN2 at channel_multiplier=2) plus
-        # the facexlib S3FD detector, both of which stay resident together. Do not go
-        # hunting for a source for this number.
+        # it covers the GFPGANv1Clean generator (StyleGAN2 at channel_multiplier=2)
+        # plus the two models `FaceRestoreHelper` loads alongside it - the
+        # `retinaface_resnet50` detector and the parsenet segmentation model, both
+        # of which stay resident together because `GFPGANer` builds the helper
+        # itself and `use_parse=True`. Do not go hunting for a source for this
+        # number; there isn't one.
         approx_vram_gb=1.5,
         license="Apache-2.0",
-        description="GFPGAN v1.4 face restoration (Faithful mode engine, face-crop only)",
+        description="GFPGAN face restoration (Faithful mode engine, face-crop only)",
     ),
     ModelMetadata(
         model_id="diffbir",
         family="image",
         dtype_quant="fp16",
-        # 8 GB is the figure the DiffBIR v2.1 release notes publish, and it is only
-        # valid *with tiled inference*. app/ml/skin_enhancer.py's loader therefore
-        # calls enable_tiling() unconditionally; without it this number is wrong.
+        # 8 GB is the figure the DiffBIR v2.1 release notes publish, and it is
+        # stated *for tiled inference of a whole image*.
+        #
+        # Being honest about the rest: app/ml/skin_enhancer.py runs DiffBIR per
+        # face crop, at `--upscale 1`, which should need no more than the
+        # whole-image case and plausibly less. That is our inference, not a
+        # measurement, and it is UNVERIFIED - there is no GPU in CI. So 8.0 is kept
+        # as the number: it is upstream's, and it is the conservative direction
+        # (admitting a smaller workload at the larger footprint). Do not lower it
+        # without measuring a real run.
         approx_vram_gb=8.0,
         license="Apache-2.0",
         description=(
             "DiffBIR v2.1 two-stage blind restoration (Creative + Flexible engine, "
-            "8 GB with tiled inference)"
+            "8 GB with tiled inference; run as a subprocess from an operator-supplied "
+            "checkout, see DIFFBIR_REPO_PATH)"
         ),
     ),
 ]

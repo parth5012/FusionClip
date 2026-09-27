@@ -26,3 +26,40 @@ transformers>=4.40.0
 diffusers>=0.27.0
 accelerate>=0.27.0
 safetensors>=0.4.2
+
+# --- Faithful-mode face restoration (app/ml/skin_enhancer.py) -----------------
+# gfpgan is a real PyPI package, so unlike DiffBIR it belongs here. It pulls in
+# facexlib and basicsr itself, but both are listed explicitly because the app
+# imports facexlib directly (`FaceRestoreHelper`) and because basicsr 1.4.2 pins
+# `torchvision<0.17` in its own metadata, which pip's resolver will fight over
+# with the torch/torchvision pair above - if installation complains, that conflict
+# is the reason, not the app's requirements.
+gfpgan>=1.3.8
+facexlib>=0.3.0
+basicsr>=1.4.2
+
+# --- Creative/Flexible-mode refinement: XPixelGroup/DiffBIR -------------------
+# NOT INSTALLABLE FROM PyPI, and deliberately not listed here.
+#
+# DiffBIR (Apache-2.0, https://github.com/XPixelGroup/DiffBIR) is a research repo,
+# not a package. `pip install diffbir` either fails or installs something else,
+# and it is *not* a diffusers pipeline - there is no `DiffBIRPipeline` class
+# anywhere. The app therefore runs it as a subprocess:
+#
+#     git clone --recursive https://github.com/XPixelGroup/DiffBIR
+#     export DIFFBIR_REPO_PATH=/path/to/DiffBIR
+#     export DIFFBIR_PYTHON=/path/to/diffbir-venv/bin/python   # optional
+#
+# `--recursive` is required: inference.py imports the `guided_diffusion`
+# submodule. The subprocess must run with the repo root as its working directory,
+# because inference.py loads its configs by CWD-relative path
+# (`OmegaConf.load("configs/inference/swinir.yaml")`).
+#
+# Its own pinned dependencies - needed only where DIFFBIR_REPO_PATH is configured,
+# and normally installed in a *separate* virtualenv rather than here, because it
+# pins `torch==2.2.2+cu118` and `xformers==0.0.25.post1+cu118`, which conflict
+# with the torch above: omegaconf, accelerate, einops, timm, torchsde,
+# pytorch-lightning, lpips, xformers, facexlib, opencv-python, pandas, ftfy,
+# regex, numpy, scipy, Pillow.
+#
+# See LEARNINGS.md, "DiffBIR is a repository, not a library".
