@@ -738,3 +738,300 @@ decision), and in `skin_enhancer.py` both the GFPGAN/facexlib API usage and the
   reference rule is now documented at the resolution site rather than in the numbered steps.
 - Real-GPU behaviour of any of this is still unverified here; the new tests pin the guard
   explicitly rather than assuming a device.
+
+## 2026-09-27: Fix the skin-enhance engines (#138 review, map #73)
+
+### Status: Review
+
+### The defect
+`backend/app/ml/skin_enhancer.py` wired both engines to APIs that do not exist, so every mode
+of `POST /api/skin-enhance` was non-functional on real hardware. The 64 tests passed because each
+one injected a fake `gfpgan` / `facexlib` / `diffusers` module that defined exactly the symbols the
+production code referenced — the fakes were derived from the call sites, so the suite asserted the
+invented API against itself. Eight invented symbols:
+
+| reference in #112 | reality |
+|---|---|
+| `facexlib.face_helper.FaceHelper` | class does not exist in facexlib 0.3.0 |
+| `FaceHelper.align_wrtk(img)` | no `align_wrtk` on any facexlib class |
+| `FaceHelper(detection_model="s3fd")` | `init_detection_model` implements only `retinaface_resnet50` / `retinaface_mobile0.25`; `s3fd` raises `NotImplementedError` |
+| `GFPGANer(..., face_helper=helper)` | no such kwarg; the helper is built internally and reachable as `restorer.face_helper` |
+| `restorer.enhance_model()` / `restorer.to("cpu")` | neither exists; `GFPGANer` is a plain class and takes `device=` |
+| `gfpgan.GFPGAN_VERSION_1_3 / _1_4` | gfpgan 1.3.8 exports no such constants; `model_path` is a path or https URL |
+| `restorer.enhance(crop_pil, ...)` → PIL | `enhance` takes a **BGR ndarray** and returns the 3-tuple `(cropped_faces, restored_faces, restored_img)` with `restored_img` a **BGR ndarray** |
+| `from diffusers import DiffBIRPipeline` | DiffBIR is not a diffusers pipeline and is not on PyPI |
+
+### Changes
+- **`app/ml/skin_enhancer.py`** — `GFPGANFaceEngine` rebuilt on the real `GFPGANer`:
+  `GFPGANer(model_path=…, upscale=1, arch='clean', channel_multiplier=2, bg_upsampler=None, device=torch.device(…))`;
+  `detect_faces` drives the restorer's own `FaceRestoreHelper` (`clean_all` → `read_image(BGR)` →
+  `get_face_landmarks_5` → `det_faces`), preserving detect-before-forward-pass; `restore_face`
+  converts PIL↔BGR and handles the real 3-tuple, refusing an empty `cropped_faces` or a `None`
+  `restored_img` rather than reporting an unrestored crop as a restoration. Detector is
+  `retinaface_resnet50` — GFPGANer hardcodes it and offers no supported override, and DiffBIR's
+  own `UnAlignedBFRInferenceLoop` uses the same one; documented rather than silently assumed.
+- **`app/ml/skin_enhancer.py`** — `DiffBIRFaceEngine` is now a subprocess integration. `build_diffbir_argv`
+  is a pure function so the argv is assertable in CI; `restore_face` stages the crop as a real PNG
+  in a temp dir, runs `<python> <repo>/inference.py …` with `cwd=<repo>`, and reads `<stem>_0.png`
+  back. Timeout mandatory (it runs inside `INFERENCE_LOCK`). No `diffusers` import anywhere.
+- **`app/config.py`** — `DIFFBIR_REPO_PATH`, `DIFFBIR_PYTHON`, `DIFFBIR_TIMEOUT_SECONDS`,
+  `GFPGAN_MODEL_PATH`. Unset/wrong `DIFFBIR_REPO_PATH` → `ValueError` naming the setting and the
+  clone recipe → the existing `LOAD_FAILED` envelope at HTTP 200. Nothing is fabricated.
+- **`app/ml/registry.py`** — GFPGAN's `approx_vram_gb` comment corrected (the resident models are the
+  generator + `retinaface_resnet50` + parsenet, not "S3FD"; v1.4 → v1.2-clean, which is what the
+  loader now names). DiffBIR's 8 GB comment made honest: published for *tiled whole-image*
+  inference; running per face crop should be smaller, that is our inference, and it is unverified
+  without a GPU. The number stays 8.0 (upstream's, and the conservative direction).
+- **`backend/requirements.txt`** — adds `gfpgan>=1.3.8`, `facexlib>=0.3.0`, `basicsr>=1.4.2`.
+  **DiffBIR is deliberately not listed**: not on PyPI. Instead a commented `git clone --recursive` +
+  env-var recipe, and its extra deps (`omegaconf`, `accelerate`, `einops`, `timm`, `torchsde`,
+  `pytorch-lightning`, `lpips`, `xformers`, …), noted as belonging in a separate venv because of
+  its pinned `torch==2.2.2+cu118`.
+- **`tests/test_skin_engine_contracts.py`** (new, 43 tests) — see below.
+- **`tests/test_skin_enhancer.py`** — `TestLoaderFactories` rewritten against the contract mirrors;
+  the two DiffBIR-pipeline tests deleted (they asserted on a mock's call record for a class that
+  does not exist). `MagicMock` import dropped, now unused.
+
+### New contract tests, and what each would have caught
+1. `TestNoInventedApiSymbols::test_production_module_names_no_symbol_absent_upstream` — tokenised
+   denylist regex scan of the production module. Catches **all eight** rows in the table above.
+2. `::test_the_denylist_would_catch_the_old_implementation` — points the same denylist at the
+   pre-fix loader, requires ≥7 hits. Stops the guard rotting into a no-op.
+3. `::test_gfpgan_import_is_confined_to_the_loader_closure` / `::test_heavy_imports_stay_inside_a_nested_def`
+   — the app must still boot with no torch. (Both already passed pre-change; kept as regression guards.)
+4. `TestRealGfpganApiContract` (7 tests, `importorskip`) — introspects the installed `GFPGANer`:
+   constructor kwargs, `enhance` kwargs, absence of `enhance_model`/`.to`, absence of
+   `GFPGAN_VERSION_*`, that `model_path` still special-cases `https://`, and that
+   `arch`/`channel_multiplier`/model URL are mutually consistent. Catches the `face_helper=` kwarg,
+   the offload API, the version-constant import, and a `clean`-arch/`GFPGANv1`-weights mismatch that
+   would raise `load_state_dict(strict=True)` on the first real load.
+5. `TestRealFacexlibApiContract` (6 tests, `importorskip`) — `FaceRestoreHelper` has
+   `read_image`/`get_face_landmarks_5`/`align_warp_face`/`get_inverse_affine`/`add_restored_face`/
+   `paste_faces_to_input_image`/`clean_all` and has **no** `align_wrtk`; `get_face_landmarks_5`
+   takes our kwargs; `det_faces` is the public box list and is reset by `clean_all`;
+   `init_detection_model`'s source implements exactly the two retinaface names and raises
+   `NotImplementedError`; the loader only names one of those two. Catches `align_wrtk`,
+   `FaceHelper`, and `detection_model="s3fd"`.
+6. `TestSkipIsLoud::test_records_whether_real_apis_were_introspected` — a green run in which the
+   real-API tests skipped is not a green run; this makes the skip explicit with instructions.
+7. `TestStubSignaturesMirrorRealApi` (5 tests) — the CI stubs are *contract mirrors*: their
+   `__init__`/`enhance` parameter lists are compared against signature literals copied out of
+   gfpgan 1.3.8, and against the real classes wherever they are importable. Prevents the stubs from
+   ever again being the authority on what the API looks like.
+8. `TestDiffBIRArgvContract` (14 tests) — the argv is asserted directly and parsed through a mirror
+   of the real `parse_args`: `--captioner none`, `--task unaligned_face`, `--version v2.1`,
+   `--upscale 1`, `--cfg_scale` (mapped from `skin_detail`, 4 slider positions), `--noise_aug`
+   (mapped from `condition_noise`, 5 values), `--steps`, `--seed 231`, `--device/--precision`,
+   `--n_samples 1`, the verbatim `--pos_prompt` for **all five presets**, upstream's
+   `DEFAULT_NEG_PROMPT`, and that the tiled flags are *bare* (`store_true`). Catches the
+   `DiffBIRPipeline` fiction, a missing flag, and `--cleaner_tiled true`.
+9. `TestDiffBIRRepoPathContract` (4 tests) — unset / non-existent / no-`inference.py` all raise
+   naming the setting and the path; end-to-end, an unset path gives HTTP 200 `LOAD_FAILED` naming
+   `DIFFBIR_REPO_PATH` with no `filename` and nothing written to storage.
+10. `TestDiffBIRStagingIntegration` (6 tests) — crop is on disk under `--input` *before* the call,
+    `cwd` is the repo root, timeout is passed, `<stem>_0.png` is read back; non-zero exit and a
+    missing output file are both errors, never the source crop passed through. Two of these drive
+    the **whole route** through the real `DiffBIRFaceEngine` with only `subprocess.run` replaced —
+    the only place a mismatch between `resolve_engine_params` and `build_diffbir_argv` can surface.
+11. `TestGfpganRestoreHonesty` (4 tests) + `TestPilBgrConversion` (3 tests) — the 3-tuple, the
+    empty-restore refusal, the `None` refusal, the wrong-type refusal, and an exact BGR↔RGB round
+    trip including C-contiguity (a negative-stride view is rejected by `Image.fromarray`).
+
+### Verification (actual numbers)
+- `cd backend && .venv/bin/python -m pytest tests/test_skin_engine_contracts.py -q -p no:cacheprovider`
+  against the **old** production code: **31 failed, 3 passed, 16 skipped, 1 error**. The headline
+  failure listed all eight invented symbols by name. Red confirmed before the rewrite, not assumed.
+- Same file after the rewrite: **43 passed, 16 skipped** (the 16 are the real-API
+  introspections plus the two mirror-vs-real diffs, all `importorskip`-gated).
+- `cd backend && .venv/bin/python -m pytest -q -p no:cacheprovider` → **608 passed, 18 skipped,
+  0 failed** in 209.35s. Pre-change baseline on this tree: **562 passed, 2 skipped**. +46 net
+  (43 new contract tests, 3 net new loader tests). Same 2 pre-existing skips
+  (`test_semantic_search`, needs the fastembed model) and the same 3 pre-existing warnings
+  (httpx/starlette deprecation + 2 duplicate operation-ID warnings from `tasks.py`, already in
+  TECH_DEBT.md). No new warnings.
+- `cd frontend && npx tsc --noEmit` → exit 0, clean. No frontend file was touched.
+- `npx next lint` not run: the repo has no ESLint config, as recorded previously. Not added.
+- torch / gfpgan / facexlib were **not** installed into `backend/.venv`. The probe venv at
+  `/tmp/opencode/probe` was read only.
+
+### Non-vacuity proof for the skipped introspection tests
+Because `gfpgan` cannot be imported without torch, the **real** class bodies were extracted from
+`/tmp/opencode/probe/.../gfpgan/utils.py` and `facexlib/utils/face_restoration_helper.py` with
+`ast.parse` + `compile` (heavy globals stubbed) and the same assertions were run against them:
+- old assumptions → **all fail**: no `face_helper` kwarg; no `enhance_model`; no `.to`;
+  no `align_wrtk`; `init_detection_model('s3fd')` → `NotImplementedError: s3fd is not implemented.`;
+  no `GFPGAN_VERSION` in the module.
+- new assumptions → **all pass**: the six constructor kwargs, the five `enhance` kwargs, the seven
+  helper methods with `align_wrtk` absent, exactly `retinaface_resnet50`/`retinaface_mobile0.25`
+  supported, `startswith('https://')` still in `GFPGANer.__init__`.
+
+### Non-vacuity proof for the argv
+`parse_args`, `DEFAULT_POS_PROMPT` and `DEFAULT_NEG_PROMPT` were extracted from the real
+`/tmp/opencode/DiffBIR/inference.py` (commit `5c2d6c1`) and our argv was run through the **real**
+parser for all five presets: all five parse, and all 14 checked fields match. Our
+`DIFFBIR_NEGATIVE_PROMPT` is byte-identical to upstream's `DEFAULT_NEG_PROMPT`. Separately
+confirmed: bare `--cleaner_tiled --cldm_tiled` is **accepted**; `--cleaner_tiled true
+--cldm_tiled true` is **rejected** with `error: unrecognized arguments: true true` (exit 2) — so
+the task sketch's `--cleaner_tiled true` form would have broken every Creative/Flexible request
+after five model loads, and we deliberately do not use it.
+
+### Not done / visible
+- **The UI still offers Creative and Flexible on a deployment with no `DIFFBIR_REPO_PATH`**, where
+  every such request degrades with a message about an env var. Surfacing
+  `diffbir_repo_configured` on `GET /api/skin-enhance/presets` (and greying the mode switch) is the
+  fix; it touches the frontend panel, so it is left as a follow-up rather than smuggled into a
+  correctness pass.
+- **One subprocess per face.** An N-face group shot pays N DiffBIR model loads. Batching all crops
+  into a single staging directory and invoking once would fix it, at the cost of the executor's
+  per-face failure isolation. Documented in the class docstring; not done.
+- **`retinaface_mobile0.25` is not used.** facexlib supports it and it would save ~50 MB and some
+  time on the Faithful tier, but reaching it means assigning over `restorer.face_helper` after
+  construction, re-deriving the `face_size`/`crop_ratio`/`upscale_factor`/`use_parse` wiring that
+  `enhance()`'s paste-back geometry depends on. Reusing GFPGANer's own helper is the lower-risk
+  choice and agrees with DiffBIR's own detector. Deviation from the brief, deliberate and recorded.
+- **Nothing here was run on a GPU.** See LEARNINGS.md, "A note on what is still unverified", for
+  the itemised list — GFPGAN output quality and identity shift, the VRAM footprint of either
+  engine, the `--noise_aug` placement of each preset, the ≤60s Creative/Flexible budget beyond one
+  face, detector agreement between our box and DiffBIR's, and that the v1.2-clean checkpoint loads
+  at runtime rather than only by construction.
+
+## 2026-09-27: One DiffBIR process per request, not per face (#138 follow-up, map #73)
+
+### Status: Review
+
+### The defect
+`run_skin_enhancement` called `engine.restore_face(crop, …)` once per detected face. For GFPGAN
+that is right: `model_registry` caches the loaded instance, so its Nth face is one forward pass
+on resident weights. For DiffBIR a call is a **process**, and the process is what loads the
+models — SwinIR ×2, ControlLDM, SD 2.1 and the diffusion schedule. So a 6-face group shot paid
+the whole load six times over, against the ~60s-per-image target #111 states for
+Creative/Flexible. Nothing required this: `--input` is a *folder* (`load_lq` globs it with
+`sorted(os.listdir(...))` over `.png/.jpg/.jpeg`) and `UnAlignedBFRInferenceLoop.save` writes one
+`<stem>_0.png` per input. The per-face loop was an accident of the executor, not a constraint.
+
+### Changes
+- **`app/ml/skin_enhancer.py` — `DiffBIRFaceEngine.restore_faces(crops, **params) -> list[Image]`**
+  stages every crop into ONE temp input dir as a real PNG with a unique
+  `face_<run>_<0000..>` stem (one `uuid4` token for the run, zero-padded index so upstream's
+  `sorted()` order is the input order), runs the subprocess once, and reads `<stem>_0.png` per
+  stem. `cwd`-is-repo-root, the mandatory timeout, `build_diffbir_argv`, the `TimeoutExpired` →
+  `RuntimeError` and non-zero-exit → `RuntimeError`-with-stderr paths are all unchanged.
+  Parameter validation moved to `_validate_restore_params` and is shared.
+  **All-or-nothing**: one missing output file raises, naming the absent file and
+  "N of the M staged face crop(s)". A short list is worse than an error here — the executor pairs
+  results with boxes positionally, so a list missing its first entry pastes face 2's restoration
+  onto face 1's box and reports success.
+- **`app/ml/skin_enhancer.py` — `restore_face` is now a one-line delegation**
+  (`self.restore_faces([crop], **params)[0]`) rather than a second copy of the staging code. Two
+  copies of that block is exactly how one of them would drift back to per-face subprocesses. The
+  single-crop contract is still pinned from the outside by `TestDiffBIRStagingIntegration`.
+- **`app/ml/skin_enhancer.py` — executor dispatch.** The crops are built once
+  (`[image.crop(box) for box in usable]`), and an engine offering `restore_faces` is asked for the
+  whole request in one call. An engine without it (GFPGAN) keeps the per-face loop verbatim,
+  including the `Face {index}/{total}` log line and its `Face {index} of {total} failed` envelope.
+  Batch failures degrade the whole request to `LOAD_FAILED` with the same envelope shape; a
+  duck-typed engine returning the wrong number of results is refused rather than guessed at.
+  The resize-and-paste loop is now shared by both shapes, so `faces_enhanced` / `face_boxes` /
+  `faces_skipped`, the background-untouched guarantee and the per-face resize warning are
+  identical either way. Nothing outside the face boxes is ever handed to an engine in either
+  shape: only crops are staged, never the image.
+- **Comments corrected.** The `DiffBIRFaceEngine` docstring now says batching amortises the model
+  load across the faces of one request and that **no wall-clock number for Creative/Flexible has
+  ever been measured here because there is no GPU in CI** — #111's ~60s is a design target the
+  engine was chosen against, not a benchmark. Same correction on `DIFFBIR_INFERENCE_STEPS` (was
+  "the 10-step path is the one that fits the budget") and on the executor's phase-8 docstring
+  ("budgeted at up to 60s"). `GFPGANFaceEngine` gained the reason it has *no* `restore_faces`:
+  its model is resident across calls, and `enhance()` re-detects inside the image it is given, so
+  N crops as one image is a different operation, not a batched one.
+
+### Tests (TDD: written first, watched red, then implemented)
+Red before the change, on the new tests alone: **11 failed, 3 passed**
+(`pytest tests/test_skin_engine_contracts.py::TestDiffBIRBatchRestore
+tests/test_skin_enhancer.py::TestBatchRestoreDispatch`). The route-level failure was the defect
+itself: `three faces cost 3 DiffBIR loads; batching is the whole point of restore_faces`.
+
+`TestDiffBIRBatchRestore` (7 new, `tests/test_skin_engine_contracts.py`) — the stub stands in for
+`inference.py`, reads the staging dir **as it found it** and writes one `<stem>_0.png` per input:
+1. `test_four_crops_cost_exactly_one_subprocess_invocation` — 4 crops → exactly 1 process; all 4
+   PNGs on disk under the single `--input` folder before the call, stems unique, `argv` has one
+   `--input`/`--output` pair pointing at those folders, `cwd` = repo root, `timeout` = 300.0.
+2. `test_results_come_back_in_the_order_the_crops_went_in` — each staged crop is a distinct solid
+   colour, the stub writes outputs in **reverse** order and tags each with its own input's colour
+   (`+1` per channel), so the test fails both if the read-back follows write order and if the
+   results come back reversed.
+3. `test_one_missing_output_file_fails_the_batch_rather_than_shortening_it` — one crop gets no
+   output file; the error names `face_…_0000_0.png` and says "1 of the 4".
+4. `test_restore_face_is_the_batch_of_one` — the single-crop path is still real: one process, one
+   staged crop, same cwd, same result.
+5. `test_an_empty_crop_list_costs_no_process_at_all` — 0 crops launches nothing.
+6. `test_the_batch_still_refuses_missing_and_unexpected_parameters` — the four argv inputs are
+   still required, an unknown key is still refused, and neither launches DiffBIR.
+7. `test_a_group_shot_through_the_route_is_one_process` — the real adapter + the executor + the
+   route, only `subprocess.run` replaced: 3 detected faces → **1** process, 3 staged crops, 3
+   results, `faces_enhanced == 3`, `face_boxes` in detected order, every background pixel
+   bit-identical, all 3 boxes visibly restored, `--cfg_scale` still carries the mapped slider value.
+
+`TestBatchRestoreDispatch` (7 new, `tests/test_skin_enhancer.py`, on a new `FakeBatchFaceEngine`) —
+1. `test_engine_with_restore_faces_is_asked_once_for_the_whole_request` — 1 batch call, 3 crops in
+   it, `restore_face` never called.
+2. `test_a_group_shot_reports_every_face_through_the_batch_path` — `faces_enhanced` 2,
+   `faces_skipped` 1, boxes in order, creative params still forwarded.
+3. `test_engine_without_restore_faces_keeps_the_per_face_loop` — **the GFPGAN path**, unchanged:
+   3 `restore_face` calls, 3 crop sizes, same response.
+4. `test_the_real_gfpgan_adapter_has_no_batch_entry_point` — the real classes, not the fakes:
+   `GFPGANFaceEngine` has no `restore_faces`, `DiffBIRFaceEngine` has.
+5. `test_a_failed_batch_degrades_the_whole_request_and_writes_nothing` — LOAD_FAILED at HTTP 200,
+   the engine's own message, no filename/url, nothing in storage, no catalog row.
+6. `test_a_batch_that_returns_fewer_images_than_crops_is_refused` — the executor's own guard, for
+   a duck-typed engine that is not careful.
+7. `test_the_batch_path_leaves_the_background_untouched` — #111 decision 4 under batching, and
+   both boxes (not just the first) visibly restored, which is what a mis-paired list would break.
+
+### Existing tests adjusted
+- **`TestDiffBIRStagingIntegration::test_timeout_is_always_passed_so_a_hang_cannot_hold_the_inference_lock`**
+  (only one). It did `inspect.getsource(DiffBIRFaceEngine.restore_face)` and asserted
+  `"timeout=" in source`; `restore_face` is now a delegation, so the substring legitimately moved
+  to `restore_faces`. It now inspects `restore_faces` (timeout present, `subprocess.run` present)
+  **and** asserts `restore_face` contains no `subprocess.run(` of its own and does call
+  `restore_faces(` — which keeps the intent (no unguarded subprocess on any path) and adds the
+  delegation check. No other existing test needed changing: the batch seam is additive, and the
+  per-face path is byte-for-byte the old one.
+
+### Verification (actual numbers)
+- `cd backend && .venv/bin/python -m pytest -q -p no:cacheprovider` → **622 passed, 18 skipped,
+  0 failed** in 204.79s. Pre-change baseline on this tree: **608 passed, 18 skipped**. +14 net,
+  exactly the 14 new tests; the 18 skips are the same ones (16 gfpgan/facexlib contract
+  introspections, `TestSkipIsLoud`, `test_semantic_search` needs the fastembed model) and the 3
+  warnings are the same pre-existing httpx/starlette + duplicate-operation-ID ones in TECH_DEBT.md.
+- Skin files only: `pytest tests/test_skin_engine_contracts.py tests/test_skin_enhancer.py` →
+  **124 passed, 16 skipped**.
+- `cd frontend && npx tsc --noEmit` → exit 0. No frontend file was touched.
+- `npx next lint` not run: the repo has no ESLint config, as recorded previously.
+- torch / gfpgan / facexlib were **not** installed into `backend/.venv`; the 16 contract skips are
+  intended and `TestSkipIsLoud` records them.
+
+### Non-vacuity: the new tests were mutated, not just watched go green
+- Return the results reversed → `test_results_come_back_in_the_order_the_crops_went_in` fails
+  (`[(41, 61, 81), …] != [(11, 1, 1), …]`).
+- Turn the missing-output raise into a silent short list →
+  `test_one_missing_output_file_fails_the_batch_rather_than_shortening_it` fails, and only that one.
+- Disable the executor's batch branch (`if False`) → 5 failures across both new classes, including
+  the route-level one.
+- Each mutation was reverted and the file verified byte-identical to the pre-mutation copy.
+
+### Not done / visible
+- **No wall-clock claim.** The model load is now paid once per request instead of once per face,
+  which is a structural saving, not a number: how long one DiffBIR process takes for 1 crop or for
+  6 has never been measured here, and the ≤60s in #111 stays a design target. Nothing in this pass
+  produces a timing figure and none was invented.
+- **Peak memory of a batched run is still inferred, not observed.** One process handles the folder
+  sequentially (its `save()` is per input), so the "one crop resident" property should hold — but
+  that is read off `save()`'s per-input contract, not watched, and it is what a real GPU run with
+  6 faces would confirm or refute.
+- **A batch failure is now all-or-nothing at the route level**: one bad crop out of six fails the
+  whole request to `LOAD_FAILED`. That is the same trade the module already made for a single face
+  (never fabricate, never partially report), and the per-face isolation the old docstring gave up
+  is now actually given up rather than merely deferred.
+- The UI still offers Creative/Flexible on a deployment with no `DIFFBIR_REPO_PATH`; surfacing
+  `diffbir_repo_configured` on `GET /api/skin-enhance/presets` remains the open follow-up from the
+  previous entry.

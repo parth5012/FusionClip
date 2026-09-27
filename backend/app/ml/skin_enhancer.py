@@ -10,7 +10,11 @@ Implements the engine and slider decisions locked by #111:
 - Decision 3: the five Flexible presets are a hardcoded (prompt, guidance-scale,
   condition-noise) table reachable through the pure function `get_flexible_preset`.
   No captioner: LLaVA/RAM would add ~16 GB on top of DiffBIR's 8 GB and break the
-  16 GB floor from #98.
+  16 GB floor from #98. Against the real DiffBIR CLI this holds: `--captioner none`
+  instantiates `EmptyCaptioner`, which returns the empty string, and
+  `InferenceLoop.run` joins only the non-empty parts - so `--pos_prompt` is the
+  entire positive prompt. A reader who "fixes" this back to the CLI default of
+  `llava` adds ~16 GB and breaks #98.
 - Decision 4: face-crop only. Detect, restore each face at native resolution, paste
   back, leave the background untouched. The 512 tile engine is not reused. Max
   input dimension is capped at 8192, the same ceiling the upscaler uses.
@@ -18,6 +22,32 @@ Implements the engine and slider decisions locked by #111:
 - Decision 8: on VRAM refusal or a missing GPU, the labeled degraded envelope
   (DegradedResponse) is returned at HTTP 200. Nothing here ever fabricates payload
   bytes to stand in for a result.
+
+The two engines are wired to their *real* APIs. That is not a formality - the
+first cut of this module referenced five symbols that do not exist upstream
+(`FaceHelper.align_wrtk`, a `GFPGANer(face_helper=...)` kwarg,
+`GFPGANer.enhance_model()`, `GFPGANer.to()`, `gfpgan.GFPGAN_VERSION_1_4`, and a
+`diffusers.DiffBIRPipeline` that was never a thing), and its 64 tests stayed green
+because every one of them injected a fake module that defined precisely those
+symbols. tests/test_skin_engine_contracts.py now asserts the real signatures
+wherever `gfpgan`/`facexlib` are importable, and denies the invented names at the
+source level everywhere else.
+
+The two engines have genuinely different shapes and the module says so rather than
+pretending otherwise:
+
+- **GFPGAN is a library.** `GFPGANer` is constructed in-process, detects, aligns,
+  restores and pastes back by itself, and hands back a 3-tuple whose third element
+  is a BGR ndarray. We drive it once per face crop on a PIL crop and convert at the
+  boundary.
+- **DiffBIR is a program.** XPixelGroup/DiffBIR is not a diffusers pipeline and is
+  not on PyPI; it is a research repo whose only stable interface is
+  `inference.py`'s argparse CLI, and whose config paths are CWD-relative, so it has
+  to be run as a subprocess from its own root. The operator supplies the checkout
+  through `DIFFBIR_REPO_PATH`. There is no importable pipeline to wrap. Because that
+  process is where the models get loaded, every face crop of a request goes into one
+  `--input` folder and is restored by **one** invocation - see `restore_faces` for
+  why, and for what is still unmeasured about the cost of one.
 
 Strictly guards and lazy-loads torch, gfpgan, facexlib and diffusers so the app
 boots and non-GPU environments function cleanly.
@@ -28,15 +58,19 @@ from __future__ import annotations
 import io
 import logging
 import re
+import subprocess
+import sys
+import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from fastapi import HTTPException
 from PIL import Image, ImageFilter
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.ml.contracts import DegradedReason, make_degraded_response
 from app.ml.guard import VRAMRefusalError, vram_guard
 from app.ml.registry import INFERENCE_LOCK, model_registry
@@ -45,6 +79,7 @@ from app.services.embedding import get_embedding
 from app.storage import download_object, generate_url, upload_object
 
 logger = logging.getLogger(__name__)
+
 
 # --------------------------------------------------------------------------- #
 # Surface constants (all pure data, assertable in CI without a GPU)
@@ -121,8 +156,13 @@ FLEXIBLE_PRESETS: Dict[str, Dict[str, Any]] = {
 
 DEFAULT_FLEXIBLE_PRESET = "enhance_skin"
 
-#: Creative mode has no preset to inherit a guidance scale from, so it carries
-#: one of its own: DiffBIR's own webui defaults `--scale` to 3.5.
+#: Creative mode has no preset to inherit a guidance scale from, so it carries one
+#: of its own. 3.5 is a *design choice inside DiffBIR's real range*, not a
+#: transcription: `--cfg_scale` defaults to 6.0 on the CLI and to 8 in upstream's
+#: webui (slider range 1..10, step 1). Those defaults are tuned for whole-image
+#: blind super-resolution, where a strong prompt pull is wanted; a face crop that
+#: must keep the subject's identity is a different job, and #111's five presets
+#: all sit in the 3.0-5.0 band for the same reason. Unverified without a GPU.
 CREATIVE_PROMPT = (
     "high quality portrait photograph of a real person, detailed natural skin, "
     "sharp eyes, photorealistic"
@@ -133,10 +173,67 @@ CREATIVE_BASE_GUIDANCE = 3.5
 #: most creative Flexible preset.
 CREATIVE_CONDITION_NOISE = 0.25
 
-#: DiffBIR v2.1 ships 10-step samplers (per its release notes) and #111 budgets
-#: Creative/Flexible at <= 60s per image, so the 10-step path is the one that
-#: fits the budget. Chosen, not measured.
+#: DiffBIR v2.1 ships 10-step samplers (per its release notes) and #111 states a
+#: ~60s-per-image design target for Creative/Flexible, so 10 steps is the setting that
+#: fits *within* that target on paper. Chosen, not measured: no DiffBIR run has been
+#: timed in this repo, so nothing here establishes that any configuration lands under
+#: 60s. Treat the figure as the budget the engine was picked against, not as a
+#: benchmark result.
 DIFFBIR_INFERENCE_STEPS = 10
+
+# --------------------------------------------------------------------------- #
+# DiffBIR real-CLI surface (XPixelGroup/DiffBIR, Apache-2.0, commit 5c2d6c1)
+#
+# Every value below is transcribed from `inference.py::parse_args` and the loop
+# classes it dispatches to. DiffBIR is not importable as a library, so its
+# argparse surface *is* its API, and the only way to be wrong about it is to
+# guess - so nothing here is guessed, and the argv is asserted in CI by
+# tests/test_skin_engine_contracts.py.
+# --------------------------------------------------------------------------- #
+
+#: `--task unaligned_face` -> `UnAlignedBFRInferenceLoop`, which is the loop that
+#: takes already-cropped / arbitrarily-oriented faces. It runs its own face
+#: detector over whatever we stage, so a staged crop is a legitimate input.
+#: `--version v2.1` because v1 explicitly refuses unaligned BFR
+#: (`UnAlignedBFRInferenceLoop.load_cleaner` raises for v1).
+DIFFBIR_TASK = "unaligned_face"
+DIFFBIR_VERSION = "v2.1"
+#: Seed 231 is upstream's own default, so a Creative run is reproducible rather
+#: than different on every request. (Determinism matters here: `smart_grain` is
+#: already seeded for the same reason.)
+DIFFBIR_SEED = 231
+DIFFBIR_DEVICE = "cuda"
+DIFFBIR_PRECISION = "fp16"
+#: `--upscale 1`. Upstream's default is 4, which would hand us a face crop four
+#: times larger than the box we are pasting back into. At 1 the composed
+#: `<stem>_0.png` comes out at the staged crop's own resolution.
+DIFFBIR_UPSCALE = 1
+
+#: `--noise_aug` is `type=int` and is fed straight into
+#: `diffusion.q_sample(t=noise_aug)`, where 0 means "no condition noise at all"
+#: (the pipeline short-circuits on `if noise_aug > 0`). 199 is the top of the
+#: range in upstream's own gradio webui. #111's preset column is a 0..1
+#: creativity fraction written against a *diffusers* 0..100 knob that never
+#: existed, so it is rescaled linearly onto these endpoints.
+#:
+#: Honest caveat: the endpoints are upstream's own; where each preset lands
+#: *inside* the range is a linear rescale chosen by us and is UNVERIFIED without
+#: a GPU. Re-tune this constant against real output before treating the presets'
+#: relative ordering as meaningful.
+DIFFBIR_MAX_NOISE_AUG = 199
+
+#: DiffBIR's own `DEFAULT_NEG_PROMPT`, copied verbatim from `inference.py`.
+#: Copied rather than invented because it happens to be right for a portrait
+#: enhancer: it penalises "over-smooth" (exactly what the `no_make_up` preset
+#: asks to remove) and "painting, illustration, drawing, art, sketch, ...
+#: 3D render, unreal engine" (exactly what `transform_to_real` pushes away
+#: from). Anything we wrote here would be a guess with no evidence behind it.
+DIFFBIR_NEGATIVE_PROMPT = (
+    "painting, oil painting, illustration, drawing, art, sketch, oil painting, cartoon, "
+    "CG Style, 3D render, unreal engine, blurring, dirty, messy, worst quality, low quality, "
+    "frames, watermark, signature, jpeg artifacts, deformed, lowres, over-smooth."
+)
+
 
 #: Sliders are unipolar Magnific-native 0..100 integers (#111 decision 4). The
 #: upscaler's -10..+10 bipolar convention is untouched and deliberately not
@@ -201,6 +298,61 @@ WORKING_OVERHEAD_GB = 1.0
 
 FaceBox = Tuple[int, int, int, int]
 
+# --------------------------------------------------------------------------- #
+# GFPGAN / facexlib real-API surface (gfpgan 1.3.8, facexlib 0.3.0)
+# --------------------------------------------------------------------------- #
+
+#: `GFPGANer.__init__(model_path, upscale=2, arch='clean', channel_multiplier=2,
+#: bg_upsampler=None, device=None)`. Note what is *not* there: no `face_helper=`
+#: kwarg, no `enhance_model()` method, no `.to()`. The helper is built internally
+#: and the device is a constructor argument.
+#:
+#: `GFPGAN_ARCH`/`GFPGAN_ARCH_CHANNEL_MULTIPLIER` must match the checkpoint or
+#: `load_state_dict(strict=True)` raises on the first load. 'clean' is
+#: `GFPGANv1Clean`; the weights below are the matching v1.2 clean release asset
+#: ("no colorization, no CUDA extensions", per the GFPGAN model zoo). Upstream
+#: pairs exactly these two values in its own `inference_gfpgan.py` for version
+#: 1.2, so this pair is transcribed, not chosen.
+GFPGAN_ARCH = "clean"
+GFPGAN_ARCH_CHANNEL_MULTIPLIER = 2
+#: Official release asset for that checkpoint. `GFPGANer.__init__` special-cases
+#: an `https://` model_path and downloads it through basicsr's
+#: `load_file_from_url`, so this works with no bundled checkpoint and no operator
+#: setup. Overridable with `GFPGAN_MODEL_PATH` for air-gapped hosts.
+#: gfpgan exports *no* `GFPGAN_VERSION_*` constants - the first cut of this module
+#: imported `GFPGAN_VERSION_1_4` and would have died with ImportError.
+GFPGAN_MODEL_URL = (
+    "https://github.com/TencentARC/GFPGAN/releases/download/v0.2.0/"
+    "GFPGANCleanv1-NoCE-C2.pth"
+)
+#: `upscale=1`: restore at native resolution, no model upscale. Combined with
+#: `bg_upsampler=None` this is what implements #111 decision 4's "background
+#: untouched" - `GFPGANer.enhance` pastes the restored faces into
+#: `cv2.resize(input_img, (w, h))` at factor 1, i.e. into a copy of its own input.
+GFPGAN_UPSCALE = 1
+#: gfpgan 1.3.8 exports only this class. Nothing else is needed: the detector,
+#: the face template, the 512 alignment and the paste-back all live inside it.
+#: Importing `facexlib.face_helper.FaceHelper` (the older S3FD-era helper) is what
+#: the first cut did, and that class does not exist in facexlib 0.3.0.
+GFPGAN_CLASS = "GFPGANer"
+
+#: facexlib 0.3.0's `init_detection_model` implements exactly two detectors -
+#: `retinaface_resnet50` and `retinaface_mobile0.25` - and raises
+#: `NotImplementedError` for anything else, `s3fd` included. There is no
+#: `detection_model=` argument anywhere: the choice is `det_model=`.
+#:
+#: We use `retinaface_resnet50` for both tiers, and that is a deliberate choice
+#: rather than an oversight. `GFPGANer` hardcodes `retinaface_resnet50` for the
+#: helper it builds, and offers no supported way to change it - the only lever
+#: would be assigning over `restorer.face_helper` after construction, which means
+#: re-deriving the `face_size` / `crop_ratio` / `upscale_factor` / `use_parse`
+#: wiring that `enhance()` depends on for its paste-back geometry. Meanwhile
+#: DiffBIR's own `UnAlignedBFRInferenceLoop.setup()` also uses
+#: `retinaface_resnet50`. Agreeing with both is worth more here than the ~50 MB
+#: `retinaface_mobile0.25` would save, because a detector disagreement shows up
+#: as "we cropped a box DiffBIR does not think is a face".
+DETECT_MODEL = "retinaface_resnet50"
+
 
 # --------------------------------------------------------------------------- #
 # Pure functions: the parameter mapping and the preset table
@@ -252,6 +404,24 @@ def map_sharpen_to_percent(sharpen: int) -> int:
 def map_smart_grain_to_sigma(smart_grain: int) -> float:
     """Map 0..100 onto a zero-mean Gaussian grain sigma in 8-bit levels."""
     return round(smart_grain / SLIDER_MAX * MAX_GRAIN_SIGMA, 3)
+
+
+def map_condition_noise_to_noise_aug(condition_noise: float) -> int:
+    """Map #111's 0..1 `condition_noise` onto DiffBIR's integer `--noise_aug`.
+
+    `--noise_aug` is `type=int` and is used as a diffusion timestep:
+    `diffusion.q_sample(x_start=cond["c_img"], t=noise_aug)`, gated on
+    `if noise_aug > 0`. 0 therefore has to survive the mapping as 0 - it is
+    DiffBIR's own "off" value, not a clamp. The top of the range is 199, the
+    maximum of the slider in upstream's gradio webui.
+
+    See `DIFFBIR_MAX_NOISE_AUG` for the honest caveat: the endpoints are
+    upstream's, the placement of each preset between them is a linear rescale we
+    chose and have not seen output from.
+    """
+    fraction = min(1.0, max(0.0, float(condition_noise)))
+    return int(round(fraction * DIFFBIR_MAX_NOISE_AUG))
+
 
 
 def resolve_engine_params(
@@ -352,21 +522,108 @@ def apply_texture_retention(
 # --------------------------------------------------------------------------- #
 
 
-class GFPGANFaceEngine:
-    """Adapter over GFPGANer: facexlib for detection, GFPGAN for restoration.
+def pil_to_bgr(image: Image.Image) -> np.ndarray:
+    """PIL RGB -> the BGR `np.uint8` ndarray both engines actually take.
 
-    `restore_face` is handed one crop and returns the restored crop at the same
-    size, so the executor stays in control of the crop / paste-back loop and the
-    background provably cannot be touched.
+    `FaceRestoreHelper.read_image` documents its input as "Numpy array, (h, w, c),
+    BGR, uint8" and `GFPGANer.enhance` passes straight through to it, so a PIL
+    image handed over unconverted is not a type error the upstream code catches -
+    it is a `len(img.shape)` failure several frames later, or worse, a silently
+    red/blue-swapped restoration.
+
+    The `.copy()` is load-bearing, not defensive: `arr[:, :, ::-1]` is a
+    negative-stride *view*, and both `Image.fromarray` and every cv2 function
+    reject one.
+    """
+    return np.asarray(image.convert("RGB"), dtype=np.uint8)[:, :, ::-1].copy()
+
+
+def bgr_to_pil(array: np.ndarray) -> Image.Image:
+    """The inverse of `pil_to_bgr`. Same contiguity requirement, same reason."""
+    array = np.asarray(array)
+    if array.ndim == 2:
+        array = np.stack([array] * 3, axis=-1)
+    if array.ndim != 3 or array.shape[2] < 3:
+        raise ValueError(
+            f"Unrecognized engine output shape {array.shape}; expected (h, w, 3) BGR"
+        )
+    return Image.fromarray(array[:, :, :3][:, :, ::-1].copy()).convert("RGB")
+
+
+def _boxes_from_det_faces(det_faces: Optional[Sequence[Any]]) -> List[FaceBox]:
+    """Normalise facexlib's `det_faces` rows into integer boxes.
+
+    Real `det_faces` entries are numpy rows of `[x0, y0, x1, y1, score]` in the
+    coordinate space of the image that was read (float, and routinely a few pixels
+    outside the frame). Rows with fewer than 4 elements are skipped rather than
+    raising: a detector version that returns a different tuple shape is a
+    condition the caller must be able to survive, not crash on.
+    """
+    boxes: List[FaceBox] = []
+    for row in det_faces or []:
+        values = list(np.asarray(row).reshape(-1))
+        if len(values) < 4:
+            continue
+        boxes.append(tuple(int(v) for v in values[:4]))  # type: ignore[arg-type]
+    return boxes
+
+
+class GFPGANFaceEngine:
+    """Adapter over the real `GFPGANer`, one face crop in and one crop out.
+
+    `GFPGANer` is not a low-level model wrapper - it builds its own
+    `FaceRestoreHelper`, then `enhance()` does the whole job: `clean_all()`,
+    `read_image()`, `get_face_landmarks_5()`, `align_warp_face()`, one forward
+    pass per aligned crop, `get_inverse_affine()` and
+    `paste_faces_to_input_image()`. The first cut of this class tried to
+    reimplement that loop by hand, which is both how you end up holding a broken
+    `face_helper` and how you end up reimplementing gfpgan's tensor plumbing
+    (`img2tensor` / `normalize` / `tensor2img`) badly. So it is not reimplemented:
+    `enhance(paste_back=True)` is called and its third return value is used.
+
+    Two ordering constraints from the route are preserved:
+
+    * **Detect before you spend a forward pass.** `detect_faces` runs the real
+      helper's own detect step (`read_image` + `get_face_landmarks_5`) and reads
+      `det_faces`, so a picture with no face still answers `no_face_detected`
+      without ever constructing the generator's output.
+    * **One crop at a time.** The executor crops a box and hands it over, so the
+      executor keeps control of the crop/paste-back loop and every pixel outside
+      the boxes provably cannot be touched (#111 decision 4).
+
+    There is deliberately no `restore_faces` here, and the executor's batch branch
+    keys off that method, so the omission is load-bearing rather than an oversight.
+    Two reasons. First, batching only pays when the per-call cost is dominated by
+    setup: GFPGAN's model is resident in this process for the request (`model_registry`
+    caches the loaded instance), so its Nth face is one forward pass on weights that
+    are already there. Second, `enhance()` re-detects faces *inside* the image it is
+    given, so handing it N crops as one image is a different operation, not a batched
+    one - it would change what Faithful mode does. DiffBIR has the opposite shape
+    (a subprocess per call that reloads everything) and does get a batch entry point.
     """
 
-    def __init__(self, restorer: Any, face_helper: Any):
+    def __init__(self, restorer: Any):
+        # `restorer.face_helper` is the `FaceRestoreHelper` GFPGANer built for
+        # itself. Reusing it is deliberate: it is the only helper whose
+        # face_size / crop_ratio / upscale_factor / use_parse wiring is known to
+        # agree with what `enhance()` does at paste-back time.
         self.restorer = restorer
-        self.face_helper = face_helper
+
+    @property
+    def face_helper(self) -> Any:
+        """The restorer's own helper. Not injected, not shared with another engine."""
+        return self.restorer.face_helper
 
     def detect_faces(self, image: Image.Image) -> List[FaceBox]:
-        _landmarks, boxes = self.face_helper.align_wrtk(image)
-        return [(int(b[0]), int(b[1]), int(b[2]), int(b[3])) for b in (boxes or [])]
+        helper = self.face_helper
+        # `clean_all()` first: `get_face_landmarks_5` *appends* to `det_faces`,
+        # so without this a second request would see the first one's faces too.
+        helper.clean_all()
+        helper.read_image(pil_to_bgr(image))
+        # `eye_dist_threshold=5` matches what GFPGANer.enhance itself uses, so the
+        # boxes we report here are the same set the restore pass will act on.
+        helper.get_face_landmarks_5(only_center_face=False, eye_dist_threshold=5)
+        return _boxes_from_det_faces(getattr(helper, "det_faces", None))
 
     def restore_face(self, crop: Image.Image, **params: Any) -> Image.Image:
         if params:
@@ -374,50 +631,391 @@ class GFPGANFaceEngine:
                 "Faithful mode's engine (GFPGAN) has no prompt or guidance control; "
                 f"unexpected parameters forwarded: {sorted(params)}"
             )
-        restored = self.restorer.enhance(
-            crop, has_aligned=False, only_center_face=False, paste_back=True
+        # `enhance` re-detects inside the crop, which is what we want: the crop is
+        # a tight box, and a second detection there is far cheaper than
+        # reimplementing align/restore/paste for a single box.
+        result = self.restorer.enhance(
+            pil_to_bgr(crop),
+            has_aligned=False,
+            only_center_face=False,
+            paste_back=True,
         )
-        if not isinstance(restored, Image.Image):
+        # The real return is the 3-tuple (cropped_faces, restored_faces,
+        # restored_img). The first cut checked `isinstance(restored, Image.Image)`
+        # on the *tuple* and raised "Unrecognized GFPGAN output type: tuple" on
+        # every single Faithful request.
+        if not isinstance(result, tuple) or len(result) != 3:
             raise ValueError(
-                f"Unrecognized GFPGAN output type: {type(restored).__name__}"
+                "GFPGANer.enhance did not return the documented "
+                f"(cropped_faces, restored_faces, restored_img) 3-tuple, got "
+                f"{type(result).__name__}"
             )
-        return restored.convert("RGB")
+        cropped_faces, _restored_faces, restored_img = result
+        if not cropped_faces:
+            # `enhance` re-detects inside the crop we hand it. If that detection
+            # comes back empty - a box that was clamped into the canvas until the
+            # face was mostly out of frame, say - it still returns a 3-tuple whose
+            # third element is the input crop, unchanged. Returning that would tell
+            # the caller a face was restored when nothing was, so it is an error.
+            raise ValueError(
+                "GFPGANer.enhance found no face inside the crop it was given, so it "
+                "restored nothing and its pasted-back image is the input unchanged. "
+                "Refusing to report that as a restoration."
+            )
+        if restored_img is None:
+            # `enhance` returns None for the third element when
+            # `has_aligned or not paste_back`; we ask for neither, so a None here
+            # means the call did not do what was asked and returning the input
+            # crop would be a lie about it having been restored.
+            raise ValueError(
+                "GFPGANer.enhance(paste_back=True) returned no pasted-back image; "
+                "the input crop was not restored"
+            )
+        return bgr_to_pil(restored_img)
+
+
+def build_diffbir_argv(
+    python_executable: str,
+    repo_root: Path,
+    input_dir: Path,
+    output_dir: Path,
+    *,
+    prompt: str,
+    guidance_scale: float,
+    condition_noise: float,
+    negative_prompt: str = DIFFBIR_NEGATIVE_PROMPT,
+    steps: int = DIFFBIR_INFERENCE_STEPS,
+    device: str = DIFFBIR_DEVICE,
+    precision: str = DIFFBIR_PRECISION,
+    seed: int = DIFFBIR_SEED,
+) -> List[str]:
+    """Build the argv for one DiffBIR invocation. Pure, so CI can assert on it.
+
+    Every flag here exists in `inference.py::parse_args`; none of them is a diffusers
+    pipeline keyword. Two spellings are load-bearing and easy to get wrong:
+
+    * `--cleaner_tiled` and `--cldm_tiled` are `action="store_true"`. Writing
+      `--cleaner_tiled true` makes argparse treat `true` as an unrecognised
+      positional and abort, *after* loading five models.
+    * `--input` and `--output` are **folders**, not files. `InferenceLoop.load_lq`
+      walks `sorted(os.listdir(args.input))` and keeps `.png/.jpg/.jpeg`.
+
+    `--captioner none` is the load-bearing one for this project: see the module
+    docstring. It is the CLI default of `llava` that would cost ~16 GB (#111).
+    """
+    return [
+        python_executable,
+        str(Path(repo_root) / "inference.py"),
+        "--input",
+        str(input_dir),
+        "--output",
+        str(output_dir),
+        "--task",
+        DIFFBIR_TASK,
+        "--version",
+        DIFFBIR_VERSION,
+        "--upscale",
+        str(DIFFBIR_UPSCALE),
+        "--captioner",
+        "none",
+        "--pos_prompt",
+        prompt,
+        "--neg_prompt",
+        negative_prompt,
+        "--cfg_scale",
+        str(round(float(guidance_scale), 4)),
+        "--noise_aug",
+        str(map_condition_noise_to_noise_aug(condition_noise)),
+        "--steps",
+        str(int(steps)),
+        # Bare `store_true` flags, no "true" token. DiffBIR's published 8 GB figure
+        # is *for tiled inference*; without these two the registry number is wrong.
+        "--cleaner_tiled",
+        "--cldm_tiled",
+        "--device",
+        device,
+        "--precision",
+        precision,
+        "--seed",
+        str(int(seed)),
+        "--n_samples",
+        "1",
+    ]
+
+
+def resolve_diffbir_repo_path() -> Path:
+    """Locate the operator-supplied DiffBIR checkout, or raise naming what is wrong.
+
+    XPixelGroup/DiffBIR is not on PyPI (it is a research repo with a `guided_diffusion`
+    submodule), so `pip install diffbir` cannot be used to make Creative/Flexible work.
+    The operator clones it and points `DIFFBIR_REPO_PATH` at the repo root - the
+    directory containing `inference.py` and `configs/`, which is also the directory
+    the subprocess has to run *in*, because `inference.py` loads its configs with the
+    CWD-relative `OmegaConf.load("configs/inference/swinir.yaml")`.
+
+    Raising here (rather than degrading later) is deliberate: the executor turns any
+    loader exception into the labeled LOAD_FAILED envelope with this message, so the
+    operator is told exactly which setting to fix, and no output is ever invented.
+    """
+    raw = (settings.DIFFBIR_REPO_PATH or "").strip()
+    if not raw:
+        raise ValueError(
+            "DIFFBIR_REPO_PATH is not configured. XPixelGroup/DiffBIR is not "
+            "installable from PyPI, so Creative and Flexible modes need a local "
+            "checkout: `git clone --recursive https://github.com/XPixelGroup/DiffBIR` "
+            "and set DIFFBIR_REPO_PATH to that directory (the one holding "
+            "inference.py and configs/). Faithful mode does not need it."
+        )
+    repo_root = Path(raw).expanduser()
+    if not repo_root.is_dir():
+        raise ValueError(
+            f"DIFFBIR_REPO_PATH={raw!r} is not a directory. Set it to the root of a "
+            "DiffBIR checkout - the directory containing inference.py and configs/."
+        )
+    entrypoint = repo_root / "inference.py"
+    if not entrypoint.is_file():
+        raise ValueError(
+            f"DIFFBIR_REPO_PATH={raw!r} has no inference.py at its root, so it is not "
+            "a DiffBIR checkout. Set it to the repository root, not to a subdirectory."
+        )
+    return repo_root
 
 
 class DiffBIRFaceEngine:
-    """Adapter over diffusers' DiffBIRPipeline for one face crop at a time."""
+    """Adapter that drives DiffBIR's CLI - every face crop in one invocation.
 
-    def __init__(self, pipeline: Any, face_helper: Any):
-        self.pipeline = pipeline
-        self.face_helper = face_helper
+    There is no importable DiffBIR pipeline to wrap - see the module docstring. This
+    class therefore does three things and delegates the rest:
+
+    1. Detects faces with its own `FaceRestoreHelper`, so the route's
+       `no_face_detected` refusal, its out-of-canvas clamping and its reported
+       `face_boxes` all still work. (DiffBIR's loop detects too, but only over
+       whatever we stage, i.e. after the refusal decision has already been made.)
+    2. Writes every crop to ONE staging directory as a real PNG, because `--input` is
+       a folder and upstream's `load_lq` globs it with
+       `sorted(os.listdir(...))`, keeping `.png/.jpg/.jpeg`.
+    3. Reads `<stem>_0.png` back out of `--output`, one per staged crop.
+
+    The output name is `<stem>_0.png`, not `<stem>.png`, and that is worth being
+    precise about: `UnAlignedBFRInferenceLoop.save` is an override, and it writes the
+    *composed* image as `f"{file_stem}_{i}.png"` (with `n_samples=1`, so `_0`).
+    The plain `<stem>.png` form is the base `InferenceLoop.save` and is only used by
+    the `sr`/`denoise` tasks. It also drops the per-face samples in
+    `restored_faces/` and the input crops in `cropped_faces/`; we read the composed
+    one, which is already the crop with the restored face pasted back at
+    `--upscale 1`.
+
+    Why one invocation for the whole request: a DiffBIR invocation is a *process*, and
+    the process is what loads the models. Each run loads SwinIR (x2), ControlLDM, SD
+    2.1 and the diffusion schedule, so the first cut - one `restore_face` call per
+    detected face - made a 6-face group shot pay the whole load six times over. Since
+    `--input` is a folder, that was never a requirement, only an accident of the
+    executor's loop. `restore_faces` stages all the crops and shells out once.
+
+    Honest position on cost, since it is easy to overstate: batching amortises the
+    model load across the faces of *one* request - the N-fold load multiplier is gone
+    - but it does not make a request cheap, and **no wall-clock number for
+    Creative/Flexible has ever been measured here, because there is no GPU in CI**.
+    The ~60s per image in #111 is a design target the engine was chosen against, not
+    a benchmark and not a verified bound. Do not read "one process now" as "within
+    budget"; only a real DiffBIR checkout on a real GPU can say that.
+    """
+
+    def __init__(
+        self,
+        repo_path: str,
+        python_executable: str,
+        timeout_seconds: float,
+        device: str = DIFFBIR_DEVICE,
+        precision: str = DIFFBIR_PRECISION,
+    ):
+        self.repo_root = resolve_diffbir_repo_path() if not repo_path else Path(repo_path)
+        # `DIFFBIR_PYTHON` exists because DiffBIR pins `torch==2.2.2+cu118` +
+        # `xformers==0.0.25.post1+cu118`, which in practice does not coexist with
+        # this app's own torch. Defaulting to our interpreter is correct only when
+        # someone has installed DiffBIR's deps alongside ours.
+        self.python_executable = python_executable or sys.executable
+        self.timeout_seconds = float(timeout_seconds)
+        self.device = device
+        self.precision = precision
+        self._face_helper: Any = None
+
+    def _build_face_helper(self) -> Any:
+        if self._face_helper is None:
+            import torch  # type: ignore
+            from facexlib.utils.face_restoration_helper import (  # type: ignore
+                FaceRestoreHelper,
+            )
+
+            # Mirrors the configuration DiffBIR's own UnAlignedBFRInferenceLoop
+            # builds, so the boxes this adapter reports and the crops DiffBIR
+            # decides are faces cannot disagree. `upscale_factor=1` because we paste
+            # back into the source box at native resolution.
+            self._face_helper = FaceRestoreHelper(
+                1,
+                face_size=512,
+                crop_ratio=(1, 1),
+                det_model=DETECT_MODEL,
+                save_ext="png",
+                use_parse=False,
+                device=torch.device(
+                    "cuda" if (self.device == "cuda" and torch.cuda.is_available()) else "cpu"
+                ),
+            )
+        return self._face_helper
 
     def detect_faces(self, image: Image.Image) -> List[FaceBox]:
-        _landmarks, boxes = self.face_helper.align_wrtk(image)
-        return [(int(b[0]), int(b[1]), int(b[2]), int(b[3])) for b in (boxes or [])]
+        # No torch import here: the helper is built lazily on the first call, and
+        # after that detection needs only the mirror/real helper's numpy plumbing.
+        helper = self._build_face_helper()
+        helper.clean_all()
+        helper.read_image(pil_to_bgr(image))
+        helper.get_face_landmarks_5(only_center_face=False, eye_dist_threshold=5)
+        return _boxes_from_det_faces(getattr(helper, "det_faces", None))
+
+    @staticmethod
+    def _validate_restore_params(params: Dict[str, Any]) -> None:
+        """DiffBIR's argv is built from exactly these four values and nothing else.
+
+        Checked rather than defaulted, because a missing key here means
+        `resolve_engine_params` failed to do its job for this mode, and silently
+        substituting a default would turn a mapping bug into a plausible-looking
+        render nobody could explain.
+        """
+        missing = [
+            key
+            for key in ("prompt", "guidance_scale", "condition_noise", "num_inference_steps")
+            if key not in params
+        ]
+        if missing:
+            raise ValueError(
+                f"DiffBIR needs {sorted(missing)} to build its argv; the Creative and "
+                "Flexible parameter mapping in resolve_engine_params should have "
+                "supplied them"
+            )
+        unexpected = set(params) - {
+            "prompt",
+            "guidance_scale",
+            "condition_noise",
+            "num_inference_steps",
+        }
+        if unexpected:
+            raise ValueError(f"Unexpected DiffBIR parameters forwarded: {sorted(unexpected)}")
+
+    def restore_faces(
+        self, crops: Sequence[Image.Image], **params: Any
+    ) -> List[Image.Image]:
+        """Restore every crop with ONE subprocess, and return them in the given order.
+
+        The staging layout is the whole contract with upstream: `--input` is globbed
+        with `sorted(os.listdir(...))` and `save()` writes `<stem>_0.png` per input, so
+        the crops are staged as `<run token>_<index>.png` and read back by the same
+        stem. The index is zero-padded so the sorted order upstream sees is the order
+        the crops were given in - it does not have to be, because the read-back is by
+        name, but a `sorted()` that scrambled them would make any future debugging of
+        the output directory actively misleading.
+
+        Every crop is a face crop from a detected box and nothing else (#111 decision
+        4): the executor hands this method crops, never the image, so no background
+        pixel can reach DiffBIR even transitively through the staging directory.
+
+        All-or-nothing: if even one `<stem>_0.png` is missing the whole call raises. A
+        short list would be worse than an error here, because the executor pairs
+        results with boxes *positionally* - a list missing its first entry would paste
+        face 2's restoration onto face 1's box and report success.
+        """
+        self._validate_restore_params(params)
+        crop_list = list(crops)
+        if not crop_list:
+            # Nothing to restore, so nothing to launch. DiffBIR would happily start,
+            # load five models and write no output.
+            return []
+
+        # A uuid run token, because a fixed stem would collide with a stale file if the
+        # staging directory were ever reused. The directory is fresh regardless, but
+        # the name is free and this removes the question.
+        run = uuid.uuid4().hex[:12]
+        stems = [f"face_{run}_{index:04d}" for index in range(len(crop_list))]
+        with tempfile.TemporaryDirectory(prefix="fusionclip-diffbir-") as workdir:
+            input_dir = Path(workdir) / "in"
+            output_dir = Path(workdir) / "out"
+            # Created up front: `load_lq` asserts `os.path.isdir(args.input)` and
+            # `setup()` only creates the *output* side.
+            input_dir.mkdir()
+            output_dir.mkdir()
+            for stem, crop in zip(stems, crop_list):
+                crop.convert("RGB").save(input_dir / f"{stem}.png", format="PNG")
+
+            argv = build_diffbir_argv(
+                python_executable=self.python_executable,
+                repo_root=self.repo_root,
+                input_dir=input_dir,
+                output_dir=output_dir,
+                prompt=str(params["prompt"]),
+                guidance_scale=float(params["guidance_scale"]),
+                condition_noise=float(params["condition_noise"]),
+                steps=int(params["num_inference_steps"]),
+                device=self.device,
+                precision=self.precision,
+            )
+
+            logger.info(
+                f"Skin enhance: running DiffBIR once for {len(stems)} face crop(s) in "
+                f"{input_dir} (task={DIFFBIR_TASK}, version={DIFFBIR_VERSION})"
+            )
+            try:
+                completed = subprocess.run(  # noqa: S603 - argv is built here, not caller-supplied
+                    argv,
+                    cwd=str(self.repo_root),
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout_seconds,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"DiffBIR did not finish within {self.timeout_seconds:g}s and was "
+                    f"killed: {exc}"
+                ) from exc
+
+            if completed.returncode != 0:
+                # Surface stderr: DiffBIR's most common failure here is a missing
+                # dependency in its own venv (torchsde, lpips, xformers), and the
+                # operator needs the line, not "exit status 1".
+                raise RuntimeError(
+                    f"DiffBIR exited {completed.returncode}: "
+                    f"{(completed.stderr or completed.stdout or '').strip()[-2000:]}"
+                )
+
+            restored: List[Image.Image] = []
+            absent: List[str] = []
+            for stem in stems:
+                produced = output_dir / f"{stem}_0.png"
+                if not produced.is_file():
+                    absent.append(produced.name)
+                    continue
+                with Image.open(produced) as opened:
+                    opened.load()
+                    restored.append(opened.convert("RGB"))
+            if absent:
+                raise RuntimeError(
+                    f"DiffBIR exited 0 but wrote no result for {len(absent)} of the "
+                    f"{len(stems)} staged face crop(s): {sorted(absent)}. "
+                    f"stdout: {(completed.stdout or '').strip()[-1000:]}"
+                )
+            return restored
 
     def restore_face(self, crop: Image.Image, **params: Any) -> Image.Image:
-        result = self.pipeline(
-            image=crop,
-            prompt=params["prompt"],
-            # DiffBIR's condition noise is 0..1 in the upstream repo's webui and
-            # 0..100 in the diffusers port; convert rather than silently
-            # under-drive the knob.
-            noise_level=int(round(float(params["condition_noise"]) * 100)),
-            guidance_scale=float(params["guidance_scale"]),
-            num_inference_steps=int(params["num_inference_steps"]),
-        )
-        output = getattr(result, "images", None)
-        if output is None:
-            output = result
-        if isinstance(output, (list, tuple)):
-            if not output:
-                raise ValueError("DiffBIR returned an empty image list")
-            output = output[0]
-        if hasattr(output, "cpu"):
-            output = output.cpu().numpy()
-        if isinstance(output, np.ndarray) and output.ndim == 3 and output.shape[0] in (1, 3):
-            output = np.transpose(output, (1, 2, 0))
-        return Image.fromarray(np.asarray(output).astype(np.uint8)).convert("RGB")
+        """One crop, through the batch path. Kept because the per-face contract is
+        real and worth pinning on its own (`TestDiffBIRStagingIntegration`), and
+        because an engine-shaped API that can restore a single thing is easier to
+        reason about than one that cannot.
+
+        It is a delegation rather than a second implementation on purpose: a separate
+        copy of the staging, argv and read-back code is exactly how the two would drift
+        apart and leave one of them doing per-face subprocesses again.
+        """
+        return self.restore_faces([crop], **params)[0]
 
 
 def _raise_unknown_engine(model_id: str):
@@ -432,10 +1030,10 @@ def _raise_unknown_engine(model_id: str):
 def make_gfpgan_loader(model_id: str):
     """Lazy loader factory for the Faithful-mode face restorer.
 
-    Guards gfpgan, facexlib and torch imports so they run only at load time.
-    On CUDA the weights are moved with `enhance_model()` (GFPGAN's own
-    half-precision / CPU-offload path) rather than `to('cuda')`, mirroring the
-    offload strategy app/ml/image.py uses for FLUX.
+    Guards the torch and gfpgan imports so they run only at load time; the app boots
+    with neither installed. The device is a *constructor argument* because
+    `GFPGANer` is a plain class, not an `nn.Module` - there is no `.to()` and no
+    `enhance_model()`, which is exactly what the first cut called.
     """
 
     def _loader():
@@ -443,87 +1041,41 @@ def make_gfpgan_loader(model_id: str):
             _raise_unknown_engine(model_id)
 
         import torch  # type: ignore
-        from facexlib.face_helper import FaceHelper  # type: ignore
-        from gfpgan import (  # type: ignore
-            GFPGAN_VERSION_1_3,
-            GFPGAN_VERSION_1_4,
-            GFPGANer,
-        )
+        from gfpgan import GFPGANer  # type: ignore
 
-        # v1.4 is the sharper, more identity-preserving checkpoint; v1.3 is the
-        # fallback for older gfpgan installs that predate it. A CPU-only host
-        # never reaches this code (the VRAM guard refuses first), so the version
-        # choice there only has to be constructible.
-        version = GFPGAN_VERSION_1_4 if torch.cuda.is_available() else GFPGAN_VERSION_1_3
-        # One detector, shared with the restorer, so we are not holding two
-        # resident copies of the S3FD model.
-        face_helper = FaceHelper(
-            max_num=20,  # a group shot must not silently drop faces 6..20
-            min_size=MIN_FACE_DIMENSION,
-            detection_model="s3fd",
-            save_ext="png",
-        )
+        cuda = torch.cuda.is_available()
         restorer = GFPGANer(
-            model_path=version,
-            upscale=1,  # no model upscale: each face is restored at native resolution
-            arch="clean",
-            channel_multiplier=2,
+            model_path=(settings.GFPGAN_MODEL_PATH or "").strip() or GFPGAN_MODEL_URL,
+            upscale=GFPGAN_UPSCALE,  # no model upscale: native resolution per crop
+            arch=GFPGAN_ARCH,
+            channel_multiplier=GFPGAN_ARCH_CHANNEL_MULTIPLIER,
             bg_upsampler=None,  # background is explicitly left untouched (#111 d4)
-            face_helper=face_helper,
+            device=torch.device("cuda" if cuda else "cpu"),
         )
-        if torch.cuda.is_available():
-            restorer.enhance_model()
-        else:
-            restorer.to("cpu")
-        return GFPGANFaceEngine(restorer, face_helper)
+        return GFPGANFaceEngine(restorer)
 
     return _loader
 
 
 def make_diffbir_loader(model_id: str):
-    """Lazy loader factory for the Creative/Flexible refinement pipeline.
+    """Lazy loader factory for the Creative/Flexible refinement engine.
 
-    Guards diffusers and torch imports so they run only at load time.
-    `enable_tiling()` is mandatory, not an optimization: the registry advertises
-    DiffBIR at 8 GB, which is the figure the v2.1 release notes publish *for tiled
-    inference only*. Without tiling the true footprint is higher and the guard
-    would be admitting a job that OOMs.
+    There is nothing heavy to import here on purpose. DiffBIR is a repository, not
+    a package, so "loading the model" means resolving the operator's checkout and
+    remembering how to run its CLI. `torch` is still needed, but only for the face
+    detector this adapter uses to answer the route's `no_face_detected` refusal -
+    and that import happens in `detect_faces`, not here.
     """
 
     def _loader():
         if model_id != "diffbir":
             _raise_unknown_engine(model_id)
 
-        import torch  # type: ignore
-        from diffusers import DiffBIRPipeline  # type: ignore
-        from facexlib.face_helper import FaceHelper  # type: ignore
-
-        cuda = torch.cuda.is_available()
-        pipe = DiffBIRPipeline.from_pretrained(
-            "XPixelGroup/DiffBIR",
-            torch_dtype=torch.float16 if cuda else torch.float32,
+        return DiffBIRFaceEngine(
+            repo_path="",
+            python_executable=settings.DIFFBIR_PYTHON,
+            timeout_seconds=settings.DIFFBIR_TIMEOUT_SECONDS,
         )
-        pipe.enable_tiling()
-        if cuda:
-            pipe.enable_model_cpu_offload()
-        else:
-            pipe.to("cpu")
-        # The pipeline itself does no face detection, so the adapter's FaceHelper
-        # has to be built here - handing it None instead produced an engine whose
-        # detect_faces raised AttributeError, which the executor turned into a
-        # LOAD_FAILED envelope: every Creative and Flexible request degraded.
-        # Same configuration as the GFPGAN loader, so a Faithful run and a
-        # Creative run agree on what a face is and what is too small to align.
-        # This is a second resident S3FD when both engines are loaded; DiffBIR's
-        # published 8 GB is the diffusion stack, and the detector is the same
-        # marginal cost its own loader already accepts.
-        face_helper = FaceHelper(
-            max_num=20,  # a group shot must not silently drop faces 6..20
-            min_size=MIN_FACE_DIMENSION,
-            detection_model="s3fd",
-            save_ext="png",
-        )
-        return DiffBIRFaceEngine(pipe, face_helper)
 
     return _loader
 
@@ -533,7 +1085,6 @@ def make_skin_loader(engine_id: str):
     return make_gfpgan_loader(engine_id) if engine_id == "gfpgan" else make_diffbir_loader(
         engine_id
     )
-
 
 # --------------------------------------------------------------------------- #
 # Executor
@@ -703,16 +1254,24 @@ def run_skin_enhancement(
        asked for, which is the same class of lie as a silent slider clamp.
     4. Lazy-load the engine through model_registry.
     5. Detect faces. No usable face is a 400, not a silent no-op.
-    6. Restore each face crop at native resolution and paste it back, sequentially,
-       so a group shot's peak VRAM stays at one crop rather than N.
+    6. Restore the face crops at native resolution and paste them back, so every pixel
+       outside the boxes is carried over from the source untouched. How the crops
+       reach the engine depends on what the engine is: one `restore_faces` call for
+       the whole request when it offers one (DiffBIR, where a call is a process and
+       each process reloads the models), the per-face `restore_face` loop when it does
+       not (GFPGAN, whose model is resident across calls). Either way the faces are
+       restored one at a time inside the engine, and neither shape ever sees a
+       background pixel.
     7. Apply the post-filters: sharpen and smart_grain over the whole image in
        every mode, plus Faithful-mode texture retention scoped to the face boxes.
     8. Encode real PNG bytes, upload to skin_enhanced/<stem>_<token>.png and
        persist a MediaAsset whose source_path points at the input, so
        BeforeAfterModal pairs before/after with no new UI. Also outside the lock:
-       phases 2-7 hold it, and a Creative run is budgeted at up to 60s, so keeping
-       the upload inside would block every other image and audio inference request
-       for two more network round trips.
+       phases 2-7 hold it, and a Creative run is the slow one - #111 states a ~60s
+       per-image design target for it, which is why keeping the upload inside would
+       block every other image and audio inference request for two more network
+       round trips. That 60s is a target, not a measurement: no DiffBIR run has been
+       timed in this repo.
     9. Return COMPLETED, or the labeled degraded envelope at HTTP 200 whenever
        admission or inference could not happen (#111 decision 8).
     """
@@ -786,28 +1345,90 @@ def run_skin_enhancement(
                 ),
             )
 
-        # 6. Restore each face crop, sequentially, and paste it back. Every pixel
-        # outside these boxes is carried over from the source untouched.
+        # 6. Restore the face crops and paste them back. Every pixel outside these boxes
+        # is carried over from the source untouched, in both shapes below.
+        #
+        # Two engine shapes, one rule. An engine that offers `restore_faces` is asked
+        # for the whole request in a single call, because for DiffBIR a call is a
+        # *process*: `--input` is a folder and every invocation reloads SwinIR, the
+        # conditional diffusion model and SD 2.1, so the per-face loop made an N-face
+        # group shot pay the model load N times. An engine without that method
+        # (GFPGAN) keeps the per-face loop, which is the right shape for it: its model
+        # is resident in this process - `model_registry` caches the loaded instance -
+        # so its Nth face is one forward pass, not one reload. Nothing about the
+        # response changes between the two.
         restored = image.copy()
-        for index, (x0, y0, x1, y1) in enumerate(usable, start=1):
-            crop = image.crop((x0, y0, x1, y1))
+        crops = [image.crop(box) for box in usable]
+        batch_restore: Optional[Callable[..., Sequence[Image.Image]]] = getattr(
+            engine, "restore_faces", None
+        )
+        enhanced_crops: Sequence[Image.Image]
+        if callable(batch_restore):
             try:
-                if restore_params:
-                    enhanced_crop = engine.restore_face(crop, **restore_params)
-                else:
-                    enhanced_crop = engine.restore_face(crop)
+                enhanced_crops = (
+                    batch_restore(crops, **restore_params)
+                    if restore_params
+                    else batch_restore(crops)
+                )
             except Exception as exc:
+                # One process owns every crop, so a failure here is every face's
+                # failure, not one face's. Same envelope and the same `Face i/n` log
+                # shape as the per-face path, with the count that actually failed.
                 logger.error(
-                    f"Face {index}/{len(usable)} failed on '{selected_model_id}': {exc}"
+                    f"Faces 1-{len(crops)}/{len(crops)} failed on '{selected_model_id}' "
+                    f"in one batched restore: {exc}"
                 )
                 return make_degraded_response(
                     reason=DegradedReason.LOAD_FAILED.value,
                     message=(
-                        f"Face {index} of {len(usable)} failed to restore on "
-                        f"'{selected_model_id}': {str(exc)}"
+                        f"All {len(crops)} face crops failed to restore on "
+                        f"'{selected_model_id}' in a single batched run: {str(exc)}"
                     ),
                     model_id=selected_model_id,
                 ).model_dump()
+            if len(enhanced_crops) != len(crops):
+                # Unreachable through `DiffBIRFaceEngine`, which raises instead. Kept
+                # because the seam is duck-typed: a short list would paste every face
+                # after the gap onto the *previous* face's box, silently.
+                logger.error(
+                    f"'{selected_model_id}' returned {len(enhanced_crops)} restored "
+                    f"crops for {len(crops)} staged ones; refusing to guess the pairing"
+                )
+                return make_degraded_response(
+                    reason=DegradedReason.LOAD_FAILED.value,
+                    message=(
+                        f"'{selected_model_id}' returned {len(enhanced_crops)} restored "
+                        f"faces for {len(crops)} detected faces, so the results cannot be "
+                        "paired with their boxes"
+                    ),
+                    model_id=selected_model_id,
+                ).model_dump()
+        else:
+            per_face: List[Image.Image] = []
+            for index, crop in enumerate(crops, start=1):
+                try:
+                    if restore_params:
+                        per_face.append(engine.restore_face(crop, **restore_params))
+                    else:
+                        per_face.append(engine.restore_face(crop))
+                except Exception as exc:
+                    logger.error(
+                        f"Face {index}/{len(crops)} failed on '{selected_model_id}': {exc}"
+                    )
+                    return make_degraded_response(
+                        reason=DegradedReason.LOAD_FAILED.value,
+                        message=(
+                            f"Face {index} of {len(crops)} failed to restore on "
+                            f"'{selected_model_id}': {str(exc)}"
+                        ),
+                        model_id=selected_model_id,
+                    ).model_dump()
+            enhanced_crops = per_face
+
+        for index, (box, crop, enhanced_crop) in enumerate(
+            zip(usable, crops, enhanced_crops), start=1
+        ):
+            x0, y0, x1, y1 = box
             if enhanced_crop.size != crop.size:
                 logger.warning(
                     f"Face {index} restored at {enhanced_crop.size} instead of "
