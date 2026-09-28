@@ -1100,3 +1100,24 @@ itself: `three faces cost 3 DiffBIR loads; batching is the whole point of restor
 - `cd backend && /home/parth/projects/FusionClip/.venv/bin/python -m pytest tests/ -q` -> **653 passed, 16 skipped**.
 - `cd frontend && npx tsc --noEmit` clean; `npx tsx --test src/utils/*.test.ts` -> **89 pass, 0 fail**.
 - `npx playwright test e2e/10-skin-enhancer.spec.ts` -> **4 passed** (was 3; test 4 added for the unmount stop).
+
+## 2026-09-28: Skin Enhancer panel — CodeRabbit review round on PR #140 (map #73)
+
+### Status: Done
+
+### Round: automated review, 3 actionable findings, all applied
+- `backend/app/routers/generate.py:100` — `SAFE_REFERENCE_PATTERN` refused parentheses, so `portrait (1).png` (an uploaded object key, since upload keeps the caller's filename) got a 400 from the per-asset Skin action. Widened the shared class to `A-Za-z0-9._/()-`; traversal rules unchanged and re-pinned.
+- `frontend/src/components/skin-enhancer/ResultsTray.tsx` — `role="status"` on the per-item status span, so queued → running → final is announced.
+- `frontend/src/components/skin-enhancer/SkinEnhancerPanel.tsx` — a `COMPLETED` response with an empty `url` (what `generate_url` returns when it cannot sign the object) is now a failed row with its own message instead of a completed run with no image.
+- No findings parked.
+
+### Commits
+- `8a0bd77` fix(skin): accept parentheses in catalog image keys
+- `78f33fe` fix(skin): announce per-item tray status changes
+- `7dddbe8` fix(skin): fail a completed run that carries no output url
+
+### Verification
+- TDD red-first: the new pytest test failed 400 before the regex change; both new Playwright assertions failed with the src files stashed (`2 failed` — status count 0, failed-row count 0), green after.
+- `cd backend && /home/parth/projects/FusionClip/.venv/bin/python -m pytest tests/ -q` -> **654 passed, 16 skipped** (was 653).
+- `cd frontend && npx tsc --noEmit` clean; `npx tsx --test src/utils/*.test.ts` -> **89 pass, 0 fail**.
+- `E2E_BASE_URL=http://localhost:3001 E2E_API_URL=http://localhost:8001 npx playwright test e2e/10-skin-enhancer.spec.ts` -> **5 passed**.
