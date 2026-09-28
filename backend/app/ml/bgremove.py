@@ -72,6 +72,16 @@ TIER_MODELS = {
     TIER_QUALITY: "birefnet-general",
 }
 
+# Quality-tier weights. `trust_remote_code=True` executes the Hub repository's own
+# modelling code, so both the repository and the exact revision it is fetched from
+# are pinned here (CWE-494, CodeRabbit on PR #139). "birefnet-general" is the
+# upstream *checkpoint* name for the general-use weights; the Hub repo that hosts
+# them (and the AutoModelForImageSegmentation auto_map) is ZhengPeng7/BiRefNet -
+# ZhengPeng7/BiRefNet-general does not exist and answers 401.
+BIREFNET_REPO_ID = "ZhengPeng7/BiRefNet"
+# Immutable commit sha, not a branch: bump deliberately after reviewing upstream.
+BIREFNET_REVISION = "e2bf8e4460fc8fa32bba5ea4d94b3233d367b0e4"
+
 # Register bgremove models into global registry if not already present
 BGREMOVE_ROSTER: List[ModelMetadata] = [
     ModelMetadata(
@@ -198,7 +208,8 @@ def get_birefnet_model():
     Intended loader:
       Uses HuggingFace transformers AutoModelForImageSegmentation:
       model = AutoModelForImageSegmentation.from_pretrained(
-          "ZhengPeng7/BiRefNet-general",
+          BIREFNET_REPO_ID,
+          revision=BIREFNET_REVISION,
           trust_remote_code=True,
       )
       model.to("cuda" if torch.cuda.is_available() else "cpu")
@@ -228,7 +239,8 @@ def get_birefnet_model():
         try:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model = AutoModelForImageSegmentation.from_pretrained(
-                "ZhengPeng7/BiRefNet-general",
+                BIREFNET_REPO_ID,
+                revision=BIREFNET_REVISION,
                 trust_remote_code=True,
             )
             model.to(device)

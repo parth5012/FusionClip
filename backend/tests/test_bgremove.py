@@ -628,3 +628,68 @@ class TestBgRemovePresetsAndInfo:
         all_models = list(surface["models"].values()) + list(TIER_MODELS.values())
         for model in all_models:
             assert "bria" not in model.lower()
+
+
+class TestBgRemoveQualityLoaderIntegrity:
+    """Supply-chain integrity of the quality-tier model load (CodeRabbit / CWE-494)."""
+
+    def test_quality_loader_pins_immutable_revision_on_a_resolvable_repo(
+        self, monkeypatch
+    ):
+        """from_pretrained must receive a 40-hex commit sha and a repo id that exists upstream.
+
+        trust_remote_code=True executes the Hub repo's own modelling code, so the load
+        has to be pinned to an immutable revision (not a branch) of a repository that
+        actually resolves - 'ZhengPeng7/BiRefNet-general' returns 401 upstream.
+        """
+        import types
+
+        from app.ml import bgremove
+
+        bgremove.reset_bgremove_runner()
+        recorded: dict = {}
+
+        class _FakeModel:
+            def to(self, device):
+                return self
+
+            def eval(self):
+                return self
+
+        class _FakeAutoModelForImageSegmentation:
+            @classmethod
+            def from_pretrained(cls, repo_id, **kwargs):
+                recorded["repo_id"] = repo_id
+                recorded.update(kwargs)
+                return _FakeModel()
+
+        fake_torch = types.ModuleType("torch")
+
+        class _Cuda:
+            @staticmethod
+            def is_available():
+                return False
+
+        fake_torch.cuda = _Cuda()
+
+        fake_transformers = types.ModuleType("transformers")
+        fake_transformers.AutoModelForImageSegmentation = _FakeAutoModelForImageSegmentation
+
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+        try:
+            model = bgremove.get_birefnet_model()
+            assert model is not None
+
+            revision = recorded.get("revision")
+            assert revision, "from_pretrained must be given an explicit revision="
+            assert len(revision) == 40 and all(
+                c in "0123456789abcdef" for c in revision
+            ), f"revision must be an immutable 40-hex commit sha, got {revision!r}"
+            assert recorded.get("trust_remote_code") is True
+            # The repo must be the one upstream documents for AutoModelForImageSegmentation.
+            assert recorded["repo_id"] == bgremove.BIREFNET_REPO_ID
+            assert recorded["repo_id"] == "ZhengPeng7/BiRefNet"
+        finally:
+            bgremove.reset_bgremove_runner()
