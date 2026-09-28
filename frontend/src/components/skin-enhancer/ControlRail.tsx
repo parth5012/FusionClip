@@ -76,8 +76,9 @@ export default function ControlRail({
             type="button"
             data-testid={`skin-mode-${mode.id}`}
             aria-pressed={settings.mode === mode.id}
+            disabled={running}
             onClick={() => onChange({ mode: mode.id })}
-            className={`w-full rounded-lg border px-3 py-2 text-left transition ${
+            className={`w-full rounded-lg border px-3 py-2 text-left transition disabled:cursor-not-allowed disabled:opacity-50 ${
               settings.mode === mode.id
                 ? 'border-amber-400 bg-amber-400/10'
                 : 'border-slate-800 hover:border-slate-700'
@@ -105,8 +106,9 @@ export default function ControlRail({
             id="skin-preset"
             data-testid="skin-preset"
             value={settings.preset}
+            disabled={running}
             onChange={(e) => onChange({ preset: e.target.value })}
-            className="w-full rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-2 font-mono text-[11px] text-slate-200"
+            className="w-full rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-2 font-mono text-[11px] text-slate-200 disabled:cursor-not-allowed disabled:opacity-50"
           >
             {presetList.map((preset) => (
               <option key={preset.id} value={preset.id}>
@@ -147,8 +149,9 @@ export default function ControlRail({
             max={100}
             step={1}
             value={settings[slider.key]}
+            disabled={running}
             onChange={(e) => onChange({ [slider.key]: Number(e.target.value) } as Partial<SkinSettings>)}
-            className="w-full accent-amber-400"
+            className="w-full accent-amber-400 disabled:cursor-not-allowed disabled:opacity-50"
           />
           <p className="text-[10px] text-slate-500">{slider.note(settings.mode)}</p>
         </div>
