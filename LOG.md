@@ -1141,3 +1141,23 @@ itself: `three faces cost 3 DiffBIR loads; batching is the whole point of restor
 - `E2E_BASE_URL=http://localhost:3001 E2E_API_URL=http://localhost:8001 npx playwright test e2e/10-skin-enhancer.spec.ts` -> **5 passed**.
 - Backend untouched by this round; last full run stands at 654 passed / 16 skipped.
 - `git status --porcelain` was clean before the review (read-only), changes confined to the three files above.
+
+## 2026-09-28: OCR round 2 on PR #140 — compare-canvas guard (map #73)
+
+### Status: Done
+
+### Scope
+- Second `ocr review --audience agent --from origin/main --to t3code/328a3246`: 14 files, session `99cfe8d8-acfa-4f3e-9cd2-865993657e6b`, `/tmp/opencode/ocr140-r2.json`, exit 0, 2m35s. Result: **0 critical, 0 high, 1 medium, 1 low**.
+
+### Findings
+- **Applied** — `CompareCanvas.tsx:67-55` [bug, medium]: the hero `<img>` was guarded on `beforeUrl` while its `src` was `hasResult ? afterUrl : beforeUrl`. The direct claim (empty `src`) cannot occur — `afterUrl` is only non-empty when `hasResult` is true — but the guard was still the wrong test: a source with no url hid a completed result entirely. Guard now on `shownUrl`, the value actually rendered. Commit `7d224ed`.
+- **Parked (low)** — `SourceStrip.tsx:48-54` indentation: round 2 asked for the *opposite* nesting from round 1. Conflicting reviewer asks are not code changes.
+- Also parked this round: CodeRabbit 🟠 "allow spaces as well as parentheses" on `generate.py:100` — **invalid**; `_is_safe_image_path_chars` matches `value.replace(" ", "")`, so spaces are already accepted, and the very test CodeRabbit cited posts `uploads/portrait (1).png` (which contains a space) and returns 200. Not applied, not argued on the PR.
+
+### TDD
+- The new spec test initially passed for the wrong reason (the url was still reaching the panel via `skinTarget`, which FileManager reads from `/api/storage/list`, not `/api/media`). Stripped the url in **both** routes, then it failed with `element(s) not found` — genuine red — and went green with the guard change.
+- `route.fetch()` + `response.json()` in the catalog interceptor threw `Response has been disposed`; the handler now re-fetches with Node `fetch(route.request().url())`.
+
+### Verification
+- `npx tsc --noEmit` clean; unit **89 pass / 0 fail**; `e2e/10-skin-enhancer.spec.ts` -> **6 passed** (was 5).
+- Backend untouched this round; last full run stands at 654 passed / 16 skipped.
