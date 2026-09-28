@@ -35,6 +35,9 @@ export default function CompareCanvas({ source, item, statusText }: CompareCanva
   const hasResult = item?.status === 'completed' && Boolean(item.resultUrl);
   const beforeUrl = source.url ?? '';
   const afterUrl = hasResult ? item!.resultUrl! : '';
+  // The canvas renders the *after* when there is one, so that is the value the
+  // guard has to test: an empty source url must not hide a real result.
+  const shownUrl = hasResult ? afterUrl : beforeUrl;
 
   const moveTo = (clientX: number) => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -64,10 +67,10 @@ export default function CompareCanvas({ source, item, statusText }: CompareCanva
         onPointerUp={() => setDragging(false)}
         onPointerCancel={() => setDragging(false)}
       >
-        {beforeUrl && (
+        {shownUrl && (
           /* eslint-disable-next-line @next/next/no-img-element */
           <img
-            src={hasResult ? afterUrl : beforeUrl}
+            src={shownUrl}
             alt={hasResult ? `${source.name} enhanced` : source.name}
             className="absolute inset-0 h-full w-full object-cover"
             draggable={false}
