@@ -246,6 +246,40 @@ test.describe('Skin Enhancer panel', () => {
     await expect(page.getByTestId('skin-results').getByRole('status')).toHaveCount(2);
   });
 
+  test('a completed response with no output image is reported as a failure', async ({ page }) => {
+    // `generate_url` answers "" when it cannot sign the object, and the backend
+    // still says COMPLETED. Storing that as a result would show the user a
+    // finished run they can never open.
+    await page.route('**/api/skin-enhance', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        json: {
+          status: 'COMPLETED',
+          mode: 'faithful',
+          preset: null,
+          engine: 'gfpgan',
+          source_path: firstImage,
+          filename: 'skin_enhanced/empty.png',
+          url: '',
+          faces_enhanced: 1,
+          faces_skipped: 0,
+          image_size: [1, 1],
+          parameters: { sharpen: 40, smart_grain: 20, skin_detail: 80 },
+        },
+      });
+    });
+
+    await openPanel(page, firstImage);
+    await page.getByTestId('skin-run').click();
+
+    await expect(
+      page.locator('[data-testid^="skin-result-"]').filter({ hasText: 'failed' }),
+    ).toHaveCount(1, { timeout: 15000 });
+    await expect(page.getByText('The enhancer returned no output image.')).toBeVisible();
+    await expect(page.getByTestId('skin-fullscreen-compare')).toBeDisabled();
+  });
+
   test('closing the overlay mid-run stops the remaining requests', async ({ page }) => {
     const catalog = await apiFetchMediaCatalog('', 100);
     const source = catalog.find((a: any) => a.file_path === firstImage);
