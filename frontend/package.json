@@ -20,7 +20,8 @@
     "test:e2e:upscaler": "npx playwright test e2e/09-upscaler-before-after.spec.ts",
     "test:e2e:happy": "npx playwright test e2e/07-integration-happy-path.spec.ts",
     "test:e2e:edge": "npx playwright test e2e/08-edge-cases.spec.ts",
-    "test:e2e:upscale": "npx playwright test e2e/09-upscaler.spec.ts"
+    "test:e2e:upscale": "npx playwright test e2e/09-upscaler.spec.ts",
+    "test:e2e:skin": "npx playwright test e2e/10-skin-enhancer.spec.ts"
   },
   "dependencies": {
     "lucide-react": "^0.331.0",
