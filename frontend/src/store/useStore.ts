@@ -9,6 +9,17 @@ export interface ProviderKeyStatus {
   last4: string | null;
 }
 
+/**
+ * Asset opened in the Skin Enhancer panel from FileManager's per-asset action
+ * (#111 decision 5). Not a sidebar tab: the panel is an overlay driven by this
+ * target, and `url` (when the row has one) lets the canvas paint before the
+ * catalog read comes back.
+ */
+export interface SkinTarget {
+  path: string;
+  url?: string;
+}
+
 export interface KeyStatus {
   gemini: ProviderKeyStatus;
   elevenlabs: ProviderKeyStatus;
@@ -78,6 +89,10 @@ interface AppState {
   upscaleTarget: string | null;
   setUpscaleTarget: (path: string | null) => void;
 
+  // Skin Enhancer — file opened in the enhance panel (FileManager per-asset action)
+  skinTarget: SkinTarget | null;
+  setSkinTarget: (target: SkinTarget | null) => void;
+
   // Layout
   sidebarOpen: boolean;
   toggleSidebar: () => void;
@@ -128,6 +143,9 @@ export const useStore = create<AppState>()(
 
       upscaleTarget: null,
       setUpscaleTarget: (upscaleTarget) => set({ upscaleTarget }),
+
+      skinTarget: null,
+      setSkinTarget: (skinTarget) => set({ skinTarget }),
 
       sidebarOpen: true,
       toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
