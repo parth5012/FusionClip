@@ -1058,3 +1058,24 @@ itself: `three faces cost 3 DiffBIR loads; batching is the whole point of restor
 ### Overall Verification:
 - `cd backend && .venv/bin/python -m pytest -q -p no:cacheprovider` -> **650 passed, 18 skipped** (baseline 622/18; 28 new offline tests, no model downloads or network).
 - `compileall app tests` clean. Frontend untouched by #116; `npx tsc --noEmit` was clean while the prototype was on the branch.
+
+## 2026-09-28: Wayfinder Map #73 - Skin Enhancer UI (#137)
+
+### Status: Done
+
+### Changes & Verification:
+- **#137 - Build the Skin Enhancer UI from the approved VariantD composite**
+  - `frontend/src/utils/skin.ts` (+ `skin.test.ts`): pure contract the panel sits on — mode list with engine/budget per mode, the five verbatim Magnific presets, slider bounds, the mode-aware skin_detail meaning (post-filter vs DiffBIR guidance), payload construction, slug-based failure parsing. `isImageFile` exported from `upscale.ts` so the two action gates cannot disagree.
+  - `frontend/src/utils/api.ts`: `startSkinEnhance` (rethrows the server detail so the panel shows `no_face_detected:`-style slugs), `fetchSkinEnhanceSurface` (mode rows read engine/budget from `GET /api/skin-enhance/presets` instead of a second hardcoded copy).
+  - `frontend/src/store/useStore.ts`: `skinTarget` slice, deliberately not persisted — the panel is an overlay, not a navigation destination.
+  - `frontend/src/components/skin-enhancer/`: `SkinEnhancerPanel` (overlay orchestration, sequential run loop, surface fetch fallback), `SourceStrip` (select vs focus, explicit per-thumb x), `CompareCanvas` (pointer + keyboard split, running/focused status, honest "Enhanced N faces" chip), `ControlRail` (engine+budget mode rows, amber honest-knob box, run button/error), `ResultsTray` (amber degraded card, rose failed card with slug).
+  - `FileManager.tsx`: per-asset "Skin" icon button, images only (`disabled` on non-images), inserted after the existing Upscale action; `page.tsx` mounts `{skinTarget && <SkinEnhancerPanel />}`.
+  - `frontend/e2e/10-skin-enhancer.spec.ts` (+ `test:e2e:skin` script): 3 tests — action/panel/mode-row/preset gating, a real two-source run, and a `page.route`-intercepted completed run through `BeforeAfterModal`.
+- Decisions carried, none re-litigated: #111 mode/slide/preset/degraded contract, #113 selected≠focused and explicit x, images only, no sidebar tab.
+- **Deviation (reported):** the endpoint is synchronous with no per-face progress stream, so the composite's "Enhancing face 2 of 3" cannot be shown without inventing data. A running row states the engine and stated budget ("Enhancing · GFPGAN · ~5s/image") and the face count appears only when the response lands.
+
+### Overall Verification:
+- `cd backend && /home/parth/projects/FusionClip/.venv/bin/python -m pytest tests/ -q` -> **653 passed, 16 skipped** (skips are gfpgan/facexlib/facex introspection, no GPU host).
+- `cd frontend && npx tsc --noEmit` clean; `npx tsx --test src/utils/*.test.ts` -> **89 pass, 0 fail** (27 new skin tests, written red first).
+- E2E over the no-Docker stack (moto :9000 + uvicorn :8001 sqlite + next dev :3001, `E2E_BASE_URL`/`E2E_API_URL`): `e2e/10-skin-enhancer.spec.ts` -> **3 passed**; `e2e/09-upscaler.spec.ts` -> passed; `e2e/01-smoke-navigation.spec.ts` -> 2 failed **both before and after** the change (verified against a stashed clean tree), pre-existing and unrelated.
+- `npm run lint` not run: the repo has no lint script wired (`next lint` prompts interactively) and no ESLint config; none was created.
