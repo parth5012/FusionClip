@@ -1035,3 +1035,26 @@ itself: `three faces cost 3 DiffBIR loads; batching is the whole point of restor
 - The UI still offers Creative/Flexible on a deployment with no `DIFFBIR_REPO_PATH`; surfacing
   `diffbir_repo_configured` on `GET /api/skin-enhance/presets` remains the open follow-up from the
   previous entry.
+
+## 2026-09-28: Wayfinder Map #74 - Deep Parity: Background Remover
+
+### Status: Done
+
+### Changes & Verification:
+- **Phase 1 (HITL): #115 - Decide quality bar, output formats, UX placement**
+  - Human decided (grilling): library-only action entry (Media Library rows/cards, no editor tool until map #75); two tiers (rembg+u2net default "Fast", birefnet-general "Quality" toggle); PNG RGBA only; preview-before-accept with an additive derivative via `source_path` (original never mutated, re-run = sibling).
+  - Recorded on #115, closed, appended to map #74.
+- **Phase 1 (HITL): #117 - Prototype the remove-background UX with mask preview**
+  - Built 3 structurally different variants behind `?variant=` on the existing Media Library page (slide-over panel / modal wizard / inline strip) in `frontend/src/components/bgremove-prototype/`, read-only stub, floating switcher, served over a Cloudflare quick tunnel for remote review.
+  - Fix along the way: with no backend, FileManager's blocking "Communication error" panel hid the sample rows — the error panel now only shows when there are zero files, otherwise an amber "Backend unreachable - showing prototype sample assets" banner sits above the list.
+  - Human picked **Variant C (inline strip)**; recorded, closed, appended to map. Prototype captured on throwaway branch `proto/117-bgremove-ux` (commit `3cbd3a8`), not on main.
+- **Phase 2 (AFK): #116 - Build remove-background endpoint producing derivative asset**
+  - `POST /api/bgremove` (+ `/presets`, `/tiers`, `/status/{task_id}`) in `backend/app/routers/bgremove.py`, pipeline in `backend/app/ml/bgremove.py`.
+  - Fast tier caches the rembg ONNX session behind a lock; quality tier lazy-loads `ZhengPeng7/BiRefNet-general` through transformers and maps missing weights/deps to a typed `BgRemoveModelUnavailable` -> HTTP 200 degraded envelope (`reason=load_failed`).
+  - RGBA PNG derivative under `bg_removed/<stem>_<12hex>.png` with `source_path` lineage; blob deleted if the catalog commit fails; oversize inputs capped at 8192px; `Task.name` static `"bgremove"`; progress frames on Redis `task_updates`.
+  - Review gate: first pass **REQUEST-CHANGES** (2 blockers, 6 should-fix, 4 nits) -> all 12 fixed -> re-review **APPROVE**.
+  - Commit `b2cbe82` on branch `wf/74-116-bgremove-endpoint`.
+
+### Overall Verification:
+- `cd backend && .venv/bin/python -m pytest -q -p no:cacheprovider` -> **650 passed, 18 skipped** (baseline 622/18; 28 new offline tests, no model downloads or network).
+- `compileall app tests` clean. Frontend untouched by #116; `npx tsc --noEmit` was clean while the prototype was on the branch.
