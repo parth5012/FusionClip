@@ -56,7 +56,10 @@ export default function ResultsTray({ items, focused, onFocus, mode }: ResultsTr
                 {source.name}
               </span>
 
-              <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px]">
+              <span
+                role="status"
+                className="flex shrink-0 items-center gap-1.5 font-mono text-[10px]"
+              >
                 {status === 'completed' && (
                   <span className="inline-flex items-center gap-1 text-emerald-300">
                     <CheckCircle2 className="h-3 w-3" /> {skinItemStatusText({ status, faces: item?.faces }, mode)}
