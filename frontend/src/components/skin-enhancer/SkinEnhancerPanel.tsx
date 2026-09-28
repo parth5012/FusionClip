@@ -49,6 +49,14 @@ export default function SkinEnhancerPanel() {
   const [runError, setRunError] = useState<string | null>(null);
   const [showCompare, setShowCompare] = useState(false);
   const initializedRef = useRef<string | null>(null);
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   const loadSources = useCallback(async () => {
     setLoadingSources(true);
@@ -147,6 +155,7 @@ export default function SkinEnhancerPanel() {
     });
 
     for (const path of paths) {
+      if (!isMountedRef.current) break;
       setResults((prev) => ({ ...prev, [path]: { status: 'running' } }));
       const built = buildSkinEnhancePayload(settings, path);
       if (!built.ok) {
@@ -158,6 +167,7 @@ export default function SkinEnhancerPanel() {
       }
       try {
         const response = await startSkinEnhance(built.payload);
+        if (!isMountedRef.current) break;
         if (response.degraded) {
           setResults((prev) => ({
             ...prev,
@@ -183,11 +193,13 @@ export default function SkinEnhancerPanel() {
           }));
         }
       } catch (err) {
+        if (!isMountedRef.current) break;
         const failure = parseSkinFailure(err instanceof Error ? err.message : String(err));
         setResults((prev) => ({ ...prev, [path]: { status: 'failed', failure } }));
       }
     }
 
+    if (!isMountedRef.current) return;
     setRunning(false);
     loadSources();
   };
