@@ -241,6 +241,9 @@ test.describe('Skin Enhancer panel', () => {
 
     // The tray result thumb describes itself.
     await expect(page.getByRole('img', { name: `${firstImage} result` })).toBeAttached();
+
+    // Every row announces its own status changes: queued → running → final.
+    await expect(page.getByTestId('skin-results').getByRole('status')).toHaveCount(2);
   });
 
   test('closing the overlay mid-run stops the remaining requests', async ({ page }) => {
