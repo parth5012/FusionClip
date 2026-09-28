@@ -40,12 +40,12 @@ export default function ResultsTray({ items, focused, onFocus, mode }: ResultsTr
             >
               {status === 'completed' && item?.resultUrl ? (
                 /* eslint-disable-next-line @next/next/no-img-element */
-                <img src={item.resultUrl} alt="" className="h-7 w-7 rounded object-cover" />
+                <img src={item.resultUrl} alt={`${source.name} result`} className="h-7 w-7 rounded object-cover" />
               ) : source.url ? (
                 /* eslint-disable-next-line @next/next/no-img-element */
                 <img
                   src={source.url}
-                  alt=""
+                  alt={`${source.name} preview`}
                   className={`h-7 w-7 rounded object-cover ${status === 'running' ? '' : 'opacity-50'}`}
                 />
               ) : (
