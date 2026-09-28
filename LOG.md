@@ -1079,3 +1079,24 @@ itself: `three faces cost 3 DiffBIR loads; batching is the whole point of restor
 - `cd frontend && npx tsc --noEmit` clean; `npx tsx --test src/utils/*.test.ts` -> **89 pass, 0 fail** (27 new skin tests, written red first).
 - E2E over the no-Docker stack (moto :9000 + uvicorn :8001 sqlite + next dev :3001, `E2E_BASE_URL`/`E2E_API_URL`): `e2e/10-skin-enhancer.spec.ts` -> **3 passed**; `e2e/09-upscaler.spec.ts` -> passed; `e2e/01-smoke-navigation.spec.ts` -> 2 failed **both before and after** the change (verified against a stashed clean tree), pre-existing and unrelated.
 - `npm run lint` not run: the repo has no lint script wired (`next lint` prompts interactively) and no ESLint config; none was created.
+
+## 2026-09-28: Skin Enhancer UI review gate (#137, round 1)
+
+### Status: Done
+
+### Findings addressed (review returned Requires Changes):
+- **Major 1 - `CompareCanvas.tsx:86`**: Tailwind preflight `img { max-width: 100% }` clamped the counter-scaled before image, so it squashed inside the clip window instead of holding the canvas width. Added `max-w-none` to that one `<img>`.
+- **Major 2 - `ControlRail.tsx:79, 109, 152`**: mode buttons, the flexible-mode preset `<select>`, and the three range inputs stayed live while `running`, so the rail could claim a mode the in-flight job did not use (and later batch items took settings captured at start). All three classes now take `disabled={running}` plus a `disabled:cursor-not-allowed disabled:opacity-50` style.
+- **Major 3 - `SkinEnhancerPanel.tsx:52-58, 158, 170, 196, 202`**: closing the overlay unmounted the panel while `handleRun`'s loop kept firing sequential POSTs and writing state. Added `isMountedRef` (true on mount, false on cleanup) with `break` at the top of each iteration and after each awaited response, and a guard before the trailing `setRunning`/`loadSources`. No AbortController exists in this fetch layer, so the guard is on the loop; the backend was not touched.
+- **Minor 4 - `CompareCanvas.tsx:98, 106-107`**: `aria-orientation="horizontal"` and `Home`/`End` handling on the split divider.
+- **Minor 7 - `ResultsTray.tsx:43, 48`**: `alt=""` replaced with `${name} result` / `${name} preview`.
+- **Deliberately not fixed:** findings 5 (canvas status badge) and 6 (nested-ternary restructure) — reviewer said skip, not worth the churn now.
+
+### TDD note:
+- New assertions were written first and run red: suite 10 test 3 failed on `toBeDisabled` (controls live mid-run) and test 4 failed with `posted` length 2 after close (loop kept going). Both green after the fixes.
+- There is no React DOM harness in this repo (no testing-library/vitest/jsdom), so the DOM-level coverage lives in Playwright rather than in a component unit test; the `max-w-none` check is a class-level guard, since the squash itself is visual.
+
+### Verification:
+- `cd backend && /home/parth/projects/FusionClip/.venv/bin/python -m pytest tests/ -q` -> **653 passed, 16 skipped**.
+- `cd frontend && npx tsc --noEmit` clean; `npx tsx --test src/utils/*.test.ts` -> **89 pass, 0 fail**.
+- `npx playwright test e2e/10-skin-enhancer.spec.ts` -> **4 passed** (was 3; test 4 added for the unmount stop).
