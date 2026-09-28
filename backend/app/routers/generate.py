@@ -97,7 +97,7 @@ def _validate_aspect_ratio(val: Optional[str]) -> None:
         )
 
 
-SAFE_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9._/-]+$")
+SAFE_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9._/()-]+$")
 
 
 def _validate_safe_reference(val: Optional[str], param_name: str = "reference") -> None:

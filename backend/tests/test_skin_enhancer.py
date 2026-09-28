@@ -546,6 +546,31 @@ class TestRequestValidation:
             res = client.post("/api/skin-enhance", json={"image_path": bad})
             assert res.status_code == 400, f"{bad!r} was accepted"
 
+    def test_parenthesised_filename_is_accepted_and_traversal_is_still_refused(
+        self, client, monkeypatch, stub_storage
+    ):
+        """Uploads keep the caller's filename as the object key
+        (`storage.py` builds `f"{folder_prefix}/{file.filename}"`), so
+        `portrait (1).png` is a real, clickable catalog row. Spaces were already
+        carved out of the shared character class for exactly that reason;
+        parentheses are the same case, and the per-asset Skin action 400s them
+        today. Traversal rules must not move with them."""
+        stub_storage["uploaded"]["uploads/portrait (1).png"] = {
+            "data": png_bytes(),
+            "content_type": "image/png",
+        }
+        _install_engine(monkeypatch, FakeFaceEngine())
+
+        res = client.post(
+            "/api/skin-enhance", json={"image_path": "uploads/portrait (1).png"}
+        )
+        assert res.status_code == 200, res.text
+        assert res.json()["source_path"] == "uploads/portrait (1).png"
+
+        for bad in ("../../etc/passwd", "/etc/passwd", "..\\secret.png", "uploads/../(x).png"):
+            res = client.post("/api/skin-enhance", json={"image_path": bad})
+            assert res.status_code == 400, f"{bad!r} was accepted"
+
     def test_missing_image_path_is_a_client_error(self, client):
         """image_path is required, so an empty body never reaches the enhancer."""
         res = client.post("/api/skin-enhance", json={})
