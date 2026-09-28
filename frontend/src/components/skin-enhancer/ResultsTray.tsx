@@ -38,19 +38,25 @@ export default function ResultsTray({ items, focused, onFocus, mode }: ResultsTr
                   : 'border-slate-800 hover:border-slate-700'
               }`}
             >
-              {status === 'completed' && item?.resultUrl ? (
-                /* eslint-disable-next-line @next/next/no-img-element */
-                <img src={item.resultUrl} alt={`${source.name} result`} className="h-7 w-7 rounded object-cover" />
-              ) : source.url ? (
-                /* eslint-disable-next-line @next/next/no-img-element */
-                <img
-                  src={source.url}
-                  alt={`${source.name} preview`}
-                  className={`h-7 w-7 rounded object-cover ${status === 'running' ? '' : 'opacity-50'}`}
-                />
-              ) : (
-                <span className="h-7 w-7 rounded bg-slate-950" />
-              )}
+              {(() => {
+                if (status === 'completed' && item?.resultUrl) {
+                  return (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img src={item.resultUrl} alt={`${source.name} result`} className="h-7 w-7 rounded object-cover" />
+                  );
+                }
+                if (source.url) {
+                  return (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img
+                      src={source.url}
+                      alt={`${source.name} preview`}
+                      className={`h-7 w-7 rounded object-cover ${status === 'running' ? '' : 'opacity-50'}`}
+                    />
+                  );
+                }
+                return <span className="h-7 w-7 rounded bg-slate-950" />;
+              })()}
 
               <span className="min-w-0 flex-1 truncate text-[11px] text-slate-300">
                 {source.name}

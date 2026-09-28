@@ -232,7 +232,7 @@ export default function SkinEnhancerPanel() {
     ? Object.keys(surface.presets).map((id) => ({
         id,
         label: id,
-        blurb: surface.presets[id].description,
+        blurb: surface.presets[id]?.description ?? '',
       }))
     : undefined;
 
