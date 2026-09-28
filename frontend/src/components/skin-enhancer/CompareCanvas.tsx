@@ -83,7 +83,7 @@ export default function CompareCanvas({ source, item, statusText }: CompareCanva
             <img
               src={beforeUrl}
               alt={`${source.name} before`}
-              className="h-full object-cover"
+              className="h-full max-w-none object-cover"
               style={{ width: `${(100 / clip) * 100}%` }}
               draggable={false}
             />
@@ -95,6 +95,7 @@ export default function CompareCanvas({ source, item, statusText }: CompareCanva
             role="slider"
             tabIndex={0}
             aria-label="Before after split"
+            aria-orientation="horizontal"
             aria-valuemin={0}
             aria-valuemax={100}
             aria-valuenow={Math.round(split)}
@@ -102,6 +103,8 @@ export default function CompareCanvas({ source, item, statusText }: CompareCanva
             onKeyDown={(e) => {
               if (e.key === 'ArrowLeft') setSplit((v) => Math.max(0, v - 4));
               if (e.key === 'ArrowRight') setSplit((v) => Math.min(100, v + 4));
+              if (e.key === 'Home') setSplit(0);
+              if (e.key === 'End') setSplit(100);
             }}
             className="absolute inset-y-0 z-10 w-0.5 cursor-ew-resize bg-amber-300/90"
             style={{ left: `${split}%` }}
