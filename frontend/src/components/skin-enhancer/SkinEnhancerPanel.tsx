@@ -181,6 +181,18 @@ export default function SkinEnhancerPanel() {
               },
             },
           }));
+        } else if (!response.url) {
+          setResults((prev) => ({
+            ...prev,
+            [path]: {
+              status: 'failed',
+              failure: {
+                slug: null,
+                message: 'No output URL returned.',
+                human: 'The enhancer returned no output image.',
+              },
+            },
+          }));
         } else {
           setResults((prev) => ({
             ...prev,
