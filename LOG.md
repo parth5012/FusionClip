@@ -1121,3 +1121,23 @@ itself: `three faces cost 3 DiffBIR loads; batching is the whole point of restor
 - `cd backend && /home/parth/projects/FusionClip/.venv/bin/python -m pytest tests/ -q` -> **654 passed, 16 skipped** (was 653).
 - `cd frontend && npx tsc --noEmit` clean; `npx tsx --test src/utils/*.test.ts` -> **89 pass, 0 fail**.
 - `E2E_BASE_URL=http://localhost:3001 E2E_API_URL=http://localhost:8001 npx playwright test e2e/10-skin-enhancer.spec.ts` -> **5 passed**.
+
+## 2026-09-28: OCR review round on PR #140 (map #73)
+
+### Status: Done
+
+### Scope
+- `ocr review --audience agent --from origin/main --to t3code/328a3246` over the Skin Enhancer UI branch: 19 files changed (+1960/−5), 14 reviewed (`.md` and test files excluded by default path rules).
+- Session `5d33754c-c213-40a8-8358-bd35b37eb382`, output `/tmp/opencode/ocr140.json`, exit 0, ~2m40s, 669,906 tokens.
+- Result: **0 critical, 0 high, 3 medium**, no lows.
+
+### Findings — all three applied
+- `ResultsTray.tsx:41-53` [style] — nested ternary thumbnail branch → IIFE with early returns (same ask CodeRabbit made and was parked earlier; applied this time on request).
+- `SourceStrip.tsx:48-54` [style] — flat indentation for the focus/selected/unselected border ternary.
+- `SkinEnhancerPanel.tsx:231-237` [maintainability] — `surface.presets[id]?.description ?? ''` instead of a bare index read.
+
+### Verification
+- `cd frontend && npx tsc --noEmit` clean; `npx tsx --test src/utils/*.test.ts` -> **89 pass, 0 fail**.
+- `E2E_BASE_URL=http://localhost:3001 E2E_API_URL=http://localhost:8001 npx playwright test e2e/10-skin-enhancer.spec.ts` -> **5 passed**.
+- Backend untouched by this round; last full run stands at 654 passed / 16 skipped.
+- `git status --porcelain` was clean before the review (read-only), changes confined to the three files above.
