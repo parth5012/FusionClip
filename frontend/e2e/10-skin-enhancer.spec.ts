@@ -280,6 +280,75 @@ test.describe('Skin Enhancer panel', () => {
     await expect(page.getByTestId('skin-fullscreen-compare')).toBeDisabled();
   });
 
+  test('a run whose source has no url still shows the enhanced image', async ({ page }) => {
+    const catalog = await apiFetchMediaCatalog('', 100);
+    const source = catalog.find((a: any) => a.file_path === firstImage);
+    expect(source).toBeTruthy();
+
+    // A catalog row can arrive without a url (expired signature, never minted).
+    // There is nothing to preview *from*, but the run's own output is still
+    // what the canvas has to show — an empty before must not blank the after.
+    await page.route('**/api/media*', async (route) => {
+      const response = await fetch(route.request().url());
+      const body = (await response.json()) as any[];
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(
+          body.map((asset) => (asset.file_path === firstImage ? { ...asset, url: '' } : asset)),
+        ),
+      });
+    });
+
+    // FileManager reads the row from the storage listing, and that is what it
+    // hands the panel as the run target — so the url has to go there too.
+    await page.route('**/api/storage/list*', async (route) => {
+      const response = await fetch(route.request().url());
+      const body = (await response.json()) as { files: any[]; directories: any[] };
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ...body,
+          files: (body.files ?? []).map((file) =>
+            file.name === firstImage ? { ...file, url: '' } : file,
+          ),
+        }),
+      });
+    });
+
+    await page.route('**/api/skin-enhance', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        json: {
+          status: 'COMPLETED',
+          mode: 'faithful',
+          preset: null,
+          engine: 'gfpgan',
+          source_path: firstImage,
+          filename: 'skin_enhanced/no-source-url.png',
+          url: source.url,
+          faces_enhanced: 1,
+          faces_skipped: 0,
+          image_size: [1, 1],
+          parameters: { sharpen: 40, smart_grain: 20, skin_detail: 80 },
+        },
+      });
+    });
+
+    await openPanel(page, firstImage);
+    await page.getByTestId('skin-run').click();
+
+    await expect(
+      page.getByTestId('skin-canvas').locator('img[alt$=" enhanced"]'),
+    ).toBeVisible({ timeout: 15000 });
+    await expect(page.getByTestId('skin-canvas').locator('img[alt$=" enhanced"]')).toHaveAttribute(
+      'src',
+      source.url,
+    );
+  });
+
   test('closing the overlay mid-run stops the remaining requests', async ({ page }) => {
     const catalog = await apiFetchMediaCatalog('', 100);
     const source = catalog.find((a: any) => a.file_path === firstImage);
