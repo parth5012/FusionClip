@@ -13,10 +13,15 @@ export const MAX_BULK_QUEUE = 8;
 
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'];
 
-/** True when a storage object name is an image the upscaler can process. */
-export function isUpscalableImage(name: string): boolean {
+/** True when a storage object name is an image file (both heavy jobs are images-only). */
+export function isImageFile(name: string): boolean {
   const ext = name.split('.').pop()?.toLowerCase() ?? '';
   return IMAGE_EXTENSIONS.includes(ext);
+}
+
+/** True when a storage object name is an image the upscaler can process. */
+export function isUpscalableImage(name: string): boolean {
+  return isImageFile(name);
 }
 
 /** '4x' -> 4 for the POST /api/upscale payload. */
