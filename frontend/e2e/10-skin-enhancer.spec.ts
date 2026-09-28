@@ -166,16 +166,16 @@ test.describe('Skin Enhancer panel', () => {
 
     await page.route('**/api/skin-enhance', async (route) => {
       const body = route.request().postDataJSON() as { image_path: string };
-      // Hold the response long enough to observe the in-flight progress line.
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Hold the response long enough to observe the in-flight controls.
+      await new Promise((resolve) => setTimeout(resolve, 2500));
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
         json: {
           status: 'COMPLETED',
-          mode: 'faithful',
-          preset: null,
-          engine: 'gfpgan',
+          mode: 'flexible',
+          preset: 'enhance_skin',
+          engine: 'diffbir',
           source_path: body.image_path,
           filename: 'skin_enhanced/stub.png',
           url: source.url,
@@ -191,13 +191,25 @@ test.describe('Skin Enhancer panel', () => {
     await page.locator(`button:has(img[alt="${secondImage}"])`).click();
     await expect(page.getByText(/2 selected/).first()).toBeVisible();
 
+    // Flexible mode so the preset select is on screen while the job runs.
+    await page.getByTestId('skin-mode-flexible').click();
     await page.getByTestId('skin-run').click();
 
     // In flight: the row states the engine and the stated per-image budget —
     // no invented percentage, no invented face index (#111 decision 7).
-    await expect(page.getByText('Enhancing · GFPGAN · ~5s/image').first()).toBeVisible({
+    await expect(page.getByText('Enhancing · DiffBIR · ~60s/image').first()).toBeVisible({
       timeout: 10000,
     });
+
+    // Every control that feeds the in-flight job is locked for its duration, so
+    // the rail cannot claim a mode the running request did not use.
+    await expect(page.getByTestId('skin-mode-faithful')).toBeDisabled();
+    await expect(page.getByTestId('skin-mode-creative')).toBeDisabled();
+    await expect(page.getByTestId('skin-mode-flexible')).toBeDisabled();
+    await expect(page.getByTestId('skin-preset')).toBeDisabled();
+    await expect(page.locator('#skin-slider-sharpen')).toBeDisabled();
+    await expect(page.locator('#skin-slider-smartGrain')).toBeDisabled();
+    await expect(page.locator('#skin-slider-skinDetail')).toBeDisabled();
 
     await expect(
       page.locator('[data-testid^="skin-result-"]').filter({ hasText: 'Enhanced 2 faces' }),
@@ -212,5 +224,72 @@ test.describe('Skin Enhancer panel', () => {
     await expect(page.getByText('Enhanced', { exact: true })).toBeVisible();
     await page.keyboard.press('Escape');
     await expect(page.getByText('Before', { exact: true })).not.toBeVisible({ timeout: 5000 });
+
+    // Split divider: horizontal slider with keyboard bounds from the ends.
+    const split = page.getByTestId('skin-split');
+    await expect(split).toHaveAttribute('aria-orientation', 'horizontal');
+    await split.focus();
+    await page.keyboard.press('End');
+    await expect(split).toHaveAttribute('aria-valuenow', '100');
+    await page.keyboard.press('Home');
+    await expect(split).toHaveAttribute('aria-valuenow', '0');
+
+    // The counter-scaled before layer opts out of preflight's img max-width.
+    await expect(page.getByTestId('skin-canvas').locator('img[alt$=" before"]')).toHaveClass(
+      /max-w-none/,
+    );
+
+    // The tray result thumb describes itself.
+    await expect(page.getByRole('img', { name: `${firstImage} result` })).toBeAttached();
+  });
+
+  test('closing the overlay mid-run stops the remaining requests', async ({ page }) => {
+    const catalog = await apiFetchMediaCatalog('', 100);
+    const source = catalog.find((a: any) => a.file_path === firstImage);
+    expect(source).toBeTruthy();
+
+    const posted: string[] = [];
+    await page.route('**/api/skin-enhance', async (route) => {
+      if (route.request().method() === 'POST') {
+        const body = route.request().postDataJSON() as { image_path: string };
+        posted.push(body.image_path);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        json: {
+          status: 'COMPLETED',
+          mode: 'faithful',
+          preset: null,
+          engine: 'gfpgan',
+          source_path: 'closed.png',
+          filename: 'skin_enhanced/closed.png',
+          url: source.url,
+          faces_enhanced: 1,
+          faces_skipped: 0,
+          image_size: [1, 1],
+          parameters: { sharpen: 40, smart_grain: 20, skin_detail: 80 },
+        },
+      });
+    });
+
+    await openPanel(page, firstImage);
+    await page.locator(`button:has(img[alt="${secondImage}"])`).click();
+    await expect(page.getByText(/2 selected/).first()).toBeVisible();
+
+    await page.getByTestId('skin-run').click();
+    await expect(page.getByText('Enhancing · GFPGAN · ~5s/image').first()).toBeVisible({
+      timeout: 10000,
+    });
+    await expect(posted).toHaveLength(1);
+
+    // Close while the first request is still in flight: the loop must not fire
+    // the second request or write results into an unmounted panel.
+    await page.getByRole('button', { name: 'Close skin enhancer' }).click();
+    await expect(page.getByTestId('skin-enhancer-panel')).not.toBeVisible();
+
+    await page.waitForTimeout(4000);
+    expect(posted).toHaveLength(1);
   });
 });
