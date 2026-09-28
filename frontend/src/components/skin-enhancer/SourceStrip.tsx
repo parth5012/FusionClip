@@ -49,8 +49,8 @@ export default function SourceStrip({
               isFocus
                 ? 'border-sky-400'
                 : isSelected
-                  ? 'border-amber-400'
-                  : 'border-slate-800 opacity-60 hover:opacity-100'
+                ? 'border-amber-400'
+                : 'border-slate-800 opacity-60 hover:opacity-100'
             }`}
           >
             <button
