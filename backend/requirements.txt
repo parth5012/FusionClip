@@ -63,3 +63,10 @@ basicsr>=1.4.2
 # regex, numpy, scipy, Pillow.
 #
 # See LEARNINGS.md, "DiffBIR is a repository, not a library".
+
+# --- Background removal (app/ml/bgremove.py) ----------------------------------
+# rembg with u2net (Apache-2.0, default Fast tier).
+# Quality tier uses birefnet-general (MIT, best hair/soft edges).
+rembg>=2.0.50
+onnxruntime>=1.16.0
+
