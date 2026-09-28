@@ -4,6 +4,7 @@ import {
 } from './tunnel';
 import type { TunnelStatus } from './tunnel';
 import { buildMediaCatalogUrl } from './tags';
+import type { SkinEnhancePayload } from './skin';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -995,5 +996,88 @@ export async function startVideoGeneration(
   });
   const url = `${API_BASE_URL}/api/generate/video?${params.toString()}`;
   return postGenerate<GenerateVideoResponse>(url, 'Video generation failed');
+}
+
+/* ── Skin Enhancer API (#112 endpoint, panel #137) ────────────────────── */
+
+/**
+ * 200 body of POST /api/skin-enhance.
+ *
+ * Either a COMPLETED result (engine, output url, face count, source_path
+ * lineage) or the labeled degraded envelope (degraded + reason + message) the
+ * backend answers with when this host cannot run the job. Refusals that are the
+ * caller's fault are HTTP 400 and arrive as a thrown Error whose message is the
+ * backend `detail`, which carries a reason slug.
+ */
+export interface SkinEnhanceResponse {
+  status?: string;
+  degraded?: boolean;
+  reason?: string;
+  message?: string;
+  model_id?: string | null;
+  vram_required_gb?: number | null;
+  vram_available_gb?: number | null;
+  mode?: string;
+  preset?: string | null;
+  engine?: string;
+  source_path?: string;
+  filename?: string;
+  url?: string;
+  faces_enhanced?: number;
+  faces_skipped?: number;
+  image_size?: number[];
+  parameters?: Record<string, unknown>;
+}
+
+export interface SkinEnhancePresetDefinition {
+  prompt: string;
+  guidance_scale: number;
+  condition_noise: number;
+  description: string;
+}
+
+/** GET /api/skin-enhance/presets — the endpoint's own description of its inputs. */
+export interface SkinEnhanceSurface {
+  modes: string[];
+  default_mode: string;
+  engines: Record<string, string>;
+  presets: Record<string, SkinEnhancePresetDefinition>;
+  default_preset: string;
+  sliders: Record<string, { min: number; max: number; default: number }>;
+  skin_detail_semantics: Record<string, string>;
+  max_input_dimension: number;
+  min_face_dimension: number;
+  video_supported: boolean;
+  faces_only: boolean;
+}
+
+/** Read the endpoint's input surface (modes, presets, slider ranges). */
+export async function fetchSkinEnhanceSurface(): Promise<SkinEnhanceSurface> {
+  const res = await fetch(`${API_BASE_URL}/api/skin-enhance/presets`);
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Failed to fetch skin enhance presets'));
+  }
+  return res.json();
+}
+
+/**
+ * Run one portrait through POST /api/skin-enhance.
+ *
+ * Synchronous by design: the response is the result (or the degraded envelope,
+ * or a thrown 400 detail). The panel therefore drives its per-item progress
+ * from request start/end rather than from a progress channel.
+ */
+export async function startSkinEnhance(
+  payload: SkinEnhancePayload,
+): Promise<SkinEnhanceResponse> {
+  const res = await fetch(`${API_BASE_URL}/api/skin-enhance`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    throw new Error(await readErrorDetail(res, 'Skin enhance request failed'));
+  }
+  return res.json();
 }
 
