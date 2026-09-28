@@ -13,6 +13,8 @@ import {
   startBatchExport, triggerDownload
 } from '../utils/api';
 import { isUpscalableImage } from '../utils/upscale';
+import { isSkinEnhanceableImage } from '../utils/skin';
+import { useStore } from '../store/useStore';
 
 const UPSCALE_SCALES = [2, 4, 8, 16] as const;
 const UPSCALE_PRESETS = [
@@ -33,6 +35,7 @@ const UPSCALE_CATEGORIES = [
 import UpscalerPanel from './UpscalerPanel';
 
 export default function FileManager() {
+  const { setSkinTarget } = useStore();
   const [currentDir, setCurrentDir] = useState<string>('');
   const [directories, setDirectories] = useState<StorageItem[]>([]);
   const [files, setFiles] = useState<StorageItem[]>([]);
@@ -899,6 +902,29 @@ export default function FileManager() {
                           : 'Upscale supports image files only'
                       }                    >
                       <Cpu className={`w-3 h-3 ${isUpscalableImage(file.name) ? 'text-emerald-500' : 'text-slate-600'}`} /> Upscale
+                    </button>
+                    <div className="w-[1px] h-3.5 bg-slate-850" />
+                    <button
+                      onClick={() => {
+                        if (isSkinEnhanceableImage(file.name)) {
+                          setSkinTarget({ path: file.path, url: file.url });
+                        }
+                      }}
+                      disabled={!isSkinEnhanceableImage(file.name)}
+                      aria-disabled={!isSkinEnhanceableImage(file.name)}
+                      aria-label={`Skin enhance ${file.name}`}
+                      className={`text-xs p-1 px-1.5 rounded flex items-center gap-1 transition ${
+                        isSkinEnhanceableImage(file.name)
+                          ? 'text-slate-300 hover:bg-slate-800 hover:text-amber-400'
+                          : 'opacity-50 cursor-not-allowed text-slate-500'
+                      }`}
+                      title={
+                        isSkinEnhanceableImage(file.name)
+                          ? 'Skin Enhancer — face-crop restore (images only)'
+                          : 'Skin Enhancer supports image files only'
+                      }
+                    >
+                      <Sparkles className={`w-3 h-3 ${isSkinEnhanceableImage(file.name) ? 'text-amber-400' : 'text-slate-600'}`} /> Skin
                     </button>
                     {isVideoFile(file.name) && (
                       <>

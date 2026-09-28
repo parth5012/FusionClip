@@ -12,10 +12,11 @@ import PlayersPanel from '../components/PlayersPanel';
 import MonitorPanel from '../components/MonitorPanel';
 import UpscalePanel from '../components/UpscalePanel';
 import QueueDashboard from '../components/QueueDashboard';
+import SkinEnhancerPanel from '../components/skin-enhancer/SkinEnhancerPanel';
 import { useStore } from '../store/useStore';
 
 export default function Home() {
-  const { activeTab, sidebarOpen } = useStore();
+  const { activeTab, sidebarOpen, skinTarget } = useStore();
 
   const renderContent = () => {
     switch (activeTab) {
@@ -77,6 +78,9 @@ export default function Home() {
           <p>FusionClip open-source multimedia dashboard. All rights reserved © 2026.</p>
         </footer>
       </div>
+
+      {/* Skin Enhancer opens as an overlay from FileManager's per-asset action (#111 decision 5) */}
+      {skinTarget && <SkinEnhancerPanel />}
     </div>
   );
 }
