@@ -12,6 +12,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite://")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("CORS_ORIGINS", "http://localhost:3000")
 os.environ.setdefault("FUSIONCLIP_SECRET_KEY", "unit-test-master-key")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import fakeredis  # noqa: E402
 import pytest  # noqa: E402
@@ -125,6 +126,8 @@ def stub_storage(monkeypatch):
         "app.ml.audio",
         "app.ml.video",
         "app.ml.skin_enhancer",
+        "app.ml.bgremove",
+        "app.routers.bgremove",
     ):
         for name, impl in (
             ("upload_object", _upload_object),
@@ -149,6 +152,7 @@ def stub_redis(monkeypatch, fake_redis):
     monkeypatch.setattr("app.routers.upscale.redis_client", fake_redis, raising=False)
     monkeypatch.setattr("app.services.upscaler.redis_client", fake_redis, raising=False)
     monkeypatch.setattr("app.tasks.redis_client", fake_redis, raising=False)
+    monkeypatch.setattr("app.ml.bgremove.redis_client", fake_redis, raising=False)
     return fake_redis
 
 
