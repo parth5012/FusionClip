@@ -26,7 +26,7 @@ export default function VariantA({
             onClick={() => setRecipe({ ...recipe, showBeforeAfter: !recipe.showBeforeAfter })}
             className="text-[11px] px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200"
           >
-            {recipe.showBeforeAfter ? 'After (filtered)' : 'Before (original)'} — toggle
+            {recipe.showBeforeAfter ? 'Before (original)' : 'After (filtered)'} — toggle
           </button>
         </div>
         <div className="aspect-[16/10] rounded-lg overflow-hidden border border-slate-700 bg-slate-950 flex items-center justify-center">
