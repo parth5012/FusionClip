@@ -108,4 +108,20 @@ describe('editor recipe contract (#121)', () => {
     assert.equal(isDefaultRecipe(DEFAULT_RECIPE), true);
     assert.equal(isDefaultRecipe({ ...DEFAULT_RECIPE, shadows: 1 }), false);
   });
+
+  it('accepts the snake_case crop_aspect wire alias (HIGH-01)', () => {
+    const res = validateRecipe({ crop_aspect: '16:9' } as never);
+    assert.equal(res.ok, true);
+    if (res.ok) assert.equal(res.recipe.cropAspect, '16:9');
+    // camelCase still wins when both keys are present.
+    const both = validateRecipe({ cropAspect: '1:1', crop_aspect: '4:3' } as never);
+    assert.equal(both.ok, true);
+    if (both.ok) assert.equal(both.recipe.cropAspect, '1:1');
+  });
+
+  it('floors grain in the ffmpeg mapping to match backend int() (LOW-02)', () => {
+    // grain=2 -> 0.5 noise steps: round() would give 1, int()/floor() gives 0.
+    const half = recipeToFfmpegFilter({ ...DEFAULT_RECIPE, grain: 2 });
+    assert.match(half, /noise=alls=0:allf=t/);
+  });
 });

@@ -69,6 +69,9 @@ const KNOWN_KEYS: readonly string[] = [
   ...SLIDERS.map((s) => s.key),
   'rotate',
   'cropAspect',
+  // HIGH-01 (#121 review): accept the snake_case wire alias the backend
+  // canonical recipe uses (`crop_aspect`). The client type stays camelCase.
+  'crop_aspect',
 ];
 
 function sliderError(name: string, value: unknown, min: number, max: number): string | null {
@@ -117,8 +120,10 @@ export function validateRecipe(raw: unknown): RecipeValidation {
     if (error) return { ok: false, field: 'rotate', error };
     recipe.rotate = input.rotate as number;
   }
-  if ('cropAspect' in input) {
-    const aspect = input.cropAspect as string;
+  if ('cropAspect' in input || 'crop_aspect' in input) {
+    // HIGH-01: accept either casing on the wire; camelCase wins when both
+    // are present (the client type is camelCase, the backend is snake_case).
+    const aspect = (input.cropAspect ?? input.crop_aspect) as string;
     if (!CROP_ASPECTS.includes(aspect as CropAspect)) {
       return { ok: false, field: 'cropAspect', error: `Invalid cropAspect '${aspect}': must be one of ${CROP_ASPECTS.join(', ')}.` };
     }
@@ -152,7 +157,9 @@ export function recipeToFfmpegFilter(r: EditorRecipe): string {
     `eq=brightness=${brightness.toFixed(4)}:contrast=${contrast.toFixed(4)}:saturation=${saturation.toFixed(4)}`,
   ];
   if (r.tint) parts.push(`hue=h=${(r.tint / 4).toFixed(1)}`);
-  if (r.grain) parts.push(`noise=alls=${Math.round((r.grain / 100) * 25)}:allf=t`);
+  // LOW-02 (#121 review): floor-to-match-backend — the backend truncates with
+  // int(), so Math.floor keeps the ffmpeg preview mapping in lockstep.
+  if (r.grain) parts.push(`noise=alls=${Math.floor((r.grain / 100) * 25)}:allf=t`);
   return parts.join(',');
 }
 
@@ -227,10 +234,12 @@ export async function saveEditorRecipe(
   sourcePath: string,
   recipe: EditorRecipe,
 ): Promise<EditorSaveResponse> {
+  // HIGH-01: send the snake_case alias the backend canonical recipe requires.
+  const wireRecipe = { ...recipe, crop_aspect: recipe.cropAspect };
   const res = await fetch(`${API_BASE_URL}/api/editor/recipe`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source_path: sourcePath, recipe }),
+    body: JSON.stringify({ source_path: sourcePath, recipe: wireRecipe }),
   });
   if (!res.ok) throw new Error(await readEditorError(res, 'Failed to save edit recipe'));
   return res.json();
@@ -251,10 +260,12 @@ export async function renderEditorImage(
   sourcePath: string,
   recipe: EditorRecipe,
 ): Promise<EditorRenderResponse> {
+  // HIGH-01: send the snake_case alias the backend canonical recipe requires.
+  const wireRecipe = { ...recipe, crop_aspect: recipe.cropAspect };
   const res = await fetch(`${API_BASE_URL}/api/editor/render`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source_path: sourcePath, recipe }),
+    body: JSON.stringify({ source_path: sourcePath, recipe: wireRecipe }),
   });
   if (!res.ok) throw new Error(await readEditorError(res, 'Failed to render edit'));
   return res.json();

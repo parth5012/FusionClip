@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session
 from app.models import MediaAsset
 from app.services.embedding import get_embedding
 from app.storage import (
+    delete_object,
     download_object,
     generate_url,
     list_workspace_files,
@@ -159,6 +160,14 @@ def normalize_recipe(raw: Any) -> Dict[str, Any]:
             status_code=400,
             detail=f"Invalid recipe {raw!r}: must be a JSON object of op names to integers.",
         )
+    # HIGH-01 (#121 review): accept the camelCase wire alias the frontend
+    # EditorRecipe type uses (`cropAspect`). Map it to the snake_case
+    # canonical key before the unknown-key check, then drop the alias so a
+    # body sending both keys is still accepted.
+    if isinstance(raw, dict) and "cropAspect" in raw:
+        if "crop_aspect" not in raw:
+            raw = {**raw, "crop_aspect": raw["cropAspect"]}
+        raw = {k: v for k, v in raw.items() if k != "cropAspect"}
     known = set(ADJUST_OPS) | {"rotate", "crop_aspect"}
     unknown = sorted(k for k in raw if k not in known)
     if unknown:
@@ -435,8 +444,14 @@ _UNSAFE_STEM_CHARS = __import__("re").compile(r"[^A-Za-z0-9._-]+")
 
 
 def _sanitize_stem(source_path: str) -> str:
-    stem = _UNSAFE_STEM_CHARS.sub("_", Path(source_path).stem).strip("._")
-    return stem or "edited"
+    base = _UNSAFE_STEM_CHARS.sub("_", Path(source_path).stem).strip("._")
+    base = base or "edited"
+    # LOW-03 (#121 review): incorporate a short hash of the full source path
+    # so `uploads/a.png` and `other/a.png` do not share a version stem.
+    # Version listing still filters by full source_path (see
+    # list_editor_recipes), so this only isolates counting/naming.
+    path_hash = hashlib.sha256(source_path.encode("utf-8")).hexdigest()[:8]
+    return f"{base}_{path_hash}"
 
 
 def _existing_recipe_versions(source_path: str) -> List[int]:
@@ -633,6 +648,16 @@ def run_editor_render(
     ).encode("utf-8")
     if not upload_object(sidecar, recipe_key, content_type="application/json"):
         logger.error(f"Image editor: rendered '{filename}' but recipe sidecar failed")
+        # MED-01 (#121 review): compensating delete — the PNG is already in
+        # storage, so remove it before raising. Upload-then-commit pattern
+        # (see LEARNINGS.md): delete in its own try/except, log a warning,
+        # never swallow the original exception.
+        try:
+            delete_object(filename)
+        except Exception as del_err:
+            logger.warning(
+                f"Image editor: failed to delete orphaned render '{filename}': {del_err}"
+            )
         raise HTTPException(
             status_code=500,
             detail="storage_write_failed: Rendered the image but could not persist its edit recipe.",
@@ -656,6 +681,16 @@ def run_editor_render(
         except Exception as exc:
             logger.error(f"Image editor: failed to save edited asset: {exc}")
             db.rollback()
+            # MED-01 (#121 review): commit failure leaves both the PNG and the
+            # sidecar orphaned — delete both, each guarded so cleanup never
+            # masks the original catalog error.
+            for orphan_key in (filename, recipe_key):
+                try:
+                    delete_object(orphan_key)
+                except Exception as del_err:
+                    logger.warning(
+                        f"Image editor: failed to delete orphaned key '{orphan_key}': {del_err}"
+                    )
             raise HTTPException(
                 status_code=500,
                 detail=f"catalog_write_failed: Failed to save the edited asset: {exc}",
