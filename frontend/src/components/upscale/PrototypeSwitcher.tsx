@@ -7,12 +7,15 @@ interface PrototypeSwitcherProps {
   variants: { id: string; name: string }[];
   current: string;
   onSelect: (variant: string) => void;
+  /** Overrides the badge copy. Defaults to the #95 upscaler prototype label. */
+  badge?: string;
 }
 
 export default function PrototypeSwitcher({
   variants,
   current,
   onSelect,
+  badge = 'UI Prototype (#95)',
 }: PrototypeSwitcherProps) {
   const currentIndex = variants.findIndex((v) => v.id === current);
 
@@ -47,13 +50,16 @@ export default function PrototypeSwitcher({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [currentIndex, variants]);
 
+  // A stray prototype merge must never ship the evaluation bar to users.
+  if (process.env.NODE_ENV === 'production') return null;
+
   return (
     <aside
       aria-label="Prototype switcher"
       className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-slate-900/95 border border-sky-500/50 shadow-2xl shadow-sky-950/50 px-4 py-2 rounded-full backdrop-blur-md text-xs"
     >
       <span className="text-[10px] uppercase font-bold tracking-wider text-sky-400 bg-sky-950/60 border border-sky-800/60 px-2 py-0.5 rounded-full">
-        UI Prototype (#95)
+        {badge}
       </span>
       <button
         onClick={prev}
