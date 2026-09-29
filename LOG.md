@@ -1161,3 +1161,59 @@ itself: `three faces cost 3 DiffBIR loads; batching is the whole point of restor
 ### Verification
 - `npx tsc --noEmit` clean; unit **89 pass / 0 fail**; `e2e/10-skin-enhancer.spec.ts` -> **6 passed** (was 5).
 - Backend untouched this round; last full run stands at 654 passed / 16 skipped.
+
+## 2026-09-29: Wayfinder Map #75 - Image Editor apply/export pipeline (#121)
+
+### Iteration Status: Done
+
+- **#121 Implement apply/export pipeline and wire Adjust panel (AFK)**
+  - Followed locked decisions: hybrid recipe-JSON source of truth (#118),
+    v1 scope Adjust 7 ops + crop/rotate, non-destructive param stacks,
+    ~50 zustand undo snapshots, dedicated route /editor/[id] (#119), and the
+    approved Variant A right-panel layout as a guide only — the #120
+    prototype (editor-prototype/) is untouched, production code is new.
+  - **Backend** (`app/ml/image_adjust.py`, `app/routers/editor.py`):
+    - `GET /api/editor/presets` (version, slider/rotate ranges, crop aspects,
+      composition order), `POST /api/editor/recipe` (versioned sidecars
+      `edits/<stem>_recipe_vN_<token>.json`, monotonic versions via listing),
+      `GET /api/editor/recipes` (reload leg, oldest first),
+      `POST /api/editor/render` (synchronous PIL authoritative render to
+      `edited/<stem>_edit_<token>.png` + co-saved recipe sidecar +
+      `MediaAsset.source_path` lineage row).
+    - Validation is 400 with reason slugs (out-of-range/fractional/unknown
+      key/bad crop+rotate/traversal/video/missing source), never a clamp.
+    - Pipeline order crop→rotate→tone→grain; no-op stages skipped so the
+      default recipe is near-identity; grain RNG seeded by the recipe
+      fingerprint so re-renders are byte-identical. `recipe_to_ffmpeg_filter`
+      is the mapping a future Celery/ffmpeg worker would consume (noted gap,
+      not a second implementation). Out of scope untouched: compositing, AI
+      fill, annotations, layers, brushes.
+  - **Frontend** (`utils/editor.ts`, `store/useEditorStore.ts`,
+    `components/editor/AdjustPanel+EditorCanvas`, `app/editor/[id]/page.tsx`):
+    - Recipe contract mirrors backend ranges; CSS preview filter; undo store
+      capped at 50 with redo-branch drop on new edits; Adjust rail with
+      stable data-testids; canvas with before/after toggle + live recipe JSON;
+      route resolves the asset via the existing catalog, replays the latest
+      saved version on load, Apply saves, Cancel reverts, Export renders and
+      shows before/after compare with the catalog lineage row.
+  - **Tests**: TDD red→green both halves. Backend
+    `tests/test_image_editor.py` (15 tests: presets, 400s, save→list
+    round-trip, version bump, derivative lineage, near-identity, pixel move,
+    byte-identical grain). Frontend `utils/editor.test.ts` + 
+    `store/useEditorStore.test.ts` (13 tests). E2E `e2e/11-image-editor.spec.ts`
+    (HTTP fidelity + UI edit-Apply-reload-Export with lineage assertion).
+
+### Verification:
+- Backend: full suite **663 passed, 16 skipped** (skips pre-existing:
+  semantic-search model + engine contracts without torch).
+- Frontend: unit **102 passed, 0 failed** (`tsx --test`); `tsc --noEmit`
+  clean; `next build` compiles `/editor/[id]` (dynamic).
+- Playwright **not run**: no backend stack in this worktree (nothing on
+  :8000, no docker socket) — same standing deviation as prior tickets. The
+  HTTP fidelity leg is covered by pytest; the spec is typechecked and uses
+  proven patterns (native-setter slider helper, self-seeded uploads).
+
+### Deviation / noted gaps:
+- Authoritative render is synchronous PIL, not Celery + ffmpeg `eq/curves`:
+  runs on CPU-only CI with no broker; async variant is future work and the
+  ffmpeg mapping ships alongside so the two cannot drift.
