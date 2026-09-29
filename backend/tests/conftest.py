@@ -126,6 +126,8 @@ def stub_storage(monkeypatch):
         "app.ml.audio",
         "app.ml.video",
         "app.ml.skin_enhancer",
+        "app.ml.image_adjust",
+        "app.routers.editor",
         "app.ml.bgremove",
         "app.routers.bgremove",
     ):
