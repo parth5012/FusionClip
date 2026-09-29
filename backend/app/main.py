@@ -10,6 +10,7 @@ from app.config import settings
 from app.database import init_db
 from app.routers import (
     bgremove,
+    editor,
     export,
     generate,
     media,
@@ -84,5 +85,6 @@ app.include_router(generate.router)
 app.include_router(media.router)
 app.include_router(upscale.router)
 app.include_router(skin_enhance.router)
+app.include_router(editor.router)
 app.include_router(export.router)
 app.include_router(bgremove.router)
