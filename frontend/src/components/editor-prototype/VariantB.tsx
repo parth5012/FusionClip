@@ -30,7 +30,7 @@ export default function VariantB({
             src="https://picsum.photos/seed/fusionclip-editor/1280/640"
             alt="prototype source"
             className="w-full h-full object-cover"
-            style={{ filter: recipe.showBeforeAfter ? 'none' : recipeToFilter(recipe), transform: `rotate(${recipe.rotate}deg)` }}
+            style={{ filter: recipe.showBeforeAfter ? 'none' : recipeToFilter(recipe), transform: `rotate(${recipe.showBeforeAfter ? 0 : recipe.rotate}deg)` }}
           />
         </div>
         <div className="flex gap-2 mt-2">

@@ -37,7 +37,8 @@ export default function VariantA({
             className="w-full h-full object-cover"
             style={{
               filter: recipe.showBeforeAfter ? 'none' : recipeToFilter(recipe),
-              transform: `rotate(${recipe.rotate}deg)`,
+              // CodeRabbit #141: Before mode shows the true original — no rotation.
+              transform: `rotate(${recipe.showBeforeAfter ? 0 : recipe.rotate}deg)`,
             }}
           />
         </div>
@@ -63,8 +64,9 @@ export default function VariantA({
           </div>
         ))}
         <div className="flex gap-2 pt-1">
-          <button onClick={() => setRecipe({ ...recipe, rotate: recipe.rotate - 5 })} className="text-[11px] px-2 py-1 bg-slate-800 rounded">⟲ -5°</button>
-          <button onClick={() => setRecipe({ ...recipe, rotate: recipe.rotate + 5 })} className="text-[11px] px-2 py-1 bg-slate-800 rounded">⟳ +5°</button>
+          {/* CodeRabbit #141: clamp to the declared -45..45 recipe range. */}
+          <button onClick={() => setRecipe({ ...recipe, rotate: Math.max(-45, recipe.rotate - 5) })} className="text-[11px] px-2 py-1 bg-slate-800 rounded">⟲ -5°</button>
+          <button onClick={() => setRecipe({ ...recipe, rotate: Math.min(45, recipe.rotate + 5) })} className="text-[11px] px-2 py-1 bg-slate-800 rounded">⟳ +5°</button>
           <select
             value={recipe.cropAspect}
             onChange={(e) => setRecipe({ ...recipe, cropAspect: e.target.value as EditorRecipe['cropAspect'] })}
