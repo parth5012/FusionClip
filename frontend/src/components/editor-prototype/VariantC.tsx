@@ -34,7 +34,7 @@ export default function VariantC({
       <div className="lg:col-span-9 bg-slate-900/70 border border-slate-800 rounded-xl p-4">
         <div className="aspect-[16/8] rounded border border-slate-700 overflow-hidden bg-slate-950 mb-3">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="https://picsum.photos/seed/fusionclip-editor/1280/640" alt="src" className="w-full h-full object-cover" style={{ filter: recipe.showBeforeAfter ? 'none' : recipeToFilter(recipe), transform: `rotate(${recipe.rotate}deg)` }} />
+          <img src="https://picsum.photos/seed/fusionclip-editor/1280/640" alt="src" className="w-full h-full object-cover" style={{ filter: recipe.showBeforeAfter ? 'none' : recipeToFilter(recipe), transform: `rotate(${recipe.showBeforeAfter ? 0 : recipe.rotate}deg)` }} />
         </div>
         <button onClick={() => setRecipe({ ...recipe, showBeforeAfter: !recipe.showBeforeAfter })} className="text-[11px] px-2 py-1 bg-slate-800 rounded mb-2">toggle before/after</button>
         {step === 'adjust' && SLIDERS.map((s) => (

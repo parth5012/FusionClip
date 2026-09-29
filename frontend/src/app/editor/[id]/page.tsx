@@ -65,7 +65,9 @@ export default function EditorPage() {
           }
           return;
         }
-        const versions = await fetchEditorRecipes(found.file_path).catch(() => []);
+        // CodeRabbit #141: recipe-list failures must follow the error path
+        // (failed + status) instead of silently loading defaults.
+        const versions = await fetchEditorRecipes(found.file_path);
         if (cancelled) return;
         setAsset(found);
         const latest = versions.length > 0 ? versions[versions.length - 1] : null;
@@ -105,8 +107,12 @@ export default function EditorPage() {
     setStatus('Saving recipe…');
     try {
       const saved = await saveEditorRecipe(asset.file_path, checked.recipe);
-      load(saved.recipe);
-      setSavedRecipe(saved.recipe);
+      // CodeRabbit #141: backend returns canonical snake_case — normalize
+      // before loading so cropAspect is never undefined in the store.
+      const normApply = validateRecipe(saved.recipe);
+      const nextApply = normApply.ok ? normApply.recipe : checked.recipe;
+      load(nextApply);
+      setSavedRecipe(nextApply);
       setSavedVersion(saved.version);
       setStatus(`Saved version ${saved.version} for ${asset.file_path}.`);
     } catch (err) {
@@ -138,8 +144,11 @@ export default function EditorPage() {
       const rendered = await renderEditorImage(asset.file_path, checked.recipe);
       setExportResult(rendered);
       // Export co-saves its recipe as a new version — adopt it as saved.
-      load(rendered.parameters);
-      setSavedRecipe(rendered.parameters);
+      // CodeRabbit #141: normalize snake_case before loading (see Apply).
+      const normExport = validateRecipe(rendered.parameters);
+      const nextExport = normExport.ok ? normExport.recipe : checked.recipe;
+      load(nextExport);
+      setSavedRecipe(nextExport);
       setSavedVersion(rendered.version);
       setStatus(`Exported ${rendered.filename} (version ${rendered.version}).`);
     } catch (err) {
