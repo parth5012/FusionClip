@@ -104,7 +104,7 @@ export default function AdjustPanel({
           data-testid="adjust-crop"
           value={recipe.cropAspect}
           disabled={busy}
-          onChange={(e) => setParam('cropAspect', e.target.value)}
+          onChange={(e) => setParam('cropAspect', e.target.value as CropAspect)}
           className="text-[11px] bg-slate-950 border border-slate-700 rounded px-1 text-slate-200"
           aria-label="Crop aspect"
         >

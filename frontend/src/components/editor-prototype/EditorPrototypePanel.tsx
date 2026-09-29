@@ -8,8 +8,13 @@ import VariantC from './VariantC';
 import PrototypeSwitcher from '../upscale/PrototypeSwitcher';
 import { DEFAULT_RECIPE, EditorRecipe } from './types';
 
-export default function EditorPrototypePanel() {
-  const [variant, setVariant] = useState('A');
+export default function EditorPrototypePanel({
+  initialVariant = 'A',
+}: {
+  initialVariant?: string;
+}) {
+  const valid = ['A', 'B', 'C'].includes(initialVariant) ? initialVariant : 'A';
+  const [variant, setVariant] = useState(valid);
   const [recipe, setRecipe] = useState<EditorRecipe>(DEFAULT_RECIPE);
   const [log, setLog] = useState<string[]>([]);
 

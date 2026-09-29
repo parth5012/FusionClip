@@ -6,8 +6,9 @@ import { useSearchParams } from 'next/navigation';
 import EditorPrototypePanel from '../../components/editor-prototype/EditorPrototypePanel';
 
 function Inner() {
-  useSearchParams(); // enables ?v= switch (panel uses internal state + bottom bar)
-  return <EditorPrototypePanel />;
+  const searchParams = useSearchParams();
+  const initialVariant = (searchParams.get('v') || 'A').toUpperCase();
+  return <EditorPrototypePanel initialVariant={initialVariant} />;
 }
 
 export default function EditorPrototypePage() {

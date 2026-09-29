@@ -165,21 +165,19 @@ export default function EditorPage() {
         </div>
       )}
 
-      {failed || !asset ? (
-        failed ? (
-          // LOW-01 (#121 review): a failed load must render an error card,
-          // not an empty container.
-          <div
-            data-testid="editor-error"
-            role="alert"
-            className="bg-red-950/60 border border-red-800 rounded-xl p-4 text-xs text-red-200"
-          >
-            <div className="font-bold mb-1">Could not load the editor</div>
-            <div>{status}</div>
-          </div>
-        ) : (
-          <div className="text-xs text-slate-400">Loading asset…</div>
-        )
+      {failed ? (
+        // LOW-01 (#121 review): a failed load must render an error card,
+        // not an empty container.
+        <div
+          data-testid="editor-error"
+          role="alert"
+          className="bg-red-950/60 border border-red-800 rounded-xl p-4 text-xs text-red-200"
+        >
+          <div className="font-bold mb-1">Could not load the editor</div>
+          <div>{status}</div>
+        </div>
+      ) : !asset ? (
+        <div className="text-xs text-slate-400">Loading asset…</div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
           <div className="lg:col-span-8">
