@@ -23,8 +23,12 @@ export default function AdjustPanel({
   const setParam = useEditorStore((s) => s.setParam);
   const undo = useEditorStore((s) => s.undo);
   const redo = useEditorStore((s) => s.redo);
-  const canUndo = useEditorStore((s) => s.canUndo)();
-  const canRedo = useEditorStore((s) => s.canRedo)();
+  // MED-02 (#121 review): subscribe to the history arrays directly so the
+  // buttons re-render on undo/redo. Calling the method refs during render
+  // (useEditorStore((s) => s.canUndo)()) subscribes to the function identity,
+  // which never changes, so the disabled state goes stale.
+  const canUndo = useEditorStore((s) => s.past.length > 0);
+  const canRedo = useEditorStore((s) => s.future.length > 0);
 
   return (
     <div

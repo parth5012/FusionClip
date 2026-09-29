@@ -47,7 +47,9 @@ export default function EditorPage() {
     let cancelled = false;
     (async () => {
       try {
-        const catalog = await fetchMediaCatalog();
+        // MED-03 (#121 review): the default catalog limit is 20 — an asset
+        // past the first page would 404 as "not found". Fetch up to 100.
+        const catalog = await fetchMediaCatalog('', 100);
         const found = catalog.find((a) => String(a.id) === String(id));
         if (!found) {
           if (!cancelled) {
@@ -164,7 +166,18 @@ export default function EditorPage() {
       )}
 
       {failed || !asset ? (
-        !failed && (
+        failed ? (
+          // LOW-01 (#121 review): a failed load must render an error card,
+          // not an empty container.
+          <div
+            data-testid="editor-error"
+            role="alert"
+            className="bg-red-950/60 border border-red-800 rounded-xl p-4 text-xs text-red-200"
+          >
+            <div className="font-bold mb-1">Could not load the editor</div>
+            <div>{status}</div>
+          </div>
+        ) : (
           <div className="text-xs text-slate-400">Loading asset…</div>
         )
       ) : (

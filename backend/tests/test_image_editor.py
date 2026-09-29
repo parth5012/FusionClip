@@ -178,6 +178,16 @@ class TestRecipeValidation:
         assert res.status_code == 400
         assert "video_input_not_supported" in res.json()["detail"]
 
+    def test_camelcase_crop_aspect_alias_is_accepted(self, client, stub_storage):
+        """HIGH-01 (#121 review): the frontend EditorRecipe type is camelCase."""
+        src = seed_source(stub_storage)
+        res = client.post(
+            "/api/editor/recipe",
+            json={"source_path": src, "recipe": {"cropAspect": "16:9"}},
+        )
+        assert res.status_code == 200
+        assert res.json()["recipe"]["crop_aspect"] == "16:9"
+
 
 class TestRecipePersistLineage:
     def test_save_then_list_round_trips_recipe_with_version(
