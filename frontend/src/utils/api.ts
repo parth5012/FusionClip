@@ -668,6 +668,7 @@ export async function generateImage(
 export interface UpscalePayload {
   image_path: string;
   scale: number;
+  mode?: 'creative' | 'precision';
   preset?: string;
   creativity?: number;
   resemblance?: number;
@@ -675,6 +676,9 @@ export interface UpscalePayload {
   hdr?: number;
   category?: string;
   prompt?: string;
+  engine?: 'hat' | 'scunet';
+  sharpness?: number;
+  grain?: number;
 }
 
 export interface UpscaleStartResponse {
@@ -682,16 +686,20 @@ export interface UpscaleStartResponse {
   task_id: string;
   status: string;
   scale: number;
-  preset: string;
-  category: string;
+  mode?: 'creative' | 'precision';
+  engine?: 'hat' | 'scunet' | null;
+  preset?: string;
+  category?: string;
   output_path: string;
   parameters: {
-    creativity: number;
-    resemblance: number;
-    fractality: number;
-    hdr: number;
-    denoise: number;
-    controlnet_scale: number;
+    creativity?: number;
+    resemblance?: number;
+    fractality?: number;
+    hdr?: number;
+    denoise?: number;
+    controlnet_scale?: number;
+    sharpness?: number;
+    grain?: number;
   };
 }
 
