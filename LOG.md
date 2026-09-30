@@ -1,5 +1,41 @@
 # Execution Log
 
+## 2026-09-30: Wayfinder Map #76 - Deep Parity, Precision Upscaler (16x)
+
+### Status: Done (all 4 child tickets closed; no open children remain)
+
+### Phase 1 - HITL:
+- **#123 - Decide engine selection, slider semantics, output caps (grilling)**
+  - Ran 3 rounds / 11 frontier questions; every recommendation accepted verbatim.
+  - Locked: v1 = `hat` + `scunet` only (non-GAN, manual pick); local -> Colab -> CI-stub venue; Sharpness 0-100 = UnsharpMask r2 percent x 1.2, Grain 0-100 = seeded gaussian sigma value/100 x 12, both applied whole-image AFTER stitching; Precision cap 16384 vs Core 8192 with hard refusal; shared substrate `backend/app/services/upscaler.py` only; full progressive 2x chain (scunet denoises stage 1 only); exactly 3 inputs, no denoise slider; loud failure on missing weights; API `mode`/`engine`/`sharpness`/`grain` with cross-mode 422s.
+  - Closed; appended to the map's Decisions so far. Commit n/a (issue-only).
+- **#125 - Prototype Precision mode UI (prototype)**
+  - Built 3 structurally different variants on `/precision-prototype?v=a|b|c` (branch `prototype/precision-ui`, commit `f494fa0`, pushed, out of main): Inline toggle / Canvas HUD / Rung grid. Read-only, each printing the live `POST /api/upscale` payload.
+  - Human picked **Variant A (Inline toggle)**; rejected B (controls over the image compete with compare) and C (too much surface, duplicated the mode decision). Stole C's rung captions + engine spec row.
+  - Verified before handing over: `tsc --noEmit` clean, `next build` generates the route, all three screenshot-checked. Closed with verdict + screenshots.
+
+### Phase 2 - AFK (single-PR mode: 2 code-changing tickets, branch `wf/76-precision`):
+- **#124 - Build precision pipeline on shared tile engine (BackendEngineer + CodeReviewer)**
+  - `mode="precision"` branch in `run_tile_upscale_pipeline`/`execute_upscale_job`; `precision_chain_plan(scale, engine)` -> 1/2/3/4 2x stages with scunet denoise-once; `apply_precision_post_filters` (sharpness + grain, whole-image post-stitch, alpha never jittered); `PRECISION_MAX_OUTPUT_DIMENSION=16384` refusing loudly; `register_sr_runner`/`resolve_sr_backend` with a non-overridable, non-selectable `stub`; `SRWeightsUnavailableError` instead of LANCZOS fallback.
+  - `UpscaleRequest` gains `mode` (default `creative`), `engine`, `sharpness`, `grain` as `None` sentinels so the wrong group yields **422** rather than being silently ignored.
+  - TDD: new tests red against HEAD, then green. Targeted upscale suite 90 passed (baseline 32); full backend suite **726 passed, 18 skipped** (pre-existing gfpgan/facexlib skips). CodeReviewer: no blockers; 2 MAJORs (`MediaAsset.source_path`, terminal Redis publish) proven pre-existing at HEAD and parked on the ticket.
+  - Commit `1ac5570`.
+- **#142 - Fold Variant A into the live UpscalePanel (FrontendEngineer + CodeReviewer)**
+  - `buildUpscalePayload` + rung/preset/clamp helpers in `src/utils/upscale.ts` (TDD-covered); segmented toggle + swapping cluster + rung captions + mode-aware canvas strip / queue metadata / compare labels in `upscale/VariantA.tsx`.
+  - First agent pass returned an EMPTY report while wiring state/payload but never rendering the toggle - CodeReviewer caught it as a BLOCKER. Implemented the missing JSX, plus all four MAJORs.
+  - Verified: `tsc --noEmit` clean, 112 unit tests, `next build`, and **24/24 Playwright DOM assertions** against the live panel covering both modes. e2e NOT run (no Postgres/MinIO/Redis/Celery stack up) - stated plainly, not claimed.
+  - Commit `7f7fca2`.
+
+### Overall Verification:
+- Backend: `pytest -q` -> **726 passed, 18 skipped, 0 failed**.
+- Frontend: `npx tsc --noEmit` clean; `npx tsx --test src/utils/*.test.ts` -> 112 passed; `npx next build` succeeds.
+- Browser: 24/24 Playwright DOM assertions on the live Magnific Upscaler panel.
+- Not run (environment, stated not skipped silently): `npm run test:e2e:upscale` (needs the full stack), `npm run lint` (repo has no ESLint config - pre-existing).
+
+### Follow-ups recorded on the tickets:
+- No production `hat`/`scunet` Torch runner is registered, so precision jobs fail loudly by design until a model-pull ticket registers one.
+- Pre-existing: `MediaAsset.source_path` unset on upscale, no terminal Redis `task_updates` publish, `clean_stem` unsanitized in the upscale router, bulk dispatch drops user-adjusted creative sliders.
+
 ## 2026-09-23: Wayfinder Map #67 - Trust & Integrity Fixes
 
 ### Status: Done
