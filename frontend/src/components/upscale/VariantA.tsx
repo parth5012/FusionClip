@@ -10,6 +10,9 @@ import {
   PRESET_RECIPES,
   CATEGORIES,
   QueueItem,
+  PrecisionMode,
+  PrecisionEngine,
+  PrecisionPreset,
   mapCreativityToDenoise,
   mapResemblanceToControlNet,
 } from './types';
@@ -20,6 +23,7 @@ import {
   fetchUpscalePresets,
   fetchUpscaleCategories,
   StorageItem,
+  UpscalePayload,
   UpscalePresetDefinition,
   UpscaleCategoryDefinition,
 } from '../../utils/api';
@@ -28,6 +32,13 @@ import {
   scaleFactorToInt,
   MAX_BULK_QUEUE,
   isUpscalableImage,
+  buildUpscalePayload,
+  clampPrecisionPct,
+  resolvePrecisionPreset,
+  formatRungStages,
+  formatRungOutputPx,
+  PRECISION_PRESETS,
+  PRECISION_ENGINES,
 } from '../../utils/upscale';
 import {
   Sparkles,
@@ -44,6 +55,7 @@ import {
   RefreshCw,
   Loader2,
   AlertCircle,
+  Cpu,
 } from 'lucide-react';
 
 function formatBytes(bytes?: number): string {
@@ -75,6 +87,16 @@ interface CompareContext {
 }
 
 export default function VariantA() {
+  // Mode selection (#142)
+  const [mode, setMode] = useState<PrecisionMode>('creative');
+
+  // Precision controls (#142)
+  const [precisionEngine, setPrecisionEngine] = useState<PrecisionEngine>('hat');
+  const [precisionSharpness, setPrecisionSharpness] = useState<number>(PRECISION_PRESETS.clean.sharpness);
+  const [precisionGrain, setPrecisionGrain] = useState<number>(PRECISION_PRESETS.clean.grain);
+  const [precisionPreset, setPrecisionPreset] = useState<PrecisionPreset>('clean');
+
+  // Creative controls (unchanged)
   const [scale, setScale] = useState<ScaleFactor>('4x');
   const [preset, setPreset] = useState<PresetType>('vivid');
   const [category, setCategory] = useState<ContentCategory>('portraits');
@@ -139,27 +161,43 @@ export default function VariantA() {
     setPreset('custom');
   };
 
-  const buildPayload = (source: StorageItem) => {
-    const params = resolveUpscaleParams(preset, {
-      scale: scaleFactorToInt(scale),
+  const handlePrecisionSharpnessChange = (value: number) => {
+    const s = clampPrecisionPct(value);
+    setPrecisionSharpness(s);
+    setPrecisionPreset(resolvePrecisionPreset(s, precisionGrain));
+  };
+
+  const handlePrecisionGrainChange = (value: number) => {
+    const g = clampPrecisionPct(value);
+    setPrecisionGrain(g);
+    setPrecisionPreset(resolvePrecisionPreset(precisionSharpness, g));
+  };
+
+  const handlePrecisionPresetSelect = (p: PrecisionPreset) => {
+    if (p === 'clean' || p === 'filmic') {
+      const spec = PRECISION_PRESETS[p];
+      setPrecisionPreset(p);
+      setPrecisionSharpness(spec.sharpness);
+      setPrecisionGrain(spec.grain);
+    }
+  };
+
+  const buildPayload = (source: StorageItem): UpscalePayload => {
+    return buildUpscalePayload({
+      image_path: source.path,
+      scale,
+      mode,
+      engine: precisionEngine,
+      sharpness: precisionSharpness,
+      grain: precisionGrain,
+      preset,
+      category,
       creativity: sliders.creativity,
       resemblance: sliders.resemblance,
       fractality: sliders.fractality,
       hdr: sliders.hdr,
-      category,
       prompt: prompt.trim() || undefined,
     });
-    return {
-      image_path: source.path,
-      scale: params.scale,
-      preset: params.preset,
-      creativity: params.creativity,
-      resemblance: params.resemblance,
-      fractality: params.fractality,
-      hdr: params.hdr,
-      category: params.category,
-      prompt: params.prompt,
-    };
   };
 
   const makeQueuedItem = (source: StorageItem): QueueItem => ({
@@ -168,13 +206,17 @@ export default function VariantA() {
     size: formatBytes(source.size),
     dimensions: '—',
     targetScale: scale,
-    preset,
-    category,
-    prompt,
+    preset: mode === 'precision' ? precisionPreset : preset,
+    category: mode === 'precision' ? undefined : category,
+    prompt: mode === 'precision' ? undefined : prompt,
     status: 'queued',
     progress: 0,
     previewUrl: source.url || '',
     sourcePath: source.path,
+    mode,
+    engine: mode === 'precision' ? precisionEngine : undefined,
+    sharpness: mode === 'precision' ? precisionSharpness : undefined,
+    grain: mode === 'precision' ? precisionGrain : undefined,
   });
 
   const dispatchSource = async (source: StorageItem): Promise<QueueItem> => {
@@ -231,14 +273,19 @@ export default function VariantA() {
       for (const item of pending) {
         const source = sources.find((s) => s.path === item.sourcePath);
         if (!source) continue;
-        // Snapshot this item's own settings at dispatch time
-        const res = await startUpscale({
+        // Snapshot this item's own settings at dispatch time (#142)
+        const payload = buildUpscalePayload({
           image_path: source.path,
-          scale: scaleFactorToInt(item.targetScale),
-          preset: item.preset,
-          category: item.category,
-          prompt: item.prompt.trim() || undefined,
+          scale: item.targetScale,
+          mode: item.mode ?? 'creative',
+          engine: item.engine,
+          sharpness: item.sharpness,
+          grain: item.grain,
+          preset: item.preset as PresetType,
+          category: item.category as string,
+          prompt: item.prompt?.trim() || undefined,
         });
+        const res = await startUpscale(payload);
         setQueue((prev) =>
           prev.map((q) =>
             q.id === item.id
@@ -283,7 +330,10 @@ export default function VariantA() {
                 resultUrl: status.result_url ?? q.resultUrl,
                 stepMessage:
                   nextStatus === 'diffusing'
-                    ? status.logs || 'Diffusing tiles (SDXL + ControlNet-Tile)'
+                    ? status.logs ||
+                      (q.mode === 'precision'
+                        ? 'Super-resolving tiles (Precision chain)'
+                        : 'Diffusing tiles (SDXL + ControlNet-Tile)')
                     : undefined,
               };
               if (nextStatus === 'completed' && status.result_url) {
@@ -291,7 +341,10 @@ export default function VariantA() {
                   beforeUrl: q.previewUrl,
                   afterUrl: status.result_url,
                   beforeLabel: `Original 1x — ${q.name}`,
-                  afterLabel: `Upscaled ${q.targetScale} • SDXL-Tile (${q.preset})`,
+                  afterLabel:
+                    q.mode === 'precision'
+                      ? `Upscaled ${q.targetScale} • ${q.engine?.toUpperCase() || 'HAT'} (sharp ${q.sharpness ?? 0} · grain ${q.grain ?? 0})`
+                      : `Upscaled ${q.targetScale} • SDXL-Tile (${q.preset})`,
                 });
               }
               return updated;
@@ -321,23 +374,42 @@ export default function VariantA() {
             </span>
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            Tile-based diffusion upscaling with structure guidance, feather blending, and -10..+10 parameter precision.
+            {mode === 'precision'
+              ? 'Faithful 2/4/8/16x super-resolution on the shared tile engine — no invented detail, no prompt.'
+              : 'Tile-based diffusion upscaling with structure guidance, feather blending, and -10..+10 parameter precision.'}
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-400">Scale Factor:</span>
+        <div className="flex items-end gap-2">
+          <span className="text-xs text-slate-400 pb-1.5">Scale Factor:</span>
           {(['2x', '4x', '8x', '16x'] as ScaleFactor[]).map((s) => (
             <button
               key={s}
+              type="button"
+              data-testid={`upscale-scale-${s}`}
+              aria-pressed={scale === s}
               onClick={() => setScale(s)}
-              className={`px-3 py-1 rounded-md text-xs font-bold transition ${
+              className={`px-3 py-1.5 rounded-md text-xs font-bold transition text-center ${
                 scale === s
                   ? 'bg-sky-500 text-slate-950 shadow-md shadow-sky-500/20'
                   : 'bg-slate-850 hover:bg-slate-800 text-slate-300 border border-slate-700/60'
               }`}
             >
-              {s}
+              <span className="block leading-none">{s}</span>
+              <span
+                className={`block font-mono font-medium mt-1 text-[10px] leading-none ${
+                  scale === s ? 'text-slate-800' : 'text-slate-500'
+                }`}
+              >
+                {formatRungOutputPx(s)}
+              </span>
+              <span
+                className={`block mt-0.5 text-[9px] leading-none ${
+                  scale === s ? 'text-slate-800' : 'text-slate-600'
+                }`}
+              >
+                {formatRungStages(s)}
+              </span>
             </button>
           ))}
         </div>
@@ -347,6 +419,33 @@ export default function VariantA() {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Column: Control Stack (5 cols) */}
         <div className="lg:col-span-5 space-y-5">
+          {/* Mode toggle (#125 Variant A) — swaps the whole control cluster below */}
+          <div
+            role="tablist"
+            aria-label="Upscale mode"
+            className="bg-slate-900/70 border border-slate-800 rounded-xl p-1.5 flex gap-1"
+          >
+            {(['creative', 'precision'] as PrecisionMode[]).map((m) => (
+              <button
+                key={m}
+                type="button"
+                role="tab"
+                aria-selected={mode === m}
+                data-testid={`upscale-mode-${m}`}
+                onClick={() => setMode(m)}
+                className={`flex-1 py-2 rounded-lg text-xs font-bold uppercase tracking-wide transition ${
+                  mode === m
+                    ? m === 'precision'
+                      ? 'bg-teal-500 text-slate-950 shadow-sm'
+                      : 'bg-sky-500 text-slate-950 shadow-sm'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                }`}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+
           {/* Source image picker (wired to MinIO listing) */}
           <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
@@ -392,6 +491,140 @@ export default function VariantA() {
             )}
           </div>
 
+          {mode === 'precision' ? (
+            <>
+              {/* SR Engine */}
+              <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4 space-y-3">
+                <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Cpu className="w-3.5 h-3.5 text-teal-400" />
+                  Super-Resolution Engine
+                </label>
+                <div className="grid grid-cols-2 gap-2">
+                  {PRECISION_ENGINES.map((eng) => (
+                    <button
+                      key={eng.id}
+                      type="button"
+                      data-testid={`precision-engine-${eng.id}`}
+                      aria-pressed={precisionEngine === eng.id}
+                      onClick={() => setPrecisionEngine(eng.id)}
+                      className={`p-2.5 rounded-lg text-left border text-xs transition ${
+                        precisionEngine === eng.id
+                          ? 'bg-teal-950/40 border-teal-500 text-teal-200'
+                          : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:bg-slate-800'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-bold text-slate-200">{eng.name}</span>
+                        {precisionEngine === eng.id && (
+                          <span className="text-[9px] font-bold text-teal-400">SELECTED</span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-slate-400 mt-0.5">{eng.hint}</div>
+                      <div className="text-[10px] text-slate-500 mt-1.5 border-t border-slate-800/80 pt-1 font-mono">
+                        {eng.vram} · {eng.role}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Manual pick (#123-d10) — no automatic noise classification. Missing weights fail
+                  the job loudly instead of degrading to LANCZOS.
+                </p>
+              </div>
+
+              {/* Precision Preset */}
+              <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                    <Layers className="w-3.5 h-3.5 text-teal-400" />
+                    Precision Preset
+                  </label>
+                  <span className="text-[11px] text-slate-400 font-mono capitalize">
+                    {precisionPreset} Mode
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(['clean', 'filmic', 'custom'] as PrecisionPreset[]).map((p) => (
+                    <button
+                      key={p}
+                      type="button"
+                      data-testid={`precision-preset-${p}`}
+                      onClick={() => handlePrecisionPresetSelect(p)}
+                      className={`py-1.5 px-2 rounded-lg text-xs font-medium capitalize text-center transition ${
+                        precisionPreset === p
+                          ? 'bg-teal-600 text-white font-bold shadow-sm'
+                          : p === 'custom'
+                            ? 'bg-slate-900 border border-slate-800 text-slate-500 cursor-default'
+                            : 'bg-slate-800/80 text-slate-400 hover:text-slate-200 hover:bg-slate-750'
+                      }`}
+                    >
+                      {p}
+                      {p !== 'custom' && (
+                        <span className="block text-[9px] font-mono opacity-70">
+                          {PRECISION_PRESETS[p].sharpness}/{PRECISION_PRESETS[p].grain}
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Sharpness + Grain (0-100) */}
+              <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4 space-y-4">
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-300 font-medium">Sharpness</span>
+                    <span className="font-mono text-teal-400 font-bold" data-testid="precision-sharpness-value">
+                      {precisionSharpness}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={precisionSharpness}
+                    onChange={(e) => handlePrecisionSharpnessChange(Number(e.target.value))}
+                    className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-teal-500"
+                    data-testid="precision-sharpness"
+                  />
+                  <div className="flex justify-between text-[10px] text-slate-400">
+                    <span>Faithful (0)</span>
+                    <span>Crisp (100)</span>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-300 font-medium">Grain</span>
+                    <span className="font-mono text-teal-400 font-bold" data-testid="precision-grain-value">
+                      {precisionGrain}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={precisionGrain}
+                    onChange={(e) => handlePrecisionGrainChange(Number(e.target.value))}
+                    className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-teal-500"
+                    data-testid="precision-grain"
+                  />
+                  <div className="flex justify-between text-[10px] text-slate-400">
+                    <span>Clean (0)</span>
+                    <span>Heavy (100)</span>
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-slate-500">
+                  Applied to the stitched image, never per tile (#123-d3/d4). No prompt, category,
+                  or creativity controls in this mode.
+                </p>
+              </div>
+            </>
+          ) : (
+            <>
           {/* Preset Buttons */}
           <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4 space-y-3">
             <div className="flex items-center justify-between">
@@ -569,6 +802,8 @@ export default function VariantA() {
               className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500"
             />
           </div>
+            </>
+          )}
 
           {error && (
             <p className="text-xs text-rose-400 flex items-center gap-1.5" data-testid="upscale-error">
@@ -636,11 +871,24 @@ export default function VariantA() {
 
             {/* Canvas Info Strip */}
             <div className="flex items-center justify-between px-3 py-2 bg-slate-900/60 border border-slate-800/80 rounded-lg text-[11px] text-slate-400 font-mono">
-              <div>Engine: SDXL + ControlNet-Tile • Feather Blend • up to 8K</div>
-              <div>
-                Denoise: {mapCreativityToDenoise(sliders.creativity)} • ControlNet:{' '}
-                {mapResemblanceToControlNet(sliders.resemblance)}
-              </div>
+              {mode === 'precision' ? (
+                <>
+                  <div>
+                    Engine: {precisionEngine.toUpperCase()} • Progressive 2x chain • up to 16K
+                  </div>
+                  <div>
+                    Sharpness: {precisionSharpness} • Grain: {precisionGrain}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div>Engine: SDXL + ControlNet-Tile • Feather Blend • up to 8K</div>
+                  <div>
+                    Denoise: {mapCreativityToDenoise(sliders.creativity)} • ControlNet:{' '}
+                    {mapResemblanceToControlNet(sliders.resemblance)}
+                  </div>
+                </>
+              )}
             </div>
           </div>
 
@@ -707,8 +955,25 @@ export default function VariantA() {
                       <span>{item.dimensions}</span>
                       <span>•</span>
                       <span className="capitalize">{item.preset}</span>
-                      <span>•</span>
-                      <span className="capitalize">{item.category}</span>
+                      {item.mode === 'precision' ? (
+                        <>
+                          <span>•</span>
+                          <span className="font-mono uppercase text-teal-400">
+                            {item.engine ?? 'hat'}
+                          </span>
+                          <span>•</span>
+                          <span className="font-mono">
+                            S:{item.sharpness ?? 0} G:{item.grain ?? 0}
+                          </span>
+                        </>
+                      ) : (
+                        item.category && (
+                          <>
+                            <span>•</span>
+                            <span className="capitalize">{item.category}</span>
+                          </>
+                        )
+                      )}
                     </div>
 
                     {item.status === 'diffusing' && (
@@ -736,7 +1001,10 @@ export default function VariantA() {
                             beforeUrl: item.previewUrl,
                             afterUrl: item.resultUrl,
                             beforeLabel: `Original 1x — ${item.name}`,
-                            afterLabel: `Upscaled ${item.targetScale} • SDXL-Tile (${item.preset})`,
+                            afterLabel:
+                              item.mode === 'precision'
+                                ? `Upscaled ${item.targetScale} • ${(item.engine ?? 'hat').toUpperCase()} (sharp ${item.sharpness ?? 0} · grain ${item.grain ?? 0})`
+                                : `Upscaled ${item.targetScale} • SDXL-Tile (${item.preset})`,
                           })
                         }
                         className="flex items-center gap-1 text-[11px] text-emerald-400 font-medium hover:text-emerald-300"

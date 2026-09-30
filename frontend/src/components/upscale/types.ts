@@ -85,15 +85,42 @@ export const CATEGORIES: { id: ContentCategory; label: string; description: stri
   },
 ];
 
+export type PrecisionMode = 'creative' | 'precision';
+
+export type PrecisionEngine = 'hat' | 'scunet';
+
+export type PrecisionPreset = 'clean' | 'filmic' | 'custom';
+
+export interface PrecisionSliderValues {
+  sharpness: number; // 0 .. 100
+  grain: number; // 0 .. 100
+}
+
+export interface PrecisionEngineSpec {
+  id: PrecisionEngine;
+  name: string;
+  hint: string;
+  vram: string;
+  latency: string;
+  role: string;
+}
+
+export interface PrecisionPresetSpec {
+  id: PrecisionPreset;
+  name: string;
+  sharpness: number;
+  grain: number;
+}
+
 export interface QueueItem {
   id: string;
   name: string;
   size: string;
   dimensions: string;
   targetScale: ScaleFactor;
-  preset: PresetType;
-  category: ContentCategory;
-  prompt: string;
+  preset: PresetType | PrecisionPreset;
+  category?: ContentCategory | string;
+  prompt?: string;
   status: 'idle' | 'queued' | 'tiling' | 'diffusing' | 'stitching' | 'completed' | 'error';
   progress: number;
   stepMessage?: string;
@@ -103,6 +130,10 @@ export interface QueueItem {
   taskId?: string;
   /** Storage object key of the source image. */
   sourcePath?: string;
+  mode?: PrecisionMode;
+  engine?: PrecisionEngine;
+  sharpness?: number;
+  grain?: number;
 }
 
 /**
