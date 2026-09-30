@@ -1,6 +1,11 @@
 """Upscaler API Router (#94).
 
 Dedicated endpoint for Magnific-style generative tile upscaling.
+
+Two modes (#123-d11): `creative` (default — the generative slider contract above)
+and `precision` (faithful SR chain with `engine`/`sharpness`/`grain`, #124).
+Precision-only and Creative-only controls are rejected with a 422 on the wrong
+mode — never silently ignored.
 """
 
 import json
@@ -9,7 +14,7 @@ import os
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, ValidationError
@@ -44,6 +49,28 @@ class UpscaleRequest(BaseModel):
     hdr: Optional[float] = Field(None, description="HDR / contrast level [-10..+10]")
     category: Optional[str] = Field("universal", description="Content category")
     prompt: Optional[str] = Field(None, description="Optional prompt guidance")
+    mode: Literal["creative", "precision"] = Field(
+        "creative",
+        description="creative (default, generative sliders) or precision (faithful SR chain)",
+    )
+    # Precision-only (#123-d11): left as None (not their defaults) so the router
+    # can 422 them when mode='creative' instead of silently ignoring them.
+    engine: Optional[Literal["hat", "scunet"]] = Field(
+        None,
+        description="Precision-only SR engine (default 'hat'). Rejected when mode='creative'.",
+    )
+    sharpness: Optional[int] = Field(
+        None,
+        ge=0,
+        le=100,
+        description="Precision-only Sharpness 0-100 (UnsharpMask). Rejected when mode='creative'.",
+    )
+    grain: Optional[int] = Field(
+        None,
+        ge=0,
+        le=100,
+        description="Precision-only Grain 0-100 (seeded Gaussian). Rejected when mode='creative'.",
+    )
 
 
 class LegacyUpscaleRequest(BaseModel):
@@ -64,11 +91,12 @@ async def trigger_upscale(
     ),
     db: Session = Depends(get_db),
 ):
-    """Trigger a Magnific-style generative tile upscale.
+    """Trigger a Magnific-style tile upscale.
 
     With a ``path`` query parameter this preserves the legacy Celery dispatch
-    flow (Task row + process_upscale_task.delay). Without it the JSON body
-    drives the local tile-upscale pipeline.
+    flow (Task row + process_upscale_task.delay, creative mode only). Without it
+    the JSON body drives the local tile-upscale pipeline in either `creative`
+    (default) or `precision` (faithful SR chain, #124) mode.
     """
     raw_body = {}
     if (request.headers.get("content-type") or "").split(";")[0].strip() == "application/json":
@@ -80,6 +108,20 @@ async def trigger_upscale(
             raw_body = {}
 
     if path is not None:
+        # The legacy Celery dispatch carries no Precision inputs — accepting them
+        # here would silently drop them, which #123-d11 forbids.
+        legacy_mode = raw_body.get("mode")
+        legacy_precision_fields = [
+            name for name in ("engine", "sharpness", "grain") if name in raw_body
+        ]
+        if legacy_mode not in (None, "creative") or legacy_precision_fields:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Precision mode and its controls (engine/sharpness/grain) are not "
+                    "supported on the legacy Celery dispatch (?path=); POST a JSON body instead"
+                ),
+            )
         legacy = LegacyUpscaleRequest(**raw_body)
         task_id = f"upscale_{uuid.uuid4().hex[:8]}"
         db_task = Task(task_id=task_id, name="upscale", status="PROCESSING", progress=0)
@@ -102,30 +144,82 @@ async def trigger_upscale(
             detail=f"Invalid scale factor {payload.scale}. Allowed: {sorted(ALLOWED_SCALES)}",
         )
 
-    preset_name = (payload.preset or "vivid").lower()
-    if preset_name not in PRESET_DEFINITIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid preset '{payload.preset}'. Allowed presets: {list(PRESET_DEFINITIONS.keys())}",
-        )
-    preset_defaults = PRESET_DEFINITIONS[preset_name]
+    mode = payload.mode
+    preset_name: Optional[str] = None
+    engine: Optional[str] = None
+    sharpness = 0
+    grain = 0
+    parameters: Dict[str, Any]
 
-    creativity = payload.creativity if payload.creativity is not None else float(preset_defaults["creativity"])
-    resemblance = payload.resemblance if payload.resemblance is not None else float(preset_defaults["resemblance"])
-    fractality = payload.fractality if payload.fractality is not None else float(preset_defaults["fractality"])
-    hdr = payload.hdr if payload.hdr is not None else float(preset_defaults["hdr"])
+    if mode == "precision":
+        # d8: Creativity/Resemblance/Fractality/HDR are Creative-only — reject
+        # them rather than silently ignoring them.
+        creative_controls = [
+            name
+            for name in ("creativity", "resemblance", "fractality", "hdr")
+            if getattr(payload, name) is not None
+        ]
+        if creative_controls:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{', '.join(creative_controls)} are Creative-only controls and are "
+                    "rejected when mode='precision'"
+                ),
+            )
+        engine = payload.engine or "hat"  # d10: manual pick, default hat
+        sharpness = payload.sharpness if payload.sharpness is not None else 0
+        grain = payload.grain if payload.grain is not None else 0
+        # Presets (clean/filmic, #142) are UI-side and not validated here yet.
+        creativity = resemblance = fractality = hdr = 0.0
+        parameters = {"sharpness": sharpness, "grain": grain}
+    else:
+        # d11: engine/sharpness/grain are Precision-only — reject them in
+        # creative mode instead of silently ignoring them.
+        precision_controls = [
+            name for name in ("engine", "sharpness", "grain") if getattr(payload, name) is not None
+        ]
+        if precision_controls:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"{', '.join(precision_controls)} are Precision-only controls and are "
+                    "rejected when mode='creative'"
+                ),
+            )
 
-    for name, val in [
-        ("creativity", creativity),
-        ("resemblance", resemblance),
-        ("fractality", fractality),
-        ("hdr", hdr),
-    ]:
-        if val < -10.0 or val > 10.0:
+        preset_name = (payload.preset or "vivid").lower()
+        if preset_name not in PRESET_DEFINITIONS:
             raise HTTPException(
                 status_code=400,
-                detail=f"Slider '{name}' value {val} must be between -10 and +10.",
+                detail=f"Invalid preset '{payload.preset}'. Allowed presets: {list(PRESET_DEFINITIONS.keys())}",
             )
+        preset_defaults = PRESET_DEFINITIONS[preset_name]
+
+        creativity = payload.creativity if payload.creativity is not None else float(preset_defaults["creativity"])
+        resemblance = payload.resemblance if payload.resemblance is not None else float(preset_defaults["resemblance"])
+        fractality = payload.fractality if payload.fractality is not None else float(preset_defaults["fractality"])
+        hdr = payload.hdr if payload.hdr is not None else float(preset_defaults["hdr"])
+
+        for name, val in [
+            ("creativity", creativity),
+            ("resemblance", resemblance),
+            ("fractality", fractality),
+            ("hdr", hdr),
+        ]:
+            if val < -10.0 or val > 10.0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Slider '{name}' value {val} must be between -10 and +10.",
+                )
+        parameters = {
+            "creativity": creativity,
+            "resemblance": resemblance,
+            "fractality": fractality,
+            "hdr": hdr,
+            "denoise": map_creativity_to_denoise(creativity),
+            "controlnet_scale": map_resemblance_to_controlnet(resemblance),
+        }
 
     category = (payload.category or "universal").lower()
     if category not in CONTENT_CATEGORIES:
@@ -142,19 +236,26 @@ async def trigger_upscale(
     clean_stem = Path(payload.image_path).stem
     output_path = f"upscaled/{clean_stem}_{payload.scale}x_{task_token}.png"
 
+    if mode == "precision":
+        queued_log = (
+            f"Queued {payload.scale}x precision upscale ({engine} engine, "
+            f"sharpness {sharpness}, grain {grain}, {category} category)"
+        )
+    else:
+        queued_log = f"Queued {payload.scale}x upscale using {preset_name} preset and {category} category"
+
     db_task = Task(
         task_id=task_id,
         name=f"upscale: {Path(payload.image_path).name} ({payload.scale}x)",
         status="PROCESSING",
         progress=0,
-        logs=f"Queued {payload.scale}x upscale using {preset_name} preset and {category} category",
+        logs=queued_log,
     )
     db.add(db_task)
     db.commit()
 
     # Dispatch to background task or thread
-    background_tasks.add_task(
-        execute_upscale_job,
+    job_kwargs: Dict[str, Any] = dict(
         task_id=task_id,
         image_path=payload.image_path,
         scale=payload.scale,
@@ -165,25 +266,25 @@ async def trigger_upscale(
         category=category,
         prompt=payload.prompt,
         output_path=output_path,
+        mode=mode,
     )
+    if mode == "precision":
+        job_kwargs.update(engine=engine, sharpness=sharpness, grain=grain)
+    background_tasks.add_task(execute_upscale_job, **job_kwargs)
 
-    return {
+    response: Dict[str, Any] = {
         "message": "Upscale processing initiated successfully",
         "task_id": task_id,
         "status": "PROCESSING",
         "scale": payload.scale,
+        "mode": mode,
+        "engine": engine,  # None in creative mode — no SR engine is involved
         "preset": preset_name,
         "category": category,
         "output_path": output_path,
-        "parameters": {
-            "creativity": creativity,
-            "resemblance": resemblance,
-            "fractality": fractality,
-            "hdr": hdr,
-            "denoise": map_creativity_to_denoise(creativity),
-            "controlnet_scale": map_resemblance_to_controlnet(resemblance),
-        },
+        "parameters": parameters,
     }
+    return response
 
 
 @router.get("/status/{task_id}")
