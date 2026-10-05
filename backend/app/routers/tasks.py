@@ -348,7 +348,7 @@ class RetryResponse(BaseModel):
 @router.get("/api/tasks/list", response_model=TaskListResponse)
 def list_tasks(
     page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=1, le=100),
+    page_size: int = Query(50, ge=1, le=200),
     status_filter: Optional[str] = Query(None, alias="status"),
     task_type: Optional[str] = Query(None, alias="type"),
     search: Optional[str] = Query(None),
@@ -358,12 +358,12 @@ def list_tasks(
     query = db.query(Task)
 
     if status_filter:
-        query = query.filter(Task.status == status_filter)
+        query = query.filter(Task.status == status_filter.upper())
     if task_type:
         query = query.filter(Task.name == task_type)
     if search:
         query = query.filter(
-            Task.name.contains(search) | Task.error.contains(search)
+            Task.error.contains(search) | Task.traceback.contains(search)
         )
 
     total = query.count()
