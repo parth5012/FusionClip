@@ -32,6 +32,22 @@ def build_client(api_key: str) -> ElevenLabs:
     return ElevenLabs(api_key=api_key)
 
 
+def _post_audio(url: str, headers: Dict, payload: Dict, log_label: str) -> bytes:
+    """Shared httpx POST for binary audio endpoints (200 → bytes, else mapped error)."""
+    try:
+        resp = httpx.post(url, headers=headers, json=payload, timeout=30.0)
+    except Exception as exc:
+        logger.error(f"ElevenLabs {log_label} request failed: {exc}")
+        raise HTTPException(
+            status_code=502, detail="Failed to connect to ElevenLabs API"
+        ) from exc
+
+    if resp.status_code == 200:
+        return resp.content
+
+    _handle_elevenlabs_error(resp)
+
+
 def synthesize(
     api_key: str,
     text: str,
@@ -66,18 +82,7 @@ def synthesize(
         },
     }
 
-    try:
-        resp = httpx.post(url, headers=headers, json=payload, timeout=30.0)
-    except Exception as exc:
-        logger.error(f"ElevenLabs TTS request failed: {exc}")
-        raise HTTPException(
-            status_code=502, detail="Failed to connect to ElevenLabs API"
-        ) from exc
-
-    if resp.status_code == 200:
-        return resp.content
-
-    _handle_elevenlabs_error(resp)
+    return _post_audio(url, headers=headers, payload=payload, log_label="TTS")
 
 
 def clone_voice(
@@ -133,18 +138,7 @@ def generate_sound_effect(
     if duration_seconds is not None:
         payload["duration_seconds"] = duration_seconds
 
-    try:
-        resp = httpx.post(url, headers=headers, json=payload, timeout=30.0)
-    except Exception as exc:
-        logger.error(f"ElevenLabs sound-generation request failed: {exc}")
-        raise HTTPException(
-            status_code=502, detail="Failed to connect to ElevenLabs API"
-        ) from exc
-
-    if resp.status_code == 200:
-        return resp.content
-
-    _handle_elevenlabs_error(resp)
+    return _post_audio(url, headers=headers, payload=payload, log_label="sound-generation")
 
 
 def _handle_elevenlabs_error(resp: httpx.Response) -> NoReturn:

@@ -19,9 +19,8 @@ export function buildMediaCatalogUrl(
     if (trimmed) params.append('tag', trimmed);
   }
   const queryString = params.toString();
-  return query
-    ? `${apiBase}/api/media/search${queryString ? `?${queryString}` : ''}`
-    : `${apiBase}/api/media${queryString ? `?${queryString}` : ''}`;
+  const base = query ? `${apiBase}/api/media/search` : `${apiBase}/api/media`;
+  return queryString ? `${base}?${queryString}` : base;
 }
 
 /**

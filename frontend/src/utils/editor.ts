@@ -12,6 +12,8 @@
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
+import { readErrorDetail as readApiError } from './api';
+
 /** Recipe schema version — bumped only on a breaking recipe-shape change. */
 export const RECIPE_VERSION = 1;
 
@@ -75,6 +77,16 @@ const KNOWN_KEYS: readonly string[] = [
 ];
 
 function sliderError(name: string, value: unknown, min: number, max: number): string | null {
+  return validateIntInRange(name, value, min, max);
+}
+
+/** Shared finite/integer/range check (messages mirror the backend 400 text). */
+export function validateIntInRange(
+  name: string,
+  value: unknown,
+  min: number,
+  max: number,
+): string | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
     return `Slider '${name}' value ${String(value)} must be a finite whole number: the wire format is an integer ${min}..${max} range.`;
   }
@@ -222,11 +234,12 @@ export interface EditorRenderResponse {
 }
 
 async function readEditorError(res: Response, fallback: string): Promise<string> {
-  const err = await res.json().catch(() => ({ detail: res.statusText }));
-  const detail = err?.detail;
-  if (typeof detail === 'string') return detail;
-  if (detail) return JSON.stringify(detail);
-  return fallback;
+  return readApiError(res, fallback);
+}
+
+/** Wire alias the backend canonical recipe requires (HIGH-01). */
+export function toWireRecipe(r: EditorRecipe): EditorRecipe & { crop_aspect: CropAspect } {
+  return { ...r, crop_aspect: r.cropAspect };
 }
 
 /** Persist one versioned edit-recipe JSON sidecar (Apply leg). */
@@ -235,7 +248,7 @@ export async function saveEditorRecipe(
   recipe: EditorRecipe,
 ): Promise<EditorSaveResponse> {
   // HIGH-01: send the snake_case alias the backend canonical recipe requires.
-  const wireRecipe = { ...recipe, crop_aspect: recipe.cropAspect };
+  const wireRecipe = toWireRecipe(recipe);
   const res = await fetch(`${API_BASE_URL}/api/editor/recipe`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -261,7 +274,7 @@ export async function renderEditorImage(
   recipe: EditorRecipe,
 ): Promise<EditorRenderResponse> {
   // HIGH-01: send the snake_case alias the backend canonical recipe requires.
-  const wireRecipe = { ...recipe, crop_aspect: recipe.cropAspect };
+  const wireRecipe = toWireRecipe(recipe);
   const res = await fetch(`${API_BASE_URL}/api/editor/render`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

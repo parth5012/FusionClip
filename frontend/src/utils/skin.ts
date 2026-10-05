@@ -12,6 +12,7 @@
  * that read is unavailable, and they are assertable without a GPU.
  */
 import { isImageFile } from './upscale';
+import { validateIntInRange } from './editor';
 
 export type SkinMode = 'faithful' | 'creative' | 'flexible';
 
@@ -114,25 +115,7 @@ export function resolveSkinDetailMeaning(mode: SkinMode): { engine: string; mean
  * produces output the user cannot explain (#111 decision 4).
  */
 export function validateSkinSlider(name: SkinSliderKey, value: number): string | null {
-  if (typeof value !== 'number' || !Number.isFinite(value)) {
-    return (
-      `Slider '${name}' value ${value} must be a finite whole number: the ` +
-      `wire format is an integer ${SLIDER_MIN}..${SLIDER_MAX} range.`
-    );
-  }
-  if (!Number.isInteger(value)) {
-    return (
-      `Slider '${name}' value ${value} must be a whole number: the wire format ` +
-      `is an integer ${SLIDER_MIN}..${SLIDER_MAX} range.`
-    );
-  }
-  if (value < SLIDER_MIN || value > SLIDER_MAX) {
-    return (
-      `Slider '${name}' value ${value} is out of range: must be between ` +
-      `${SLIDER_MIN} and ${SLIDER_MAX}. Values are not clamped.`
-    );
-  }
-  return null;
+  return validateIntInRange(name, value, SLIDER_MIN, SLIDER_MAX);
 }
 
 export interface SkinEnhancePayload {

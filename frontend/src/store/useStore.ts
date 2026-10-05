@@ -180,15 +180,8 @@ export const useStore = create<AppState>()(
       version: 2,
       migrate: (persistedState: any, _version: number) => {
         if (!persistedState) return persistedState;
-        if ('apiKeys' in persistedState) {
-          const { apiKeys, ...clean } = persistedState;
-          persistedState = clean;
-        }
-        if ('colabTunnel' in persistedState) {
-          const { colabTunnel, ...clean } = persistedState;
-          return clean;
-        }
-        return persistedState;
+        const { apiKeys: _droppedKeys, colabTunnel: _droppedTunnel, ...rest } = persistedState;
+        return rest;
       },
     }
   )

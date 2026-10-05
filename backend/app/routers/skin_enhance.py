@@ -33,7 +33,7 @@ from app.ml.skin_enhancer import (
     get_flexible_preset,
     run_skin_enhancement,
 )
-from app.routers.generate import SAFE_REFERENCE_PATTERN
+from app.routers._paths import has_safe_catalog_chars
 
 logger = logging.getLogger(__name__)
 
@@ -113,16 +113,8 @@ MAX_IMAGE_PATH_LENGTH = 256
 
 
 def _is_safe_image_path_chars(value: str) -> bool:
-    """Character-class check against the *shared* `SAFE_REFERENCE_PATTERN`.
-
-    Spaces are the one addition, and it is an addition rather than a divergence:
-    an upload keeps the user's original filename as its object key
-    (`app/routers/storage.py`: `f"{folder_prefix}/{file.filename}"`), so
-    "my portrait.png" is a real, clickable catalog row. Checking
-    `value.replace(" ", "")` keeps `SAFE_REFERENCE_PATTERN` the single source of
-    truth for the character class while still refusing everything else.
-    """
-    return bool(SAFE_REFERENCE_PATTERN.match(value.replace(" ", "")))
+    """Character-class check against the shared catalog-key pattern (spaces allowed)."""
+    return has_safe_catalog_chars(value)
 
 
 def _validate_safe_image_path(value: str) -> str:

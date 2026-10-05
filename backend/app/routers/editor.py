@@ -28,7 +28,7 @@ from app.ml.image_adjust import (
     run_editor_render,
     save_editor_recipe,
 )
-from app.routers.generate import SAFE_REFERENCE_PATTERN
+from app.routers._paths import has_safe_catalog_chars
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +56,10 @@ MAX_SOURCE_PATH_LENGTH = 256
 def _validate_safe_source_path(value: str) -> str:
     """Refuse a `source_path` that is not a relative catalog key.
 
-    Same rules as the skin endpoint's image_path (shared
-    `SAFE_REFERENCE_PATTERN` plus spaces, because uploads keep the user's
-    original filename as the object key): `..`, a leading `/`, backslashes
-    and over-length keys are refused with 400.
+    Same rules as the skin endpoint's image_path (shared catalog-key pattern
+    plus spaces, because uploads keep the user's original filename as the
+    object key): `..`, a leading `/`, backslashes and over-length keys are
+    refused with 400.
     """
     if (
         not value
@@ -68,7 +68,7 @@ def _validate_safe_source_path(value: str) -> str:
         or value.startswith("/")
         or "\\" in value
         or len(value) > MAX_SOURCE_PATH_LENGTH
-        or not SAFE_REFERENCE_PATTERN.match(value.replace(" ", ""))
+        or not has_safe_catalog_chars(value)
     ):
         raise HTTPException(
             status_code=400,
