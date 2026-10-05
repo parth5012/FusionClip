@@ -101,6 +101,37 @@ def call_gemini_generate_content(
         )
 
 
+def extract_candidate_parts(data: dict) -> list:
+    """Return candidates[0].content.parts or raise 502 on empty candidates."""
+    candidates = data.get("candidates", [])
+    if not candidates or not candidates[0].get("content"):
+        raise HTTPException(
+            status_code=502, detail="Gemini returned an empty candidate list"
+        )
+    return candidates[0]["content"].get("parts", [])
+
+
+def extract_text(data: dict) -> str:
+    """Join text parts from a generateContent response."""
+    parts = extract_candidate_parts(data)
+    return "".join(part.get("text", "") for part in parts)
+
+
+def extract_inline_image(data: dict) -> bytes:
+    """Decode inlineData/inline_data image bytes or raise 502 when absent."""
+    import base64
+
+    parts = extract_candidate_parts(data)
+    for part in parts:
+        inline_data = part.get("inlineData") or part.get("inline_data")
+        if inline_data and "data" in inline_data:
+            return base64.b64decode(inline_data["data"])
+    raise HTTPException(
+        status_code=502,
+        detail="Gemini did not return image data in candidate parts",
+    )
+
+
 def generate_text(api_key: str, prompt: str, model: str = TEXT_MODEL) -> str:
     """Generate text content from a prompt using Gemini (REST generateContent)."""
     data = call_gemini_generate_content(
@@ -108,13 +139,7 @@ def generate_text(api_key: str, prompt: str, model: str = TEXT_MODEL) -> str:
         model,
         contents=[{"role": "user", "parts": [{"text": prompt}]}],
     )
-    candidates = data.get("candidates", [])
-    if not candidates or not candidates[0].get("content"):
-        raise HTTPException(
-            status_code=502, detail="Gemini returned an empty candidate list"
-        )
-    parts = candidates[0]["content"].get("parts", [])
-    return "".join(part.get("text", "") for part in parts)
+    return extract_text(data)
 
 
 def _upload_media(client: genai.Client, data: bytes, mime_type: str, display_name: str):

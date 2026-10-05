@@ -16,6 +16,7 @@ from app.database import SessionLocal
 from app.models import MediaAsset, Task
 from app.scratchpad import scratchpad
 from app.storage import generate_url, get_object_bytes, upload_object
+from app.task_logging import categorize_error
 from app.upscaler import TileUpscaler, calculate_tile_size
 
 logger = logging.getLogger(__name__)
@@ -43,19 +44,6 @@ def is_transient_error(error_msg: str) -> bool:
     return any(te in lower for te in TRANSIENT_ERRORS)
 
 
-def categorize_error(error_msg: str) -> str:
-    if not error_msg:
-        return 'runtime'
-    lower = error_msg.lower()
-    if 'out of memory' in lower or 'oom' in lower or 'memoryerror' in lower:
-        return 'OOM'
-    if 'timeout' in lower or 'timed out' in lower:
-        return 'timeout'
-    if any(v in lower for v in ('invalid', 'validation', 'bad parameter', 'unsupported')):
-        return 'validation'
-    return 'runtime'
-
-
 def update_task_retry(db_task: Task, retry_count: int, db) -> None:
     """Update retry tracking fields on task."""
     db_task.retry_count = retry_count
@@ -63,15 +51,24 @@ def update_task_retry(db_task: Task, retry_count: int, db) -> None:
     db.commit()
 
 
+def _ffprobe(args: list) -> str:
+    """Run ffprobe with shared boilerplate, return stripped stdout or '' on failure."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
 def parse_duration(file_path: str) -> float:
     """Get duration of media file in seconds using ffprobe."""
+    raw = _ffprobe(["-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", file_path])
     try:
-        cmd = [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", file_path
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        return float(result.stdout.strip())
+        return float(raw) if raw else 0.0
     except Exception as e:
         logger.error(f"Failed to parse duration {file_path}: {e}")
         return 0.0
@@ -79,14 +76,10 @@ def parse_duration(file_path: str) -> float:
 
 def parse_frame_rate(file_path: str) -> float:
     """Get the video frame rate in fps using ffprobe (handles rationals like 30000/1001)."""
+    raw = _ffprobe(["-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate",
+        "-of", "default=noprint_wrappers=1:nokey=1", file_path])
     try:
-        cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=avg_frame_rate",
-            "-of", "default=noprint_wrappers=1:nokey=1", file_path
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        raw = result.stdout.strip()
         if "/" in raw:
             num, _, den = raw.partition("/")
             return float(num) / float(den) if den else 0.0
@@ -98,17 +91,9 @@ def parse_frame_rate(file_path: str) -> float:
 
 def probe_audio_codec(file_path: str) -> str:
     """Return the first audio stream's codec name, or '' when the clip has no audio."""
-    try:
-        cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "a:0",
-            "-show_entries", "stream=codec_name",
-            "-of", "default=noprint_wrappers=1:nokey=1", file_path
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-        return result.stdout.strip()
-    except Exception as e:
-        logger.error(f"Failed to probe audio codec for {file_path}: {e}")
-        return ""
+    return _ffprobe(["-select_streams", "a:0",
+        "-show_entries", "stream=codec_name",
+        "-of", "default=noprint_wrappers=1:nokey=1", file_path])
 
 
 def run_ffmpeg_with_progress(cmd, duration: float, task_id: str, celery_task=None) -> None:

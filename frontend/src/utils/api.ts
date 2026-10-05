@@ -307,8 +307,7 @@ export async function createTag(name: string): Promise<TagItem> {
     body: JSON.stringify({ name }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to create tag');
+    throw new Error(await readErrorDetail(res, 'Failed to create tag'));
   }
   return res.json();
 }
@@ -318,8 +317,7 @@ export async function deleteTag(tagId: number): Promise<{ message: string; id: n
     method: 'DELETE',
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to delete tag');
+    throw new Error(await readErrorDetail(res, 'Failed to delete tag'));
   }
   return res.json();
 }
@@ -342,8 +340,7 @@ export async function addAssetTag(
     body: JSON.stringify({ name }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to add tag to asset');
+    throw new Error(await readErrorDetail(res, 'Failed to add tag to asset'));
   }
   return res.json();
 }
@@ -356,8 +353,7 @@ export async function removeAssetTag(
     method: 'DELETE',
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to remove tag from asset');
+    throw new Error(await readErrorDetail(res, 'Failed to remove tag from asset'));
   }
   return res.json();
 }
@@ -372,8 +368,7 @@ export async function updateAssetTags(
     body: JSON.stringify({ tags }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to update asset tags');
+    throw new Error(await readErrorDetail(res, 'Failed to update asset tags'));
   }
   return res.json();
 }
@@ -601,15 +596,7 @@ export interface GenerateImageResponse {
 async function postGenerate<T>(url: string, fallbackMessage: string): Promise<T> {
   const res = await fetch(url, { method: 'POST' });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    const detail = err?.detail;
-    let message = fallbackMessage;
-    if (typeof detail === 'string') {
-      message = detail;
-    } else if (detail) {
-      message = JSON.stringify(detail);
-    }
-    throw new Error(message);
+    throw new Error(await readErrorDetail(res, fallbackMessage));
   }
   return res.json();
 }
@@ -729,7 +716,7 @@ export interface UpscaleCategoryDefinition {
   prompt_keywords: string;
 }
 
-async function readErrorDetail(res: Response, fallback: string): Promise<string> {
+export async function readErrorDetail(res: Response, fallback: string): Promise<string> {
   const err = await res.json().catch(() => ({ detail: res.statusText }));
   const detail = err?.detail;
   if (typeof detail === 'string') return detail;
@@ -792,8 +779,7 @@ export async function startAssetBatchExport(
   });
 
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to start batch export');
+    throw new Error(await readErrorDetail(res, 'Failed to start batch export'));
   }
   return res.json();
 }
@@ -802,8 +788,7 @@ export async function startAssetBatchExport(
 export async function getExportStatus(taskId: string): Promise<ExportStatusResponse> {
   const res = await fetch(`${API_BASE_URL}/api/export/${encodeURIComponent(taskId)}`);
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || 'Failed to fetch export status');
+    throw new Error(await readErrorDetail(res, 'Failed to fetch export status'));
   }
   return res.json();
 }

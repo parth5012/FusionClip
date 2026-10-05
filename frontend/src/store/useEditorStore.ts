@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { DEFAULT_RECIPE, type AdjustOpKey, type EditorRecipe } from '../utils/editor';
+import { canonicalRecipe, DEFAULT_RECIPE, type AdjustOpKey, type EditorRecipe } from '../utils/editor';
 
 /** Full session history depth (#119: undo full session history ~50 snapshots). */
 export const MAX_UNDO_SNAPSHOTS = 50;
@@ -34,6 +34,17 @@ function pushPast(past: EditorRecipe[], snapshot: EditorRecipe): EditorRecipe[] 
     : next;
 }
 
+function withEdit(
+  state: { recipe: EditorRecipe; past: EditorRecipe[] },
+  next: EditorRecipe,
+): { recipe: EditorRecipe; past: EditorRecipe[]; future: never[] } {
+  return {
+    recipe: next,
+    past: pushPast(state.past, state.recipe),
+    future: [],
+  };
+}
+
 export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   recipe: { ...DEFAULT_RECIPE },
   past: [],
@@ -44,22 +55,14 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   setParam: (key, value) =>
     set((state) => {
       if (state.recipe[key] === value) return state; // no-op: no snapshot
-      return {
-        recipe: { ...state.recipe, [key]: value },
-        past: pushPast(state.past, state.recipe),
-        future: [],
-      };
+      return withEdit(state, { ...state.recipe, [key]: value });
     }),
 
   setRecipe: (recipe) =>
     set((state) => {
       const next = { ...recipe };
-      if (JSON.stringify(next) === JSON.stringify(state.recipe)) return state;
-      return {
-        recipe: next,
-        past: pushPast(state.past, state.recipe),
-        future: [],
-      };
+      if (canonicalRecipe(next) === canonicalRecipe(state.recipe)) return state;
+      return withEdit(state, next);
     }),
 
   undo: () =>

@@ -29,6 +29,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["settings"])
 
 
+def _set_config(db: Session, key: str, value: str) -> None:
+    """Get-or-create a Configuration row (staged, caller commits)."""
+    cfg = db.query(Configuration).filter(Configuration.key == key).first()
+    if cfg:
+        cfg.value = value
+    else:
+        db.add(Configuration(key=key, value=value))
+
+
 @router.get("/api/settings")
 def get_settings(db: Session = Depends(get_db)):
     """Return all non-secret configuration key/value pairs.
@@ -121,19 +130,8 @@ def configure_colab(
     status: str = Query("running"),
     db: Session = Depends(get_db),
 ):
-    cfg_url = db.query(Configuration).filter(Configuration.key == "colab_tunnel_url").first()
-    if cfg_url:
-        cfg_url.value = url
-    else:
-        db.add(Configuration(key="colab_tunnel_url", value=url))
-
-    cfg_status = (
-        db.query(Configuration).filter(Configuration.key == "colab_tunnel_status").first()
-    )
-    if cfg_status:
-        cfg_status.value = status
-    else:
-        db.add(Configuration(key="colab_tunnel_status", value=status))
+    _set_config(db, "colab_tunnel_url", url)
+    _set_config(db, "colab_tunnel_status", status)
 
     db.commit()
     return {"status": "SUCCESS", "colab_url": url, "colab_status": status}
@@ -183,11 +181,7 @@ async def websocket_colab_endpoint(websocket: WebSocket, token: str = Query(None
     logger.info("Colab WebSocket bridge connection established")
 
     # Set tunnel status in DB and notify Redis
-    cfg_status = db.query(Configuration).filter(Configuration.key == "colab_tunnel_status").first()
-    if cfg_status:
-        cfg_status.value = "running"
-    else:
-        db.add(Configuration(key="colab_tunnel_status", value="running"))
+    _set_config(db, "colab_tunnel_status", "running")
     db.commit()
     
     redis_client.set("colab:connected", "true")
@@ -304,10 +298,8 @@ async def websocket_colab_endpoint(websocket: WebSocket, token: str = Query(None
         logger.error(f"WebSocket error in Colab: {e}")
     finally:
         listener_task.cancel()
-        cfg_status = db.query(Configuration).filter(Configuration.key == "colab_tunnel_status").first()
-        if cfg_status:
-            cfg_status.value = "disconnected"
-            db.commit()
+        _set_config(db, "colab_tunnel_status", "disconnected")
+        db.commit()
         redis_client.set("colab:connected", "false")
 
 @router.get("/api/colab/tasks/pending")
@@ -380,11 +372,7 @@ def colab_update_metrics_http(
     }
     redis_client.set("colab:metrics", json.dumps(metrics))
     
-    cfg_status = db.query(Configuration).filter(Configuration.key == "colab_tunnel_status").first()
-    if cfg_status:
-        cfg_status.value = "running"
-    else:
-        db.add(Configuration(key="colab_tunnel_status", value="running"))
+    _set_config(db, "colab_tunnel_status", "running")
     db.commit()
         
     redis_client.set("colab:connected", "true")

@@ -71,16 +71,20 @@ export function applyTaskUpdate(tasks: TaskItem[], update: TaskUpdatePayload): T
   const existingIndex = tasks.findIndex((t) => t.task_id === update.task_id);
   if (existingIndex >= 0) {
     const existing = tasks[existingIndex];
+    const pick = <K extends keyof TaskItem>(key: K, fallback: TaskItem[K]): TaskItem[K] =>
+      update[key as keyof TaskUpdatePayload] !== undefined
+        ? (update[key as keyof TaskUpdatePayload] as TaskItem[K])
+        : fallback;
     const updatedTask: TaskItem = {
       ...existing,
       status: update.status || existing.status,
-      progress: update.progress !== undefined ? update.progress : existing.progress,
-      error: update.error !== undefined ? update.error : existing.error,
-      error_type: update.error_type !== undefined ? update.error_type : existing.error_type,
-      traceback: update.traceback !== undefined ? update.traceback : existing.traceback,
-      logs: update.logs !== undefined ? update.logs : existing.logs,
-      retry_count: update.retry_count !== undefined ? update.retry_count : existing.retry_count,
-      max_retries: update.max_retries !== undefined ? update.max_retries : existing.max_retries,
+      progress: pick('progress', existing.progress),
+      error: pick('error', existing.error),
+      error_type: pick('error_type', existing.error_type),
+      traceback: pick('traceback', existing.traceback),
+      logs: pick('logs', existing.logs),
+      retry_count: pick('retry_count', existing.retry_count),
+      max_retries: pick('max_retries', existing.max_retries),
       updated_at: new Date().toISOString(),
     };
     const nextTasks = [...tasks];

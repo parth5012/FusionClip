@@ -1,28 +1,19 @@
 """Media library listing and search endpoints."""
 
 import logging
-from typing import List, Optional
-
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
-
-from app.deps import get_db
-from app.models import MediaAsset, Tag
-from app.schemas import AssetTagsUpdate, TagCreate, TagOut
-
 import re
 import uuid
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.deps import get_db
-from app.models import MediaAsset, SubtitleTrack
-from app.schemas import SubtitleExtractOut, SubtitleTrackOut
+from app.models import MediaAsset, SubtitleTrack, Tag
+from app.schemas import AssetTagsUpdate, SubtitleExtractOut, SubtitleTrackOut, TagCreate, TagOut
 from app.services.embedding import (
     backfill_media_embeddings,
     compute_cosine_distance,
@@ -152,8 +143,7 @@ def search_media(
                 db.query(MediaAsset, cosine_dist.label("dist"))
                 .filter(MediaAsset.embedding.isnot(None))
             )
-            for t_name in filter_tags:
-                q = q.filter(MediaAsset.tags.any(func.lower(Tag.name) == t_name.lower()))
+            q = _apply_tag_filter(q, filter_tags)
             rows = (
                 q.order_by(cosine_dist)
                 .limit(limit)
@@ -163,8 +153,7 @@ def search_media(
         else:
             # SQLite / test fallback: calculate distance over assets with embeddings
             q = db.query(MediaAsset).filter(MediaAsset.embedding.isnot(None))
-            for t_name in filter_tags:
-                q = q.filter(MediaAsset.tags.any(func.lower(Tag.name) == t_name.lower()))
+            q = _apply_tag_filter(q, filter_tags)
             candidates = q.all()
             ranked = sorted(
                 (
@@ -177,8 +166,7 @@ def search_media(
 
         # Always include literal title matches (covers rows not yet backfilled).
         t_query = db.query(MediaAsset).filter(MediaAsset.title.ilike(f"%{query}%"))
-        for t_name in filter_tags:
-            t_query = t_query.filter(MediaAsset.tags.any(func.lower(Tag.name) == t_name.lower()))
+        t_query = _apply_tag_filter(t_query, filter_tags)
         text_matches = t_query.limit(limit).all()
 
         merged = {asset.id: (asset, score) for asset, score in ranked}
@@ -195,8 +183,7 @@ def search_media(
         logger.warning(f"Vector search failed, falling back to text search: {db_err}")
         db.rollback()
         q = db.query(MediaAsset).filter(MediaAsset.title.ilike(f"%{query}%"))
-        for t_name in filter_tags:
-            q = q.filter(MediaAsset.tags.any(func.lower(Tag.name) == t_name.lower()))
+        q = _apply_tag_filter(q, filter_tags)
         assets = q.limit(limit).all()
 
         return _serialize_search(
@@ -204,6 +191,20 @@ def search_media(
         )
 
 # --- Tag CRUD Endpoints ---------------------------------------------------
+
+def _apply_tag_filter(q, filter_tags):
+    """Narrow a MediaAsset query to rows carrying every tag (case-insensitive)."""
+    for t_name in filter_tags:
+        q = q.filter(MediaAsset.tags.any(func.lower(Tag.name) == t_name.lower()))
+    return q
+
+
+def _require_clean_tag_name(name: str) -> str:
+    """Strip a tag name or raise 400 when empty."""
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Tag name cannot be empty")
+    return clean_name
 
 def _get_or_create_tag(db: Session, name: str) -> Tag:
     clean_name = name.strip()
@@ -232,9 +233,7 @@ def list_tags(db: Session = Depends(get_db)):
 @router.post("/api/tags", response_model=TagOut, status_code=201)
 def create_tag(payload: TagCreate, db: Session = Depends(get_db)):
     """Create a tag or return existing tag idempotently."""
-    clean_name = payload.name.strip()
-    if not clean_name:
-        raise HTTPException(status_code=400, detail="Tag name cannot be empty")
+    clean_name = _require_clean_tag_name(payload.name)
     tag = _get_or_create_tag(db, clean_name)
     try:
         db.commit()
@@ -271,9 +270,7 @@ def add_asset_tag(asset_id: int, payload: TagCreate, db: Session = Depends(get_d
     asset = db.query(MediaAsset).filter(MediaAsset.id == asset_id).first()
     if not asset:
         raise HTTPException(status_code=404, detail="Media asset not found")
-    clean_name = payload.name.strip()
-    if not clean_name:
-        raise HTTPException(status_code=400, detail="Tag name cannot be empty")
+    clean_name = _require_clean_tag_name(payload.name)
     tag = _get_or_create_tag(db, clean_name)
     if tag not in asset.tags:
         asset.tags.append(tag)

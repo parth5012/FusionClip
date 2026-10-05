@@ -27,7 +27,7 @@ from app.ml.bgremove import (
     run_background_removal,
 )
 from app.models import MediaAsset, Task
-from app.routers.generate import SAFE_REFERENCE_PATTERN
+from app.routers._paths import has_safe_catalog_chars
 from app.storage import generate_url
 
 logger = logging.getLogger(__name__)
@@ -53,14 +53,8 @@ class BgRemoveRequest(BaseModel):
 
 
 def _is_safe_image_path_chars(value: str) -> bool:
-    """Character-class check against the shared SAFE_REFERENCE_PATTERN.
-
-    Spaces are permitted (as documented in skin_enhance.py:125 and LEARNINGS.md #211):
-    uploads keep user's original filenames as object keys (e.g. 'uploads/my photo.png').
-    Checking value.replace(' ', '') keeps SAFE_REFERENCE_PATTERN the single source
-    of truth for the character class while still refusing everything else.
-    """
-    return bool(SAFE_REFERENCE_PATTERN.match(value.replace(" ", "")))
+    """Character-class check against the shared catalog-key pattern (spaces allowed)."""
+    return has_safe_catalog_chars(value)
 
 
 def _validate_safe_image_path(value: str) -> str:

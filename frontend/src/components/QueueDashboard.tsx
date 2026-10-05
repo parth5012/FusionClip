@@ -58,34 +58,20 @@ const TASK_TYPE_OPTIONS: { value: string; label: string }[] = [
   { value: 'audio_extract', label: 'Audio Extract' },
 ];
 
+const BUCKET_STYLE: Record<TaskBucket, { badge: string; bar: string }> = {
+  running: { badge: 'bg-sky-950 text-sky-400 border-sky-800', bar: 'bg-sky-500' },
+  pending: { badge: 'bg-amber-950 text-amber-400 border-amber-800', bar: 'bg-amber-500' },
+  completed: { badge: 'bg-emerald-950 text-emerald-400 border-emerald-800', bar: 'bg-emerald-500' },
+  failed: { badge: 'bg-rose-950 text-rose-400 border-rose-800', bar: 'bg-rose-500' },
+  unknown: { badge: 'bg-slate-800 text-slate-400 border-slate-700', bar: 'bg-slate-600' },
+};
+
 function statusColor(bucket: TaskBucket): string {
-  switch (bucket) {
-    case 'running':
-      return 'bg-sky-950 text-sky-400 border-sky-800';
-    case 'pending':
-      return 'bg-amber-950 text-amber-400 border-amber-800';
-    case 'completed':
-      return 'bg-emerald-950 text-emerald-400 border-emerald-800';
-    case 'failed':
-      return 'bg-rose-950 text-rose-400 border-rose-800';
-    default:
-      return 'bg-slate-800 text-slate-400 border-slate-700';
-  }
+  return BUCKET_STYLE[bucket].badge;
 }
 
 function progressBarColor(bucket: TaskBucket): string {
-  switch (bucket) {
-    case 'running':
-      return 'bg-sky-500';
-    case 'completed':
-      return 'bg-emerald-500';
-    case 'failed':
-      return 'bg-rose-500';
-    case 'pending':
-      return 'bg-amber-500';
-    default:
-      return 'bg-slate-600';
-  }
+  return BUCKET_STYLE[bucket].bar;
 }
 
 function formatDuration(start: string | null | undefined, end: string | null | undefined): string {

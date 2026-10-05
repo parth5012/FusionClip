@@ -35,7 +35,6 @@ from app.config import settings
 from app.deps import get_db
 from app.ml.contracts import DegradedReason, make_degraded_response
 from app.ml.audio import SUPPORTED_AUDIO_TYPES, run_local_audio_generation
-from app.ml.contracts import DegradedReason, make_degraded_response
 from app.ml.image import SUPPORTED_SCHEDULERS, run_local_image_generation
 from app.models import Configuration, MediaAsset, Task
 from app.schemas import (
@@ -97,7 +96,7 @@ def _validate_aspect_ratio(val: Optional[str]) -> None:
         )
 
 
-SAFE_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9._/()-]+$")
+from app.routers._paths import SAFE_REFERENCE_PATTERN
 
 
 def _validate_safe_reference(val: Optional[str], param_name: str = "reference") -> None:
@@ -512,7 +511,6 @@ def generate_audio(
             except Exception as e:
                 logger.error(f"ElevenLabs audio synthesis failed: {e}")
                 raise HTTPException(status_code=502, detail=f"ElevenLabs audio synthesis failed: {e}")
-                filename = f"eleven_tts_{int(time.time())}_{uuid.uuid4().hex[:6]}.mp3"
 
             upload_success = upload_object(content, filename, content_type="audio/mpeg")
             if not upload_success:
@@ -815,12 +813,6 @@ def generate_image(
             detail=f"Invalid scale: must be between 0.0 and 30.0, got {scale}",
         )
 
-    if denoising_strength is not None and (denoising_strength < 0.0 or denoising_strength > 1.0):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid denoising_strength: must be between 0.0 and 1.0, got {denoising_strength}",
-        )
-
     # `strength` is img2img-only: diffusers txt2img pipelines raise TypeError on it,
     # and this route has no source-image input yet. Accepting the value and quietly
     # dropping it would be worse than refusing, so refuse with an actionable message.
@@ -870,25 +862,7 @@ def generate_image(
                 logger.error(f"Gemini image generation failed: {e}")
                 raise HTTPException(status_code=502, detail=f"Gemini image generation failed: {e}")
 
-            candidates = data.get("candidates", [])
-            if not candidates or not candidates[0].get("content"):
-                raise HTTPException(
-                    status_code=502, detail="Gemini returned an empty candidate list"
-                )
-            parts = candidates[0]["content"].get("parts", [])
-
-            img_bytes = None
-            for part in parts:
-                inline_data = part.get("inlineData") or part.get("inline_data")
-                if inline_data and "data" in inline_data:
-                    img_bytes = base64.b64decode(inline_data["data"])
-                    break
-
-            if not img_bytes:
-                raise HTTPException(
-                    status_code=502,
-                    detail="Gemini did not return image data in candidate parts",
-                )
+            img_bytes = gemini_service.extract_inline_image(data)
 
             filename = f"gemini_img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
             upload_success = upload_object(img_bytes, filename, content_type="image/png")

@@ -17,13 +17,6 @@ from pydantic import BaseModel
 
 from app.celery_app import celery
 from app.config import settings
-from app.tasks import process_multimedia_task, process_upscale_task, exponential_backoff
-from app.deps import get_db
-from app.models import Task
-from app.task_logging import parse_log_events
-
-from app.celery_app import celery
-from app.config import settings
 from app.deps import get_db
 from app.ml.guard import vram_guard
 from app.ml.registry import model_registry
@@ -34,7 +27,8 @@ from app.schemas import (
     GPUVRAMMetrics,
     ModelHealthInfo,
 )
-from app.tasks import process_multimedia_task
+from app.task_logging import parse_log_events
+from app.tasks import process_multimedia_task, process_upscale_task, exponential_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -116,60 +110,6 @@ def get_task_status(task_id: str):
         response["info"] = str(res.result)
 
     return response
-
-
-@router.get("/api/tasks/list")
-def list_tasks(
-    page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(50, ge=1, le=200, description="Items per page"),
-    status: str = None,
-    task_type: str = None,
-    search: str = None,
-    db: Session = Depends(get_db),
-):
-    """List persisted tasks with optional filtering pagination and search."""
-    query = db.query(Task)
-
-    if status:
-        query = query.filter(Task.status == status.upper())
-    if task_type:
-        query = query.filter(Task.name == task_type)
-    if search:
-        query = query.filter(
-            Task.error.contains(search) | Task.traceback.contains(search)
-        )
-
-    total = query.count()
-    tasks = (
-        query.order_by(Task.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
-
-    return {
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "tasks": [
-            {
-                "id": t.id,
-                "task_id": t.task_id,
-                "name": t.name,
-                "status": t.status,
-                "progress": t.progress,
-                "error": t.error,
-                "event_count": len(parse_log_events(t.logs)) if t.logs else 0,
-                "error_type": t.error_type,
-                "retry_count": t.retry_count,
-                "max_retries": t.max_retries,
-                "last_retry_at": t.last_retry_at.isoformat() if t.last_retry_at else None,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-                "updated_at": t.updated_at.isoformat() if t.updated_at else None,
-            }
-            for t in tasks
-        ],
-    }
 
 
 @router.post("/api/tasks/{task_id}/retry")
