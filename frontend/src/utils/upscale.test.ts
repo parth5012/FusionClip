@@ -247,4 +247,25 @@ describe('POST /api/upscale payload builder (#142, #123-d11)', () => {
     assert.equal(payload.sharpness, 100);
     assert.equal(payload.grain, 0);
   });
+
+  it('preserves custom creative slider overrides from bulk queue items (#149)', () => {
+    // When a queued item holds custom sliders, buildUpscalePayload must preserve
+    // them rather than falling back to the preset's static recipe (#149).
+    const payload = buildUpscalePayload({
+      image_path: 'inputs/batch_item.png',
+      scale: '4x',
+      mode: 'creative',
+      preset: 'subtle', // subtle defaults: creativity -4, resemblance 7, fractality -2, hdr 1
+      creativity: 5,   // custom override
+      resemblance: -3, // custom override
+      fractality: 8,   // custom override
+      hdr: 4,          // custom override
+    });
+
+    assert.equal(payload.preset, 'subtle');
+    assert.equal(payload.creativity, 5, 'custom creativity must take precedence over subtle default (-4)');
+    assert.equal(payload.resemblance, -3, 'custom resemblance must take precedence over subtle default (7)');
+    assert.equal(payload.fractality, 8, 'custom fractality must take precedence over subtle default (-2)');
+    assert.equal(payload.hdr, 4, 'custom hdr must take precedence over subtle default (1)');
+  });
 });

@@ -217,6 +217,10 @@ export default function VariantA() {
     engine: mode === 'precision' ? precisionEngine : undefined,
     sharpness: mode === 'precision' ? precisionSharpness : undefined,
     grain: mode === 'precision' ? precisionGrain : undefined,
+    creativity: mode === 'precision' ? undefined : sliders.creativity,
+    resemblance: mode === 'precision' ? undefined : sliders.resemblance,
+    fractality: mode === 'precision' ? undefined : sliders.fractality,
+    hdr: mode === 'precision' ? undefined : sliders.hdr,
   });
 
   const dispatchSource = async (source: StorageItem): Promise<QueueItem> => {
@@ -273,7 +277,7 @@ export default function VariantA() {
       for (const item of pending) {
         const source = sources.find((s) => s.path === item.sourcePath);
         if (!source) continue;
-        // Snapshot this item's own settings at dispatch time (#142)
+        // Snapshot this item's own settings at dispatch time (#142, #149)
         const payload = buildUpscalePayload({
           image_path: source.path,
           scale: item.targetScale,
@@ -283,6 +287,10 @@ export default function VariantA() {
           grain: item.grain,
           preset: item.preset as PresetType,
           category: item.category as string,
+          creativity: item.creativity,
+          resemblance: item.resemblance,
+          fractality: item.fractality,
+          hdr: item.hdr,
           prompt: item.prompt?.trim() || undefined,
         });
         const res = await startUpscale(payload);

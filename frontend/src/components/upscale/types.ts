@@ -134,6 +134,10 @@ export interface QueueItem {
   engine?: PrecisionEngine;
   sharpness?: number;
   grain?: number;
+  creativity?: number;
+  resemblance?: number;
+  fractality?: number;
+  hdr?: number;
 }
 
 /**
