@@ -831,6 +831,7 @@ def execute_upscale_job(
     category: str,
     prompt: Optional[str],
     output_path: str,
+    preview: bool = False,
     mode: str = CREATIVE_MODE,
     engine: str = "hat",
     sharpness: int = 0,
@@ -851,6 +852,16 @@ def execute_upscale_job(
 
         # Read source image from MinIO
         image_bytes = get_object_bytes(image_path)
+        if preview:
+            with Image.open(io.BytesIO(image_bytes)) as image_obj:
+                width, height = image_obj.size
+                crop_width, crop_height = min(252, width), min(252, height)
+                left = (width - crop_width) // 2
+                top = (height - crop_height) // 2
+                cropped = image_obj.crop((left, top, left + crop_width, top + crop_height))
+                preview_buffer = io.BytesIO()
+                cropped.save(preview_buffer, format="PNG")
+                image_bytes = preview_buffer.getvalue()
 
         # Run tile-based diffusion & feather stitching (or the precision SR chain)
         out_bytes, metadata = run_tile_upscale_pipeline(
@@ -898,6 +909,17 @@ def execute_upscale_job(
             db_task.logs = json.dumps(metadata)
         db.commit()
 
+        try:
+            if redis_client:
+                redis_client.publish("task_updates", json.dumps({
+                    "task_id": task_id,
+                    "status": "COMPLETED",
+                    "progress": 100,
+                    "error": None,
+                }))
+        except Exception as publish_error:
+            logger.warning(f"Failed to publish completion state for task {task_id}: {publish_error}")
+
         logger.info(f"Successfully completed upscale job {task_id} -> {output_path}")
 
     except Exception as e:
@@ -912,6 +934,16 @@ def execute_upscale_job(
                 db_task.status = "FAILED"
                 db_task.error = str(e)
                 db.commit()
+            if redis_client:
+                try:
+                    redis_client.publish("task_updates", json.dumps({
+                        "task_id": task_id,
+                        "status": "FAILED",
+                        "progress": 0,
+                        "error": str(e),
+                    }))
+                except Exception as pub_err:
+                    logger.debug(f"Could not publish failure update to Redis: {pub_err}")
         except Exception as db_e:
             logger.error(f"Failed to record failure state for task {task_id}: {db_e}")
     finally:
