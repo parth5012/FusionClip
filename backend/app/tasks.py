@@ -426,6 +426,9 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
                     output_path=output_name,
                 )
                 with SessionLocal() as db:
+                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
+                    if db_task and db_task.status == "FAILED":
+                        raise RuntimeError(db_task.error or "Upscale execution failed")
                     record_upscaled_asset(db, object_name, output_name, generate_url(output_name), params)
                 return {
                     "status": "COMPLETED",
@@ -840,7 +843,13 @@ def process_upscale_task(self, task_id: str, object_name: str, params: dict):
             category=str(params.get("category", "universal")),
             prompt=params.get("prompt"),
             output_path=processed_name,
+            preview=bool(params.get("preview", False)),
         )
+
+        with SessionLocal() as db:
+            db_t = db.query(Task).filter(Task.task_id == task_id).first()
+            if db_t and db_t.status == "FAILED":
+                raise RuntimeError(db_t.error or "Upscale execution failed")
 
         return {
             "status": "COMPLETED",
