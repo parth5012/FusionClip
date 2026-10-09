@@ -427,6 +427,40 @@ def clear_sr_runners() -> None:
     _SR_DENOISE_RUNNERS.clear()
 
 
+def make_lazy_sr_runner(engine: str, kind: str = "sr") -> Callable[[Image.Image], Image.Image]:
+    """Create a lazy runner for HAT or SCUNet backed by app.ml.registry (#150)."""
+    from app.ml.registry import INFERENCE_LOCK, model_registry
+
+    def runner(img: Image.Image) -> Image.Image:
+        if not model_registry.has_loader(engine):
+            raise SRWeightsUnavailableError(
+                f"SR weights unavailable for engine '{engine}' — run the model pull or enable Colab offload"
+            )
+        try:
+            with INFERENCE_LOCK:
+                try:
+                    from app.ml.guard import vram_guard
+                    vram_guard.check_vram(engine)
+                except Exception as guard_exc:
+                    logger.debug(f"VRAM guard check skipped or unavailable: {guard_exc}")
+                model = model_registry.load_model(engine)
+                return model(img)
+        except SRWeightsUnavailableError:
+            raise
+        except Exception as exc:
+            logger.error(f"Inference error in SR runner for '{engine}': {exc}", exc_info=True)
+            raise
+
+    setattr(runner, "_is_lazy_standard", True)
+    return runner
+
+
+def register_standard_sr_runners() -> None:
+    """Register standard lazy Torch/ONNX runners backed by app.ml.registry (#150)."""
+    register_sr_runner("hat", make_lazy_sr_runner("hat", "sr"), kind="sr", venue="local")
+    register_sr_runner("scunet", make_lazy_sr_runner("scunet", "denoise"), kind="denoise", venue="local")
+
+
 def resolve_sr_backend(engine: str, *, kind: str = "sr") -> Tuple[str, Callable[[Image.Image], Image.Image]]:
     """Resolve (venue, processor) for `engine`, or fail loudly (#123-d2/d9).
 
@@ -441,6 +475,13 @@ def resolve_sr_backend(engine: str, *, kind: str = "sr") -> Tuple[str, Callable[
         raise SRWeightsUnavailableError(
             f"SR weights unavailable for engine '{engine}' — run the model pull or enable Colab offload"
         )
+    venue, processor = entry
+    if venue == "local" and getattr(processor, "_is_lazy_standard", False):
+        from app.ml.registry import model_registry
+        if not model_registry.has_loader(engine):
+            raise SRWeightsUnavailableError(
+                f"SR weights unavailable for engine '{engine}' — run the model pull or enable Colab offload"
+            )
     return entry
 
 
@@ -875,3 +916,7 @@ def execute_upscale_job(
             logger.error(f"Failed to record failure state for task {task_id}: {db_e}")
     finally:
         db.close()
+
+
+# Wire standard lazy SR runners on module initialization (#150)
+register_standard_sr_runners()
