@@ -8,7 +8,7 @@ engine standing in for the real SR models.
 
 import io
 import pytest
-from PIL import Image
+from PIL import Image, ImageFilter
 import numpy as np
 
 from app.services.upscaler import (
@@ -32,6 +32,7 @@ from app.services.upscaler import (
     map_sharpness_to_percent,
     precision_chain_plan,
     register_sr_runner,
+    register_standard_sr_runners,
     resolve_sr_backend,
 )
 from app.models import Task, MediaAsset
@@ -42,8 +43,12 @@ from app.storage import upload_object
 def _clean_sr_runners():
     """The SR runner registry is module-level state; isolate every test."""
     clear_sr_runners()
+    from app.ml.registry import model_registry
+    model_registry.reset()
     yield
     clear_sr_runners()
+    from app.ml.registry import model_registry
+    model_registry.reset()
 
 
 def _png_bytes(size=(64, 64), color=(90, 140, 200)) -> bytes:
@@ -455,6 +460,36 @@ class TestSRWeightsUnavailablePolicy:
         register_sr_runner("hat", lambda img: img, venue="colab")
         venue, processor = resolve_sr_backend("hat")
         assert venue == "colab"
+
+    def test_standard_loaders_resolve_without_error(self):
+        """Assert resolve_sr_backend('hat') does not raise SRWeightsUnavailableError when standard loaders are registered (#150)."""
+        from app.ml.registry import model_registry
+
+        hat_meta = model_registry.get("hat")
+        mock_model = lambda img: img.filter(ImageFilter.SHARPEN)
+        model_registry.register(hat_meta, loader_handle=lambda: mock_model)
+
+        register_standard_sr_runners()
+        venue, processor = resolve_sr_backend("hat")
+        assert venue == "local"
+        assert callable(processor)
+
+        test_tile = Image.new("RGB", (32, 32), (100, 100, 100))
+        out_tile = processor(test_tile)
+        assert out_tile.size == (32, 32)
+
+    def test_standard_loaders_fail_loudly_upfront_when_weights_absent(self):
+        """Standard runners fail loudly up front in resolve_sr_backend when loader is not bound (#123-d9)."""
+        from app.ml.registry import model_registry
+
+        # Reset hat entry to have no loader
+        hat_meta = model_registry.get("hat")
+        model_registry.register(hat_meta, loader_handle=None)
+
+        register_standard_sr_runners()
+        with pytest.raises(SRWeightsUnavailableError) as exc_info:
+            resolve_sr_backend("hat")
+        assert "SR weights unavailable for engine 'hat'" in str(exc_info.value)
 
     def test_precision_job_marks_task_failed_with_loud_error(self, client, stub_storage):
         import app.storage as storage

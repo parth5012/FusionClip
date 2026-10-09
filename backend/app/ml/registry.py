@@ -176,6 +176,22 @@ PINNED_ROSTER: List[ModelMetadata] = [
             "checkout, see DIFFBIR_REPO_PATH)"
         ),
     ),
+    ModelMetadata(
+        model_id="hat",
+        family="image",
+        dtype_quant="fp16",
+        approx_vram_gb=2.3,
+        license="Apache-2.0",
+        description="HAT (Hybrid Attention Transformer) super-resolution model for faithful detail recovery",
+    ),
+    ModelMetadata(
+        model_id="scunet",
+        family="image",
+        dtype_quant="fp16",
+        approx_vram_gb=2.1,
+        license="Apache-2.0",
+        description="SCUNet practical blind image denoising model",
+    ),
 ]
 
 
@@ -237,6 +253,12 @@ class ModelRegistry:
         if model_id not in self._models:
             return False
         return self._models[model_id].is_loaded
+
+    def has_loader(self, model_id: str) -> bool:
+        """Check if a loader handle is registered (or instance loaded) for model_id."""
+        with self._lock:
+            entry = self._models.get(model_id)
+            return bool(entry and (entry.loader_handle is not None or entry.is_loaded))
 
     def load_model(
         self,

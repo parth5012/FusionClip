@@ -56,6 +56,8 @@ class TestModelRegistry:
             "svd",
             "gfpgan",
             "diffbir",
+            "hat",
+            "scunet",
         }
         # Exact roster: nothing extra, nothing missing (Decision #4 pins the roster).
         assert set(models.keys()) == expected_ids
