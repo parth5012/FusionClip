@@ -1,5 +1,15 @@
 # Learnings & Edge Cases
 
+## 2026-10-09: Unified Upscale Studio & SR Runners (Map #145)
+
+### 38. Upfront Failure Contracts vs Lazy Model Registration
+- When architecture requires failing loudly up front before any pixel work, canvas allocation, or progress broadcasting begins (decision #123-d9), lazy model runners cannot wait until tile execution to detect missing weights.
+- `resolve_sr_backend` must verify that the underlying model loader is registered (`model_registry.has_loader(engine)`) at resolution time. This ensures missing weights reject before expensive pipeline initialization while allowing lazy execution under `INFERENCE_LOCK` once resolved.
+
+### 39. Zustand Tab Migration on Surface Consolidation
+- When deleting a deprecated panel component (`UpscalerPanel.tsx`) and its sidebar tab (`upscaler`), localStorage may still hold the old active tab identifier for existing users.
+- Bump the Zustand persist store version (e.g. `version: 3`) and implement `migrate` to rewrite `rest.activeTab = 'upscale'`, while also aliasing `case 'upscaler'` in `page.tsx` to `<UpscalePanel />` to eliminate any possible white screen or broken layout.
+
 ## 2026-09-23: Trust & Integrity Architecture (Map #67)
 
 ### 1. SQLite vs PostgreSQL Vector Search in Tests

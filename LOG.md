@@ -1,5 +1,41 @@
 # Execution Log
 
+## 2026-10-09: Wayfinder Map #145 - Unified Upscale Studio & Engine
+
+### Status: Done (all 5 child tickets closed; no open children remain)
+
+### Phase 1 - HITL:
+- **#146 - Upscale: Decide surface consolidation & legacy task endpoint deprecation (grilling)**
+  - Operator locked: immediate hard cutover removing \`"upscale"\` from \`ALLOWED_TASK_TYPES\` in \`tasks.py\` with explicit 400 redirect guidance; complete removal of legacy \`UpscalerPanel\` tab and component; single authoritative \`upscale\` tab labeled "Upscale Studio".
+  - Closed; appended to Map #145 Decisions so far.
+- **#147 - Upscale: Prototype production studio layout without PrototypeSwitcher (prototype)**
+  - Created branch \`prototype/clean-studio-ui\` (commit \`a75e7a5\`) removing developer \`PrototypeSwitcher\`, \`VariantB\`, and \`VariantC\`, mounting \`VariantA\` directly at \`UpscalePanel.tsx\` without floating bar padding.
+  - Verified: \`npx tsc --noEmit\` clean, \`next build\` successful, captured Playwright screenshot: https://files.catbox.moe/dpv44g.png.
+  - Operator approved. Closed; appended to Map #145 Decisions so far.
+
+### Phase 2 - AFK (single-PR mode: 3 code-changing tickets, branch \`wf/145-unified-upscale\`):
+- **#148 - Upscale: Collapse task routing and retire legacy app/upscaler.py (task)**
+  - Removed \`"upscale"\` from \`ALLOWED_TASK_TYPES\` in \`backend/app/routers/tasks.py\` (returns 400 with redirect guidance).
+  - Collapsed Celery task execution in \`backend/app/tasks.py\` directly onto \`app.services.upscaler.execute_upscale_job\` and populated \`MediaAsset.source_path\` lineage.
+  - Converted \`backend/app/upscaler.py\` into a deprecated compatibility shim retaining \`UpscaleParams\` and \`apply_temporal_blend\` for video upscale callers.
+  - Deleted \`frontend/src/components/UpscalerPanel.tsx\` and obsolete \`e2e/09-upscaler-before-after.spec.ts\`. Updated \`Sidebar.tsx\` and \`page.tsx\`.
+  - Commit \`668f4e2\`.
+- **#149 - Upscale: Persist custom slider values in Variant A bulk queue (task)**
+  - Extended \`QueueItem\` in \`types.ts\` with \`creativity\`, \`resemblance\`, \`fractality\`, \`hdr\`.
+  - Snapshotted active sliders in \`makeQueuedItem\` (\`VariantA.tsx\`) and forwarded them in \`handleStartBulk\`.
+  - Added unit test in \`src/utils/upscale.test.ts\` verifying \`buildUpscalePayload\` preserves custom creative sliders on queued items.
+  - Commit \`b9d74c1\`.
+- **#150 - Upscale: Register production Torch SR runners for precision mode (task)**
+  - Registered \`hat\` (2.3 GB) and \`scunet\` (2.1 GB) in \`PINNED_ROSTER\` in \`backend/app/ml/registry.py\`. Added \`has_loader()\` helper to \`ModelRegistry\`.
+  - Implemented \`make_lazy_sr_runner\` and \`register_standard_sr_runners\` in \`backend/app/services/upscaler.py\` under \`INFERENCE_LOCK\` with \`vram_guard\`.
+  - Enforced #123-d9 upfront fail-loudly check in \`resolve_sr_backend\` when loaders are unbound before pixel work.
+  - Added TDD tests in \`backend/tests/test_upscale_engine.py\` and updated roster assertions in \`test_localml_scaffold.py\`.
+  - Commit \`fb7fc7d\`.
+
+### Overall Verification:
+- Backend: 130 targeted pytest tests passing (\`pytest backend/tests/test_upscale*.py backend/tests/test_tasks_validation.py backend/tests/test_localml_scaffold.py\`).
+- Frontend: \`npx tsc --noEmit\` clean (0 errors); \`npx tsx --test src/utils/*.test.ts\` -> 112 passed; \`next build\` succeeds.
+
 ## 2026-09-30: Wayfinder Map #76 - Deep Parity, Precision Upscaler (16x)
 
 ### Status: Done (all 4 child tickets closed; no open children remain)
