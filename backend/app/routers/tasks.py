@@ -36,7 +36,7 @@ redis_client = redis.from_url(settings.REDIS_URL)
 router = APIRouter(tags=["tasks"])
 
 ALLOWED_TASK_TYPES = frozenset(
-    {"transcode", "thumbnail", "waveform", "audio_extract", "upscale", "video_upscale"}
+    {"transcode", "thumbnail", "waveform", "audio_extract", "video_upscale"}
 )
 
 
@@ -45,7 +45,7 @@ def run_processing_pipeline(
     path: str = Query(..., description="Key of the object to process"),
     task_type: str = Query(
         "transcode",
-        description="Pipeline type: transcode, audio_extract, thumbnail, waveform, upscale, video_upscale",
+        description="Pipeline type: transcode, audio_extract, thumbnail, waveform, video_upscale",
     ),
     denoise: Optional[float] = Query(
         None, description="Upscale: Denoising Strength (Creativity)"
@@ -65,6 +65,11 @@ def run_processing_pipeline(
     ),
 ):
     """Dispatch long-running celery worker multimedia task processing pipeline."""
+    if task_type == "upscale":
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid task_type 'upscale'. Upscaling is now served exclusively via POST /api/upscale.",
+        )
     if task_type not in ALLOWED_TASK_TYPES:
         raise HTTPException(
             status_code=400,

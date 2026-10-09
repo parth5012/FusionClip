@@ -842,6 +842,7 @@ def execute_upscale_job(
         media_asset = MediaAsset(
             title=title,
             file_path=output_path,
+            source_path=image_path,
             file_size=len(out_bytes),
             content_type="image/png",
             embedding=embedding_vec,

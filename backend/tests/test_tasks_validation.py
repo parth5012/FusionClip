@@ -17,6 +17,12 @@ class TestTaskTypeValidation:
         res_bogus = client.post("/api/tasks/process?path=sample.mp4&task_type=definitely_not_real")
         assert res_bogus.status_code == 400
 
+    def test_legacy_upscale_task_type_rejected_with_specific_guidance(self, client):
+        """POST /api/tasks/process?task_type=upscale must reject with 400 and redirect guidance (#146)."""
+        res = client.post("/api/tasks/process?path=sample.png&task_type=upscale")
+        assert res.status_code == 400
+        assert res.json()["detail"] == "Invalid task_type 'upscale'. Upscaling is now served exclusively via POST /api/upscale."
+
     def test_implemented_task_types_accepted(self, client, monkeypatch):
         """All supported pipeline types must be accepted."""
         # Mock Celery delay to avoid needing live Redis broker in unit test

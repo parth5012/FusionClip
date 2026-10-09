@@ -1,19 +1,8 @@
-"""Magnific-style generative upscaler pipeline (CPU fallback + Colab params).
+"""DEPRECATED: Legacy upscaler compatibility shim (#148).
 
-Implements the decisions recorded on the wayfinder map #56:
-
-- HDR (#57/#61): a zero-GPU PIL post-pass — UnsharpMask + Contrast.
-- Fractality (#57/#61): pre-tile Gaussian noise injection plus a
-  ``guidance_scale`` bump (7 → 12) when enabled, forwarded to the Colab
-  worker so the notebook's diffusion pipeline applies it during sampling.
-- Prompt guidance (#59): an optional text prompt threaded through the task
-  dispatch as an img2img positive prompt for each tile pass.
-
-When a Colab worker is connected the parameters are forwarded as-is and the
-notebook is expected to run the actual SDXL/Flux + ControlNet Tile inference
-(see ``guide/Colab guide.md``). When no worker is available this module runs
-a deterministic tile-based Lanczos upscale with feather blending plus the
-HDR / Fractality post-processing so the pipeline stays functional offline.
+All production image upscale requests have been collapsed onto `POST /api/upscale`
+backed by `app.services.upscaler`. This module remains as a compatibility shim
+providing `UpscaleParams`, `apply_temporal_blend`, and legacy tile helpers.
 """
 
 from __future__ import annotations

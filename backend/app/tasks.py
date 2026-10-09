@@ -7,6 +7,7 @@ import sys
 import time
 import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import redis
@@ -17,7 +18,6 @@ from app.models import MediaAsset, Task
 from app.scratchpad import scratchpad
 from app.storage import generate_url, get_object_bytes, upload_object
 from app.task_logging import categorize_error
-from app.upscaler import TileUpscaler, calculate_tile_size
 
 logger = logging.getLogger(__name__)
 
@@ -410,37 +410,32 @@ def process_media_heavy(self, object_name: str, task_type: str = "transcode", **
             }))
             raise TimeoutError("Colab execution timed out")
         if task_type == "upscale":
-            from app.upscaler import run_upscale_task
+            from app.services.upscaler import execute_upscale_job
+            output_name = f"processed/upscaled_{Path(object_name).stem}.png"
             try:
-                result = run_upscale_task(object_name, params, task_id=task_id)
+                execute_upscale_job(
+                    task_id=task_id,
+                    image_path=object_name,
+                    scale=int(upscale_kwargs.get("scale", 2)),
+                    creativity=float(upscale_kwargs.get("creativity", 0.0)),
+                    resemblance=float(upscale_kwargs.get("resemblance", 0.0)),
+                    fractality=float(upscale_kwargs.get("fractality", 0.0)),
+                    hdr=float(upscale_kwargs.get("hdr", 0.0)),
+                    category=str(upscale_kwargs.get("category", "universal")),
+                    prompt=upscale_kwargs.get("prompt"),
+                    output_path=output_name,
+                )
                 with SessionLocal() as db:
-                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
-                    if db_task:
-                        db_task.status = "COMPLETED"
-                        db_task.progress = 100
-                        db.commit()
-                    record_upscaled_asset(db, object_name, result.get("processed_name"), result.get("processed_url"), params)
-                redis_client.publish("task_updates", json.dumps({
-                    "task_id": task_id,
+                    record_upscaled_asset(db, object_name, output_name, generate_url(output_name), params)
+                return {
                     "status": "COMPLETED",
-                    "progress": 100,
-                    "error": None,
-                }))
-                return result
+                    "task_id": task_id,
+                    "original_object": object_name,
+                    "processed_name": output_name,
+                    "processed_url": generate_url(output_name),
+                }
             except Exception as e:
                 logger.error(f"Error executing local upscale task {task_id}: {e}")
-                with SessionLocal() as db:
-                    db_task = db.query(Task).filter(Task.task_id == task_id).first()
-                    if db_task:
-                        db_task.status = "FAILED"
-                        db_task.error = str(e)
-                        db.commit()
-                redis_client.publish("task_updates", json.dumps({
-                    "task_id": task_id,
-                    "status": "FAILED",
-                    "progress": 0,
-                    "error": str(e),
-                }))
                 raise
         if task_type == "video_upscale":
             try:
@@ -821,13 +816,9 @@ def process_upscale_task(self, task_id: str, object_name: str, params: dict):
         }))
         raise TimeoutError("Colab execution timed out")
         
-    # Local fallback processing
-    from PIL import Image
-    from app.scratchpad import scratchpad
-    
-    temp_in = scratchpad.get_temp_path(suffix="_in.png")
-    temp_out = scratchpad.get_temp_path(suffix="_out.png")
-    
+    # Local fallback processing via shared upscaler service
+    from app.services.upscaler import execute_upscale_job
+
     db = SessionLocal()
     db_task = db.query(Task).filter(Task.task_id == task_id).first()
     if not db_task:
@@ -835,107 +826,28 @@ def process_upscale_task(self, task_id: str, object_name: str, params: dict):
         db.add(db_task)
         db.commit()
     db.close()
-    
-    from app.storage import s3_client
+
     try:
-        # Download S3 object locally
-        s3_client.download_file(settings.MINIO_BUCKET_NAME, object_name, str(temp_in))
-        
-        # Open source image
-        img = Image.open(str(temp_in))
-        
-        # Crop for preview mode if needed
-        if params.get("preview", False):
-            w, h = img.size
-            cw, ch = min(252, w), min(252, h)
-            left = (w - cw) // 2
-            top = (h - ch) // 2
-            img = img.crop((left, top, left + cw, top + ch))
-            
-        # Progress callback setup
-        def progress_callback(percent, msg):
-            self.update_state(state="PROGRESS", meta={"percent": percent, "status": msg})
-            db = SessionLocal()
-            try:
-                db_t = db.query(Task).filter(Task.task_id == task_id).first()
-                if db_t:
-                    db_t.progress = percent
-                db.commit()
-            finally:
-                db.close()
-                
-            redis_client.publish("task_updates", json.dumps({
-                "task_id": task_id,
-                "status": "PROCESSING",
-                "progress": percent,
-                "error": None
-            }))
-            
-        # Resolve tile size
-        width, height = img.size
-        tile_size = calculate_tile_size(width, height, 16.0)
-        
-        # Execute upscaler engine with OOM protection
-        while True:
-            try:
-                upscaler = TileUpscaler(tile_size=tile_size, overlap=0.25)
-                # We scale by 2.0x default
-                upscaled_img = upscaler.upscale(
-                    img,
-                    upscale_factor=2.0,
-                    progress_callback=progress_callback,
-                    **params
-                )
-                break
-            except Exception as e:
-                is_oom = "out of memory" in str(e).lower() or "oom" in str(e).lower()
-                if is_oom and tile_size > 256:
-                    logger.warning(f"OOM error: reducing tile size from {tile_size} to {tile_size - 256} and retrying")
-                    tile_size = max(256, tile_size - 256)
-                else:
-                    raise e
-                    
-        # Save output image
-        upscaled_img.save(str(temp_out))
-        
-        # Upload scale result back
         processed_name = f"processed/scaled_{int(time.time())}_{object_name.split('/')[-1]}"
-        with open(str(temp_out), "rb") as f:
-            upload_success = upload_object(f.read(), processed_name, content_type="image/png")
-            
-        # Final success update
-        db = SessionLocal()
-        try:
-            db_t = db.query(Task).filter(Task.task_id == task_id).first()
-            if db_t:
-                db_t.status = "COMPLETED"
-                db_t.progress = 100
-            db.commit()
-            
-            # Create MediaAsset record
-            asset = MediaAsset(
-                title=f"Upscaled: {object_name.split('/')[-1]}",
-                file_path=processed_name,
-                file_size=os.path.getsize(str(temp_out)),
-                content_type="image/png"
-            )
-            db.add(asset)
-            db.commit()
-        finally:
-            db.close()
-            
-        redis_client.publish("task_updates", json.dumps({
-            "task_id": task_id,
-            "status": "COMPLETED",
-            "progress": 100,
-            "error": None
-        }))
-        
+        execute_upscale_job(
+            task_id=task_id,
+            image_path=object_name,
+            scale=int(params.get("scale", 2)),
+            creativity=float(params.get("creativity", 0.0)),
+            resemblance=float(params.get("resemblance", 0.0)),
+            fractality=float(params.get("fractality", 0.0)),
+            hdr=float(params.get("hdr", 0.0)),
+            category=str(params.get("category", "universal")),
+            prompt=params.get("prompt"),
+            output_path=processed_name,
+        )
+
         return {
             "status": "COMPLETED",
             "task_id": task_id,
             "original_object": object_name,
-            "processed_url": generate_url(processed_name) if upload_success else None
+            "processed_url": generate_url(processed_name),
+            "processed_name": processed_name,
         }
     except Exception as e:
         logger.error(f"Error executing upscale task {task_id}: {e}")
@@ -948,7 +860,6 @@ def process_upscale_task(self, task_id: str, object_name: str, params: dict):
             db.commit()
         finally:
             db.close()
-            
         redis_client.publish("task_updates", json.dumps({
             "task_id": task_id,
             "status": "FAILED",
@@ -956,9 +867,6 @@ def process_upscale_task(self, task_id: str, object_name: str, params: dict):
             "error": str(e)
         }))
         raise e
-    finally:
-        scratchpad.remove_path(temp_in)
-        scratchpad.remove_path(temp_out)
 
 class CLIPEmbedder:
     _model = None
