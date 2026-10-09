@@ -32,8 +32,6 @@ const UPSCALE_CATEGORIES = [
   { id: 'product', label: 'Product' },
 ] as const;
 
-import UpscalerPanel from './UpscalerPanel';
-
 export default function FileManager() {
   const { setSkinTarget } = useStore();
   const [currentDir, setCurrentDir] = useState<string>('');

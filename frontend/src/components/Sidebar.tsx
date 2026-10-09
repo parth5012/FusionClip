@@ -28,15 +28,9 @@ const menuItems = [
   },
   {
     id: 'upscale' as TabType,
-    label: 'Magnific Upscaler',
+    label: 'Upscale Studio',
     icon: Cpu,
     description: 'Tile & Feather Diffusion',
-  },
-  {
-    id: 'upscaler' as TabType,
-    label: 'Upscaler',
-    icon: Wand2,
-    description: 'Magnific-style upscale',
   },
   {
     id: 'players' as TabType,

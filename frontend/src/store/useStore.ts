@@ -177,10 +177,13 @@ export const useStore = create<AppState>()(
       // state mutation (which never fires when the backend is unreachable).
       // v2 additionally drops the cached colabTunnel slice (#79): the tunnel
       // badge must reflect the backend on every load, never stale storage.
-      version: 2,
+      version: 3,
       migrate: (persistedState: any, _version: number) => {
         if (!persistedState) return persistedState;
         const { apiKeys: _droppedKeys, colabTunnel: _droppedTunnel, ...rest } = persistedState;
+        if (rest.activeTab === 'upscaler') {
+          rest.activeTab = 'upscale';
+        }
         return rest;
       },
     }
