@@ -130,6 +130,7 @@ def stub_storage(monkeypatch):
         "app.routers.editor",
         "app.ml.bgremove",
         "app.routers.bgremove",
+        "app.services.media_derivative",
     ):
         for name, impl in (
             ("upload_object", _upload_object),

@@ -1,5 +1,22 @@
 # Execution Log
 
+## 2026-10-14: Wayfinder Map #151 - Media Derivative & Lineage Service
+
+### Status: In Progress
+
+### Phase 1 - HITL:
+- **#152 - MediaDerivative: Decide derivative invariants & atomic rollback contract (grilling)**
+  - Operator locked: standardized `{pipeline_folder}/{clean_stem}_{qualifier}_{token}.{ext}` storage keys with 12-hex unique token; synchronous compensating deletes via `delete_object` on DB rollback; relational lineage tracked via `MediaAsset.source_path` with zero schema migrations.
+  - Closed; documented in `DECISIONS.md`; appended to Map #151 Decisions so far.
+
+### Phase 2 - AFK:
+- **#153 - MediaDerivative: Implement deep MediaDerivativeService module (task)**
+  - Created `backend/app/services/media_derivative.py` implementing `MediaDerivativeService` and `record_derivative`.
+  - Hides S3 upload, stem sanitization, catalog insert with `source_path` lineage, and synchronous compensating rollback for derivative and auxiliary sidecars.
+  - Hardened against path traversal, stream EOF cursor exhaustion, and isolated post-commit refresh failures.
+  - Added 17 unit tests in `backend/tests/test_media_derivative.py` and registered service in `conftest.py:stub_storage`.
+  - Closed; appended to Map #151 Decisions so far.
+
 ## 2026-10-09: Wayfinder Map #145 - Unified Upscale Studio & Engine
 
 ### Status: Done (all 5 child tickets closed; no open children remain)
