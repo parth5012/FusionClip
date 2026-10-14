@@ -45,8 +45,12 @@ from app.ml.registry import (
     model_registry,
 )
 from app.models import MediaAsset, Task
-from app.services.embedding import get_embedding
-from app.storage import delete_object, download_object, generate_url, upload_object
+from app.services.media_derivative import (
+    build_derivative_key,
+    record_derivative,
+    sanitize_stem,
+)
+from app.storage import download_object, generate_url, upload_object
 
 try:
     from app.routers.tasks import redis_client
@@ -302,18 +306,21 @@ def _default_bgremove_runner(image: Image.Image, tier: str = TIER_FAST) -> Image
 # ---------------------------------------------------------------------------
 
 def _sanitize_output_stem(source_path: str) -> str:
-    """Clean stem to safe alphanumeric + underscore chars."""
-    stem = UNSAFE_STEM_CHARS.sub("_", Path(source_path).stem).strip("._")
-    return stem or DEFAULT_OUTPUT_STEM
+    """Clean stem to safe alphanumeric + underscore chars via MediaDerivativeService."""
+    return sanitize_stem(source_path, default=DEFAULT_OUTPUT_STEM)
 
 
 def build_bgremove_filename(source_path: str, token: Optional[str] = None) -> str:
     """Construct unique output key: bg_removed/<stem>_<12_hex>.png.
 
-    The 12-hex unique token prevents collisions across concurrent operations.
+    Delegates to MediaDerivativeService.build_derivative_key for repo consistency.
     """
-    tok = token or uuid.uuid4().hex[:12]
-    return f"{OUTPUT_PREFIX}/{_sanitize_output_stem(source_path)}_{tok}.png"
+    return build_derivative_key(
+        source_path=source_path,
+        pipeline="bgremove",
+        token=token,
+        extension="png",
+    )
 
 
 def _cap_dimension(image: Image.Image) -> Image.Image:
@@ -510,39 +517,27 @@ def run_background_removal(
     output_image.save(out_buf, format="PNG", optimize=True)
     png_bytes = out_buf.getvalue()
 
-    # 7. Upload derivative to storage
+    # 7 & 8. Upload derivative and record MediaAsset with source_path lineage via MediaDerivativeService
     filename = build_bgremove_filename(image_path, token=task_token)
     _publish_task_update(task_id, 75, "PROCESSING", step_message="Uploading derivative to storage")
-    if not upload_object(png_bytes, filename, content_type="image/png"):
-        logger.error(f"Failed to upload isolated image '{filename}' to storage")
-        if db is not None and db_task is not None:
-            db_task.status = "FAILED"
-            db_task.error = "Storage upload failed"
-            db.commit()
-        _publish_task_update(task_id, 0, "FAILED", error="Storage upload failed")
-        return make_degraded_response(
-            reason=DegradedReason.LOAD_FAILED.value,
-            message="Failed to upload isolated image to storage",
-            model_id=model_id,
-        ).model_dump()
+    title = f"Background Removed: {Path(image_path).stem} ({tier})"
 
-    # 8. Record MediaAsset in catalog with source_path lineage
-    if db is not None:
-        try:
-            title = f"Background Removed: {Path(image_path).stem} ({tier})"
-            asset = MediaAsset(
-                title=title,
-                file_path=filename,
-                file_size=len(png_bytes),
-                content_type="image/png",
-                duration=0.0,
-                # Lineage: pairs source and derivative without mutating source
-                source_path=image_path,
-                embedding=get_embedding(title),
-            )
-            db.add(asset)
+    try:
+        deriv_res = record_derivative(
+            db=db,
+            source_path=image_path,
+            file_data=png_bytes,
+            pipeline="bgremove",
+            output_path=filename,
+            title=title,
+            content_type="image/png",
+            duration=0.0,
+            auto_commit=False,
+            upload_fn=upload_object,
+        )
 
-            # Update Task row to COMPLETED
+        # Update Task row to COMPLETED and commit catalog changes
+        if db is not None:
             if db_task is not None:
                 db_task.status = "COMPLETED"
                 db_task.progress = 100
@@ -554,17 +549,28 @@ def run_background_removal(
                     "height": output_image.height,
                 })
             db.commit()
-        except Exception as exc:
-            logger.error(f"Failed to save background-removed asset to catalog: {exc}")
-            db.rollback()
-            # Clean up orphaned storage blob to avoid leaking objects in MinIO (#116 review fix 5)
+    except RuntimeError as up_err:
+        logger.error(f"Failed to upload isolated image '{filename}' to storage: {up_err}")
+        if db is not None and db_task is not None:
             try:
-                delete_object(filename)
-            except Exception as del_err:
-                logger.warning(
-                    f"Failed to delete orphaned derivative '{filename}' from storage: {del_err}"
-                )
-
+                db_task.status = "FAILED"
+                db_task.error = "Storage upload failed"
+                db.commit()
+            except Exception:
+                pass
+        _publish_task_update(task_id, 0, "FAILED", error="Storage upload failed")
+        return make_degraded_response(
+            reason=DegradedReason.LOAD_FAILED.value,
+            message="Failed to upload isolated image to storage",
+            model_id=model_id,
+        ).model_dump()
+    except Exception as exc:
+        logger.error(f"Failed to save background-removed asset to catalog: {exc}")
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
             if db_task is not None:
                 try:
                     db_task.status = "FAILED"
@@ -572,12 +578,12 @@ def run_background_removal(
                     db.commit()
                 except Exception:
                     pass
-            _publish_task_update(task_id, 0, "FAILED", error=str(exc))
-            return make_degraded_response(
-                reason=DegradedReason.LOAD_FAILED.value,
-                message=f"Failed to save asset to catalog: {exc}",
-                model_id=model_id,
-            ).model_dump()
+        _publish_task_update(task_id, 0, "FAILED", error=str(exc))
+        return make_degraded_response(
+            reason=DegradedReason.LOAD_FAILED.value,
+            message=f"Failed to save asset to catalog: {exc}",
+            model_id=model_id,
+        ).model_dump()
 
     _publish_task_update(task_id, 100, "COMPLETED", step_message="Subject isolation complete")
 

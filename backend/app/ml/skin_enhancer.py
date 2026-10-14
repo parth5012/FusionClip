@@ -75,7 +75,11 @@ from app.ml.contracts import DegradedReason, make_degraded_response
 from app.ml.guard import VRAMRefusalError, vram_guard
 from app.ml.registry import INFERENCE_LOCK, model_registry
 from app.models import MediaAsset
-from app.services.embedding import get_embedding
+from app.services.media_derivative import (
+    build_derivative_key,
+    record_derivative,
+    sanitize_stem,
+)
 from app.storage import download_object, generate_url, upload_object
 
 logger = logging.getLogger(__name__)
@@ -1101,28 +1105,23 @@ DEFAULT_OUTPUT_STEM = "portrait"
 def _sanitize_output_stem(source_path: str) -> str:
     """Reduce a caller-supplied key to a stem that is safe inside a storage key.
 
-    The stem is untrusted input: `Path("..").stem` is `".."`, which would mint
-    `skin_enhanced/.._<token>.png`. The transform is deliberately boring -
-    disallowed characters (including the spaces an uploaded filename may carry)
-    become `_`, leading and trailing `.`/`_` are stripped so the stem cannot
-    collapse into a traversal segment, and an all-punctuation stem falls back to
-    `DEFAULT_OUTPUT_STEM`. Only new derivative keys are affected; no existing
-    catalog row changes.
+    Delegates to MediaDerivativeService.sanitize_stem with fallback to DEFAULT_OUTPUT_STEM.
     """
-    stem = UNSAFE_STEM_CHARS.sub("_", Path(source_path).stem).strip("._")
-    return stem or DEFAULT_OUTPUT_STEM
+    return sanitize_stem(source_path, default=DEFAULT_OUTPUT_STEM)
 
 
 def build_skin_filename(source_path: str) -> str:
     """Unique output key: `skin_enhanced/<stem>_<12 hex>.png` (#111 decision 7).
 
-    The unique-token suffix is mandatory, not cosmetic. #96 shipped
-    `upscaled/<stem>_<scale>x.png` with a second-resolution token that collapsed
-    to a shared prefix, so concurrent jobs on one source overwrote each other's
-    output and cross-linked their status lookups. 12 hex chars is uuid4's
-    collision-free width at any request rate this endpoint will see.
+    The unique-token suffix is mandatory, not cosmetic. Delegated to
+    MediaDerivativeService.build_derivative_key for repo-wide consistency.
     """
-    return f"{OUTPUT_PREFIX}/{_sanitize_output_stem(source_path)}_{uuid.uuid4().hex[:12]}.png"
+    return build_derivative_key(
+        source_path=source_path,
+        pipeline="skin_enhance",
+        extension="png",
+        default_stem=DEFAULT_OUTPUT_STEM,
+    )
 
 
 def _cap_dimension(image: Image.Image) -> Image.Image:
@@ -1458,50 +1457,45 @@ def run_skin_enhancement(
 
         finished = apply_skin_post_filters(restored, sharpen=sharpen, smart_grain=smart_grain)
 
-    # 8. Encode real PNG bytes, upload, persist the derivative with lineage. Outside
-    # the lock on purpose: the lock exists to keep eviction out of inference, and
-    # holding it across a PNG encode, a MinIO upload and a catalog commit would idle
-    # every other inference request for three round trips it does not need to guard.
+    # 8. Encode real PNG bytes, upload, persist the derivative with lineage via MediaDerivativeService.
+    # Outside the lock on purpose: the lock exists to keep eviction out of inference, and
+    # holding it across a PNG encode, an upload and a catalog commit would idle every other
+    # inference request for round trips it does not need to guard.
     out_buf = io.BytesIO()
     finished.save(out_buf, format="PNG", optimize=True)
     png_bytes = out_buf.getvalue()
 
+    title = f"Skin Enhanced: {Path(image_path).stem} ({mode})"
     filename = build_skin_filename(image_path)
-    if not upload_object(png_bytes, filename, content_type="image/png"):
-        logger.error(f"Failed to upload skin-enhanced image '{filename}' to storage")
-        return make_degraded_response(
-            reason=DegradedReason.LOAD_FAILED.value,
-            message="Failed to upload skin-enhanced image to storage",
-            model_id=selected_model_id,
-        ).model_dump()
-
-    if db is not None:
-        try:
-            title = f"Skin Enhanced: {Path(image_path).stem} ({mode})"
-            asset = MediaAsset(
-                title=title,
-                file_path=filename,
-                file_size=len(png_bytes),
-                content_type="image/png",
-                duration=0.0,
-                # Lineage: BeforeAfterModal pairs on this, no new UI needed.
-                source_path=image_path,
-                embedding=get_embedding(title),
-            )
-            db.add(asset)
-            db.commit()
-        except Exception as exc:
-            logger.error(f"Failed to save skin-enhanced asset: {exc}")
-            db.rollback()
-            # The object is already in storage, so COMPLETED here would hand the
-            # caller a filename and a URL for an object with no catalog row, and
-            # the source_path lineage #111 decision 7 requires would be silently
-            # absent. Same rule the upload failure above follows.
+    try:
+        deriv_res = record_derivative(
+            db=db,
+            source_path=image_path,
+            file_data=png_bytes,
+            pipeline="skin_enhance",
+            output_path=filename,
+            title=title,
+            content_type="image/png",
+            duration=0.0,
+            auto_commit=True,
+            upload_fn=upload_object,
+        )
+    except Exception as exc:
+        err_msg = str(exc)
+        if "Failed to upload" in err_msg:
+            logger.error(f"Failed to upload skin-enhanced image '{filename}' to storage: {exc}")
             return make_degraded_response(
                 reason=DegradedReason.LOAD_FAILED.value,
-                message=f"Failed to save skin-enhanced asset to the catalog: {str(exc)}",
+                message="Failed to upload skin-enhanced image to storage",
                 model_id=selected_model_id,
             ).model_dump()
+
+        logger.error(f"Failed to save skin-enhanced asset: {exc}")
+        return make_degraded_response(
+            reason=DegradedReason.LOAD_FAILED.value,
+            message=f"Failed to save skin-enhanced asset to the catalog: {err_msg}",
+            model_id=selected_model_id,
+        ).model_dump()
 
     # 9. Response
     response_parameters: Dict[str, Any] = {
