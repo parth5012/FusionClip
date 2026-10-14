@@ -50,7 +50,7 @@ from app.services.media_derivative import (
     record_derivative,
     sanitize_stem,
 )
-from app.storage import download_object, generate_url, upload_object
+from app.storage import delete_object, download_object, generate_url, upload_object
 
 try:
     from app.routers.tasks import redis_client
@@ -566,6 +566,10 @@ def run_background_removal(
         ).model_dump()
     except Exception as exc:
         logger.error(f"Failed to save background-removed asset to catalog: {exc}")
+        try:
+            delete_object(filename)
+        except Exception as del_err:
+            logger.warning(f"Failed to delete orphaned object '{filename}' on commit failure: {del_err}")
         if db is not None:
             try:
                 db.rollback()

@@ -263,10 +263,11 @@ class MediaDerivativeService:
             except Exception as db_exc:
                 if not committed:
                     logger.error(f"Failed to commit derivative catalog row for '{resolved_key}': {db_exc}")
-                    try:
-                        db.rollback()
-                    except Exception as rb_err:
-                        logger.warning(f"Error during db.rollback: {rb_err}")
+                    if auto_commit:
+                        try:
+                            db.rollback()
+                        except Exception as rb_err:
+                            logger.warning(f"Error during db.rollback: {rb_err}")
 
                     # Synchronous compensating delete for all uploaded objects
                     for orphan_key in uploaded_keys:
