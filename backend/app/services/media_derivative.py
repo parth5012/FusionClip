@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
-from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Union
+from typing import Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
 import uuid
 
 from sqlalchemy.orm import Session
@@ -108,11 +108,21 @@ class DerivativeResult:
     file_size: int
     asset: Optional[MediaAsset] = None
     sidecar_paths: Dict[str, str] = field(default_factory=dict)
+    uploaded_keys: List[str] = field(default_factory=list)
 
     @property
     def filename(self) -> str:
         """Alias for output_path for compatibility across routers."""
         return self.output_path
+
+    def cleanup(self, delete_fn: Optional[Callable[[str], Any]] = None) -> None:
+        """Compensating delete helper for callers managing deferred transactions."""
+        deleter = delete_fn or delete_object
+        for key in self.uploaded_keys:
+            try:
+                deleter(key)
+            except Exception as del_err:
+                logger.warning(f"Failed to delete uploaded key '{key}' during cleanup: {del_err}")
 
 
 class MediaDerivativeService:
@@ -287,6 +297,7 @@ class MediaDerivativeService:
             source_path=source_path,
             file_size=len(data_bytes),
             sidecar_paths=sidecar_urls,
+            uploaded_keys=uploaded_keys,
         )
 
 
