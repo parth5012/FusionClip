@@ -24,7 +24,8 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models import MediaAsset, Task
 from app.services.embedding import get_embedding
-from app.storage import get_object_bytes, upload_object
+from app.services.media_derivative import record_derivative
+from app.storage import get_object_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -881,25 +882,22 @@ def execute_upscale_job(
             grain=grain,
         )
 
-        # Save upscaled image to MinIO
-        upload_success = upload_object(out_bytes, output_path, content_type="image/png")
-        if not upload_success:
-            raise RuntimeError(f"Failed to upload upscaled output to {output_path}")
-
-        # Index into MediaAsset catalog with embedding
+        # Save upscaled image and persist MediaAsset with lineage via MediaDerivativeService
         title = f"{Path(image_path).stem}_{scale}x_upscaled.png"
         prompt_context = f"{category} upscale: {prompt or 'enhanced image'}"
         embedding_vec = get_embedding(prompt_context)
 
-        media_asset = MediaAsset(
-            title=title,
-            file_path=output_path,
+        record_derivative(
+            db=db,
             source_path=image_path,
-            file_size=len(out_bytes),
+            file_data=out_bytes,
+            pipeline="upscale",
+            output_path=output_path,
+            title=title,
             content_type="image/png",
             embedding=embedding_vec,
+            auto_commit=False,
         )
-        db.add(media_asset)
 
         # Mark Task complete
         db_task = db.query(Task).filter(Task.task_id == task_id).first()

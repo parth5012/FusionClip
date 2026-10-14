@@ -58,17 +58,27 @@ def _validate_safe_key(key: str) -> None:
         raise ValueError(f"Insecure or invalid storage key: '{key}'")
 
 
+DEFAULT_FALLBACK_STEMS: Dict[str, str] = {
+    "upscale": "asset",
+    "skin_enhance": "portrait",
+    "bgremove": "asset",
+    "editor": "edited",
+}
+
+
 def build_derivative_key(
     source_path: str,
     pipeline: str,
     qualifier: Optional[str] = None,
     token: Optional[str] = None,
     extension: str = "png",
+    default_stem: Optional[str] = None,
 ) -> str:
     """Construct standardized derivative key: {folder}/{stem}_{qualifier}_{12hex}.{ext}."""
     folder = PIPELINE_FOLDERS.get(pipeline, pipeline)
     folder = UNSAFE_STEM_CHARS.sub("_", folder.strip()).strip("._")
-    stem = sanitize_stem(source_path)
+    d_stem = default_stem or DEFAULT_FALLBACK_STEMS.get(pipeline, DEFAULT_STEM)
+    stem = sanitize_stem(source_path, default=d_stem)
     tok = token or uuid.uuid4().hex[:12]
     tok = UNSAFE_STEM_CHARS.sub("_", tok.strip()).strip("._")
     tok = re.sub(r"\.{2,}", "_", tok).strip("._")
@@ -119,6 +129,7 @@ class MediaDerivativeService:
         qualifier: Optional[str] = None,
         token: Optional[str] = None,
         extension: str = "png",
+        default_stem: Optional[str] = None,
     ) -> str:
         return build_derivative_key(
             source_path=source_path,
@@ -126,6 +137,7 @@ class MediaDerivativeService:
             qualifier=qualifier,
             token=token,
             extension=extension,
+            default_stem=default_stem,
         )
 
     @staticmethod
@@ -143,8 +155,13 @@ class MediaDerivativeService:
         embedding: Optional[List[float]] = None,
         sidecars: Optional[Dict[str, Union[bytes, Tuple[bytes, str]]]] = None,
         auto_commit: bool = True,
+        upload_fn: Optional[Any] = None,
+        delete_fn: Optional[Any] = None,
     ) -> DerivativeResult:
         """Atomically upload derivative and auxiliary sidecars, register catalog row, and handle rollbacks."""
+        uploader = upload_fn or upload_object
+        deleter = delete_fn or delete_object
+
         if hasattr(file_data, "getvalue"):
             data_bytes = file_data.getvalue()
         elif hasattr(file_data, "read"):
@@ -176,7 +193,7 @@ class MediaDerivativeService:
         uploaded_keys: List[str] = []
 
         # 1. Upload main derivative
-        if not upload_object(data_bytes, resolved_key, content_type=content_type):
+        if not uploader(data_bytes, resolved_key, content_type=content_type):
             raise RuntimeError(f"Failed to upload derivative to {resolved_key}")
         uploaded_keys.append(resolved_key)
 
@@ -191,11 +208,11 @@ class MediaDerivativeService:
                     s_bytes = s_val
                     s_ctype = "application/json" if s_key.endswith(".json") else "application/octet-stream"
 
-                if not upload_object(s_bytes, s_key, content_type=s_ctype):
+                if not uploader(s_bytes, s_key, content_type=s_ctype):
                     logger.error(f"Failed to upload sidecar '{s_key}', triggering compensating delete")
                     for orphan_key in uploaded_keys:
                         try:
-                            delete_object(orphan_key)
+                            deleter(orphan_key)
                         except Exception as del_err:
                             logger.warning(
                                 f"Failed to delete orphaned key '{orphan_key}' during sidecar abort: {del_err}"
@@ -254,7 +271,7 @@ class MediaDerivativeService:
                     # Synchronous compensating delete for all uploaded objects
                     for orphan_key in uploaded_keys:
                         try:
-                            delete_object(orphan_key)
+                            deleter(orphan_key)
                         except Exception as del_err:
                             logger.warning(
                                 f"Failed to delete orphaned object '{orphan_key}' after catalog commit failure: {del_err}"

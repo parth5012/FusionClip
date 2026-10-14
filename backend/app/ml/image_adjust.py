@@ -37,9 +37,11 @@ from PIL import Image, ImageChops, ImageEnhance
 from sqlalchemy.orm import Session
 
 from app.models import MediaAsset
-from app.services.embedding import get_embedding
+from app.services.media_derivative import (
+    record_derivative,
+    sanitize_stem,
+)
 from app.storage import (
-    delete_object,
     download_object,
     generate_url,
     list_workspace_files,
@@ -443,8 +445,7 @@ _UNSAFE_STEM_CHARS = __import__("re").compile(r"[^A-Za-z0-9._-]+")
 
 
 def _sanitize_stem(source_path: str) -> str:
-    base = _UNSAFE_STEM_CHARS.sub("_", Path(source_path).stem).strip("._")
-    base = base or "edited"
+    base = sanitize_stem(source_path, default="edited")
     # LOW-03 (#121 review): incorporate a short hash of the full source path
     # so `uploads/a.png` and `other/a.png` do not share a version stem.
     # Version listing still filters by full source_path (see
@@ -632,77 +633,55 @@ def run_editor_render(
     png_bytes = out_buf.getvalue()
 
     filename = _render_output_key(source_path)
-    if not upload_object(png_bytes, filename, content_type="image/png"):
-        raise HTTPException(
-            status_code=500,
-            detail="storage_write_failed: Could not upload the edited image to storage.",
-        )
 
     # Co-save the exact recipe this render used: the PNG is the artifact, the
     # sidecar is the source of truth that re-creates it.
     version = _next_recipe_version(source_path)
     recipe_key = _recipe_sidecar_key(source_path, version)
-    sidecar = json.dumps(
+    sidecar_bytes = json.dumps(
         _sidecar_document(source_path, recipe, version), sort_keys=True, indent=1
     ).encode("utf-8")
-    if not upload_object(sidecar, recipe_key, content_type="application/json"):
-        logger.error(f"Image editor: rendered '{filename}' but recipe sidecar failed")
-        # MED-01 (#121 review): compensating delete — the PNG is already in
-        # storage, so remove it before raising. Upload-then-commit pattern
-        # (see LEARNINGS.md): delete in its own try/except, log a warning,
-        # never swallow the original exception.
-        try:
-            delete_object(filename)
-        except Exception as del_err:
-            logger.warning(
-                f"Image editor: failed to delete orphaned render '{filename}': {del_err}"
+
+    title = f"Edited: {Path(source_path).stem}"
+    try:
+        deriv_res = record_derivative(
+            db=db,
+            source_path=source_path,
+            file_data=png_bytes,
+            pipeline="editor",
+            output_path=filename,
+            title=title,
+            content_type="image/png",
+            duration=0.0,
+            sidecars={recipe_key: (sidecar_bytes, "application/json")},
+            auto_commit=True,
+        )
+    except RuntimeError as up_err:
+        logger.error(f"Image editor storage upload failed: {up_err}")
+        if "sidecar" in str(up_err).lower():
+            raise HTTPException(
+                status_code=500,
+                detail="storage_write_failed: Rendered the image but could not persist its edit recipe.",
             )
         raise HTTPException(
             status_code=500,
-            detail="storage_write_failed: Rendered the image but could not persist its edit recipe.",
+            detail="storage_write_failed: Could not upload the edited image to storage.",
         )
-
-    if db is not None:
-        try:
-            title = f"Edited: {Path(source_path).stem}"
-            asset = MediaAsset(
-                title=title,
-                file_path=filename,
-                file_size=len(png_bytes),
-                content_type="image/png",
-                duration=0.0,
-                # Lineage: before/after pairs on this, no new UI needed.
-                source_path=source_path,
-                embedding=get_embedding(title),
-            )
-            db.add(asset)
-            db.commit()
-        except Exception as exc:
-            logger.error(f"Image editor: failed to save edited asset: {exc}")
-            db.rollback()
-            # MED-01 (#121 review): commit failure leaves both the PNG and the
-            # sidecar orphaned — delete both, each guarded so cleanup never
-            # masks the original catalog error.
-            for orphan_key in (filename, recipe_key):
-                try:
-                    delete_object(orphan_key)
-                except Exception as del_err:
-                    logger.warning(
-                        f"Image editor: failed to delete orphaned key '{orphan_key}': {del_err}"
-                    )
-            raise HTTPException(
-                status_code=500,
-                detail=f"catalog_write_failed: Failed to save the edited asset: {exc}",
-            )
+    except Exception as exc:
+        logger.error(f"Image editor catalog commit failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"catalog_write_failed: Failed to save the edited asset: {exc}",
+        )
 
     return {
         "status": "COMPLETED",
         "recipe_version": RECIPE_VERSION,
         "source_path": source_path,
         "filename": filename,
-        "url": generate_url(filename),
+        "url": deriv_res.url,
         "recipe_path": recipe_key,
-        "recipe_url": generate_url(recipe_key),
+        "recipe_url": deriv_res.sidecar_paths.get(recipe_key) or generate_url(recipe_key),
         "version": version,
         "image_size": list(finished.size),
         "parameters": recipe,
