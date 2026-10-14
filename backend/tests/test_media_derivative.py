@@ -150,6 +150,51 @@ class TestMediaDerivativeService:
         assert "upscaled/test_testtoken123.png" in uploaded_keys
         assert "upscaled/test_testtoken123.png" in deleted_keys
 
+    def test_record_derivative_no_session_rollback_when_auto_commit_false(self, db_session, monkeypatch):
+        """When auto_commit=False, session rollback is deferred to caller but storage rollback executes."""
+        deleted_keys = []
+        uploaded_keys = []
+
+        monkeypatch.setattr(
+            "app.services.media_derivative.upload_object",
+            lambda data, name, content_type: uploaded_keys.append(name) or True,
+        )
+        monkeypatch.setattr(
+            "app.services.media_derivative.delete_object",
+            lambda key: deleted_keys.append(key) or True,
+        )
+        monkeypatch.setattr(
+            "app.services.media_derivative.get_embedding",
+            lambda text: [0.0] * 384,
+        )
+
+        rollback_called = False
+
+        def mock_rollback():
+            nonlocal rollback_called
+            rollback_called = True
+
+        monkeypatch.setattr(db_session, "rollback", mock_rollback)
+        monkeypatch.setattr(
+            db_session,
+            "flush",
+            MagicMock(side_effect=SQLAlchemyError("Flush failure")),
+        )
+
+        with pytest.raises(SQLAlchemyError, match="Flush failure"):
+            record_derivative(
+                db=db_session,
+                source_path="uploads/test.png",
+                file_data=b"sample_bytes",
+                pipeline="upscale",
+                task_token="testtoken123",
+                auto_commit=False,
+            )
+
+        assert "upscaled/test_testtoken123.png" in uploaded_keys
+        assert "upscaled/test_testtoken123.png" in deleted_keys
+        assert not rollback_called, "db.rollback() should not be called when auto_commit=False"
+
     def test_record_derivative_sidecar_rollback_on_commit_failure(self, db_session, monkeypatch):
         """Failure to commit cleans up both main derivative and auxiliary sidecars."""
         deleted_keys = []

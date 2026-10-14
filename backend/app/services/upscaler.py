@@ -22,10 +22,10 @@ import redis
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models import MediaAsset, Task
+from app.models import Task
 from app.services.embedding import get_embedding
 from app.services.media_derivative import record_derivative
-from app.storage import get_object_bytes
+from app.storage import delete_object, get_object_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -922,6 +922,11 @@ def execute_upscale_job(
 
     except Exception as e:
         logger.error(f"Upscale job {task_id} failed: {e}", exc_info=True)
+        if "output_path" in locals() and output_path:
+            try:
+                delete_object(output_path)
+            except Exception as del_err:
+                logger.warning(f"Failed to delete orphaned object '{output_path}' on commit failure: {del_err}")
         try:
             # A failed commit (e.g. MediaAsset insert) leaves the session in a
             # failed transaction; roll back before recording the failure state

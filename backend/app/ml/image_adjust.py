@@ -441,9 +441,6 @@ def apply_recipe(image: Image.Image, recipe: Dict[str, Any]) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 
-_UNSAFE_STEM_CHARS = __import__("re").compile(r"[^A-Za-z0-9._-]+")
-
-
 def _sanitize_stem(source_path: str) -> str:
     base = sanitize_stem(source_path, default="edited")
     # LOW-03 (#121 review): incorporate a short hash of the full source path
