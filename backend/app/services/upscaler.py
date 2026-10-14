@@ -922,7 +922,9 @@ def execute_upscale_job(
 
     except Exception as e:
         logger.error(f"Upscale job {task_id} failed: {e}", exc_info=True)
-        if "output_path" in locals() and output_path:
+        if "deriv_res" in locals() and deriv_res:
+            deriv_res.cleanup()
+        elif "output_path" in locals() and output_path:
             try:
                 delete_object(output_path)
             except Exception as del_err:

@@ -448,4 +448,18 @@ class TestMediaDerivativeService:
         assert res.asset.id is not None
         db_session.rollback()
 
+    def test_derivative_result_cleanup(self, monkeypatch):
+        """DerivativeResult exposes uploaded_keys and cleanup helper deletes them."""
+        deleted = []
+        res = DerivativeResult(
+            output_path="test/output.png",
+            url="http://storage/test/output.png",
+            source_path="test.png",
+            file_size=100,
+            uploaded_keys=["test/output.png", "recipes/test.json"],
+        )
+        res.cleanup(delete_fn=lambda k: deleted.append(k) or True)
+        assert deleted == ["test/output.png", "recipes/test.json"]
+
+
 

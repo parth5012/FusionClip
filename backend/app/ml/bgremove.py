@@ -566,10 +566,13 @@ def run_background_removal(
         ).model_dump()
     except Exception as exc:
         logger.error(f"Failed to save background-removed asset to catalog: {exc}")
-        try:
-            delete_object(filename)
-        except Exception as del_err:
-            logger.warning(f"Failed to delete orphaned object '{filename}' on commit failure: {del_err}")
+        if "deriv_res" in locals() and deriv_res:
+            deriv_res.cleanup()
+        else:
+            try:
+                delete_object(filename)
+            except Exception as del_err:
+                logger.warning(f"Failed to delete orphaned object '{filename}' on commit failure: {del_err}")
         if db is not None:
             try:
                 db.rollback()
