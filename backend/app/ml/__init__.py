@@ -26,6 +26,13 @@ from app.ml.registry import (
     ModelRegistry,
     model_registry,
 )
+from app.ml.lock import (
+    InferenceLockSeam,
+    InMemoryLockAdapter,
+    RedisDistributedLock,
+    InferenceLockTimeoutError,
+    get_inference_lock,
+)
 from app.ml.image import (
     ASPECT_RATIO_DIMENSIONS,
     SUPPORTED_SCHEDULERS,
@@ -75,6 +82,11 @@ __all__ = [
     "ModelRegistry",
     "model_registry",
     "INFERENCE_LOCK",
+    "InferenceLockSeam",
+    "InMemoryLockAdapter",
+    "RedisDistributedLock",
+    "InferenceLockTimeoutError",
+    "get_inference_lock",
     "SUPPORTED_SCHEDULERS",
     "ASPECT_RATIO_DIMENSIONS",
     "run_local_image_generation",
