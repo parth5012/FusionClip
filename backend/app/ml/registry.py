@@ -30,13 +30,13 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 from pydantic import BaseModel, Field
 
+from app.ml.lock import InferenceLockSeam, get_inference_lock
+
 logger = logging.getLogger(__name__)
 
-# Module-level inference lock serializing local GPU admission + inference within one process
-# Note: INFERENCE_LOCK and ModelRegistry._lock are threading.RLock instances and serialize
-# threads within a single Python process. Cross-process coordination (e.g. between the API
-# process and Celery prefork worker processes) is not covered and is tracked on the map.
-INFERENCE_LOCK = threading.RLock()
+# Module-level distributed inference lock seam serializing GPU admission + inference across processes.
+# Backed by RedisDistributedLock in multi-process production, or InMemoryLockAdapter in tests/CI.
+INFERENCE_LOCK: InferenceLockSeam = get_inference_lock(device=0)
 
 
 
@@ -198,11 +198,15 @@ PINNED_ROSTER: List[ModelMetadata] = [
 class ModelRegistry:
     """Registry managing model metadata and lazy resident lifecycle."""
 
-    def __init__(self, populate_defaults: bool = True):
+    def __init__(
+        self,
+        populate_defaults: bool = True,
+        lock: Optional[Any] = None,
+    ):
         self._models: Dict[str, ModelEntry] = {}
         # Guards the load/unload/register lifecycle: without it two workers can
         # both observe `is_loaded == False` and allocate the same model twice.
-        self._lock = threading.RLock()
+        self._lock: Any = lock if lock is not None else INFERENCE_LOCK
         if populate_defaults:
             for meta in PINNED_ROSTER:
                 self.register(meta)

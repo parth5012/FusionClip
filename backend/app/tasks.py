@@ -1385,6 +1385,7 @@ def process_gpu_task(self, model_id: str, payload: Optional[dict] = None):
 
     from app.ml.contracts import DegradedReason, make_degraded_response
     from app.ml.guard import vram_guard, VRAMRefusalError
+    from app.ml.registry import INFERENCE_LOCK
 
     payload = payload or {}
     op = payload.get("op")
@@ -1543,27 +1544,28 @@ def process_gpu_task(self, model_id: str, payload: Optional[dict] = None):
             )
             raise e
 
-    try:
-        admission = vram_guard.check_vram(model_id)
-    except VRAMRefusalError as e:
-        logger.warning(f"GPU task {task_id} refused by VRAM guard: {e}")
-        return e.to_degraded_response().model_dump()
-    except KeyError:
-        # Defense in depth: never let an uncaught KeyError flip the Celery task to
-        # FAILURE instead of returning the Decision #3 degraded contract.
-        logger.warning(f"GPU task {task_id} requested unknown model '{model_id}'")
-        return make_degraded_response(
-            reason=DegradedReason.MODEL_NOT_FOUND.value,
-            message=f"Model '{model_id}' is not registered in ModelRegistry",
-            model_id=model_id,
-        ).model_dump()
+    with INFERENCE_LOCK:
+        try:
+            admission = vram_guard.check_vram(model_id)
+        except VRAMRefusalError as e:
+            logger.warning(f"GPU task {task_id} refused by VRAM guard: {e}")
+            return e.to_degraded_response().model_dump()
+        except KeyError:
+            # Defense in depth: never let an uncaught KeyError flip the Celery task to
+            # FAILURE instead of returning the Decision #3 degraded contract.
+            logger.warning(f"GPU task {task_id} requested unknown model '{model_id}'")
+            return make_degraded_response(
+                reason=DegradedReason.MODEL_NOT_FOUND.value,
+                message=f"Model '{model_id}' is not registered in ModelRegistry",
+                model_id=model_id,
+            ).model_dump()
 
-    return {
-        "status": "SUCCESS",
-        "task_id": task_id,
-        "model_id": model_id,
-        "admitted": True,
-        "admission": admission,
-        "message": f"Scaffold GPU task admitted for {model_id}",
-    }
+        return {
+            "status": "SUCCESS",
+            "task_id": task_id,
+            "model_id": model_id,
+            "admitted": True,
+            "admission": admission,
+            "message": f"Scaffold GPU task admitted for {model_id}",
+        }
 
