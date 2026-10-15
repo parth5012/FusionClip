@@ -426,7 +426,7 @@ def run_background_removal(
         )
 
     model_id = TIER_MODELS[tier]
-    task_token = task_id.split("_", 1)[-1] if (task_id and "_" in task_id) else uuid.uuid4().hex[:12]
+    task_token = uuid.uuid4().hex[:12]
     task_id = task_id or f"bgremove_{task_token}"
 
     # 1. Source resolution (outside lock)
