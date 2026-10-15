@@ -26,3 +26,27 @@ Generative pipelines across FusionClip (`/api/upscale`, `/api/skin-enhance`, `/a
    - Lineage pairing is established via `MediaAsset.source_path` referencing the parent asset's `file_path`.
    - Existing `BeforeAfterModal` and `GET /api/media` (which dynamically signs `source_url`) work out of the box with zero schema migrations required.
    - *Alternatives considered*: New JSON column on `MediaAsset` (rejected: requires Alembic migration for information already present or stored in `Task.logs`), tag-based metadata (rejected: overcomplicates before/after pairing queries).
+
+## 2026-10-15: Distributed Inference Execution Seam & VRAM Admission Semantics (Map #155, Issue #156)
+
+### Context
+FastAPI Uvicorn workers and Celery prefork child processes run across OS process boundaries. Previously, `INFERENCE_LOCK = threading.RLock()` in `backend/app/ml/registry.py` only serialized threads within a single Python process, risking simultaneous GPU execution, CUDA memory collisions, and OOM panics in multi-process deployments. Ticket #156 resolves the distributed concurrency model, cross-process eviction protocol, and crash recovery semantics.
+
+### Decisions
+1. **Exclusive Distributed Redis Mutex**:
+   - Concurrency is strictly serialized across all API and Celery workers via an exclusive Redis mutex (`ml:lock:gpu:{device}`).
+   - An in-memory non-blocking `RLock` adapter is provided for CI and local unit tests, preserving fast in-memory execution when Redis is unavailable (`one adapter = hypothetical seam, two adapters = real seam`).
+   - *Alternatives considered*: Redis counting semaphore (rejected: high risk of CUDA OOM when bursty model allocations overlap).
+
+2. **Cross-Process Eviction via Redis Pub/Sub Signal**:
+   - When a worker acquiring the distributed lock detects insufficient free VRAM for model admission, it publishes an eviction broadcast on channel `ml:gpu:evict`.
+   - Peer workers running listener threads receive the broadcast, evict idle resident models (`model_registry.unload_all()` or `evict_idle()`), and trigger `torch.cuda.empty_cache()`.
+   - The acquiring worker pauses briefly and re-samples available VRAM before proceeding or raising `InsufficientVRAMError`.
+   - *Alternatives considered*: Ephemeral loading / eager unloading on every request (rejected: severe latency degradation from constantly reloading multi-gigabyte model weights from disk).
+
+3. **Lease TTL, Heartbeat Auto-Renew & Crash Deadlock Protection**:
+   - Mutex lease TTL is set to 60 seconds with a background heartbeat thread auto-renewing the lock every 15 seconds while inference executes.
+   - If a worker crashes or is terminated by the OS/OOM-killer mid-inference, the lease auto-expires within 60 seconds, preventing permanent deadlocks.
+   - Default lock acquisition timeout is set to 120 seconds, allowing queued inference jobs to wait without timing out prematurely.
+   - *Alternatives considered*: Static 300s TTL without heartbeat (rejected: leaves cluster hung for up to 5 minutes on unexpected worker death).
+
