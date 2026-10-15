@@ -1,5 +1,29 @@
 # Execution Log
 
+## 2026-10-15: Wayfinder Map #155 - Distributed Inference Execution Seam
+
+### Status: Done (all 3 child tickets closed; no open children remain)
+
+### Phase 1 - HITL:
+- **#156 - InferenceLock: Decide multi-process concurrency & VRAM admission semantics (grilling)**
+  - Operator locked: exclusive Redis mutex (`ml:lock:gpu:{device}`) governing all GPU admissions across Uvicorn and Celery; dual-adapter seam (`RedisDistributedLock` and `InMemoryLockAdapter`); Redis Pub/Sub cross-worker eviction broadcast (`ml:gpu:evict`); 60s lease TTL with 15s heartbeat auto-renew and 120s acquisition timeout.
+  - Closed; documented in `DECISIONS.md`; appended to Map #155 Decisions so far.
+
+### Phase 2 - AFK:
+- **#157 - InferenceLock: Implement Redis distributed lock adapter at inference seam (task)**
+  - Created `backend/app/ml/lock.py` with `InferenceLockSeam`, `InMemoryLockAdapter`, and `RedisDistributedLock`.
+  - Implemented background daemon heartbeat renewing lease every 15s, crash deadlock prevention (60s lease TTL), thread-local re-entrancy, atomic acquire/extend/release via Lua and pipeline CAS fallback, and cross-process eviction Pub/Sub.
+  - Added 12 unit tests in `backend/tests/test_inference_lock.py` covering acquisition, release, timeout, contention, re-entrancy, heartbeat auto-renewal, and Pub/Sub eviction signals.
+  - Verified: `pytest backend/tests/test_inference_lock.py` passing (12 passed in 1.20s).
+  - Closed; appended to Map #155 Decisions so far.
+- **#158 - InferenceLock: Integrate distributed guard into ModelRegistry and worker tasks (task)**
+  - Replaced process-local `threading.RLock()` in `backend/app/ml/registry.py` with `INFERENCE_LOCK: InferenceLockSeam = get_inference_lock(device=0)` and enabled pluggable lock injection in `ModelRegistry`.
+  - Wrapped `process_gpu_task` in `backend/app/tasks.py` under `with INFERENCE_LOCK:`.
+  - Verified `backend/app/ml/skin_enhancer.py` phases 2-7 execute under `INFERENCE_LOCK`.
+  - Added simulated multi-process concurrent allocation test and Celery task execution guard test in `backend/tests/test_localml_scaffold.py`.
+  - Verified: 140/140 tests passing across all `test_localml_*.py` and `test_inference_lock.py` test suites.
+  - Closed; appended to Map #155 Decisions so far.
+
 ## 2026-10-14: Wayfinder Map #151 - Media Derivative & Lineage Service
 
 ### Status: Done (all 3 child tickets closed; no open children remain)

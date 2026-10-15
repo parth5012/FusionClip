@@ -289,6 +289,85 @@ class TestModelRegistry:
         assert len(results) == 2
         assert results[0] is results[1]
 
+    def test_simulated_concurrent_processes_cannot_allocate_simultaneously(self):
+        """Simulate two worker processes with independent registries sharing a distributed lock.
+
+        Asserts that two separate worker processes cannot allocate models simultaneously,
+        preventing CUDA out-of-memory collisions across Uvicorn and Celery processes.
+        """
+        import fakeredis
+        import threading
+        import time
+        from app.ml.lock import RedisDistributedLock
+
+        fake_server = fakeredis.FakeServer()
+        client1 = fakeredis.FakeStrictRedis(server=fake_server)
+        client2 = fakeredis.FakeStrictRedis(server=fake_server)
+
+        lock_proc1 = RedisDistributedLock(redis_client=client1, device=0, default_timeout=0.2)
+        lock_proc2 = RedisDistributedLock(redis_client=client2, device=0, default_timeout=0.2)
+
+        reg1 = ModelRegistry(populate_defaults=False, lock=lock_proc1)
+        reg2 = ModelRegistry(populate_defaults=False, lock=lock_proc2)
+
+        concurrent_allocations = []
+        active_allocations = 0
+        alloc_lock = threading.Lock()
+
+        def slow_loader_proc1():
+            nonlocal active_allocations
+            with alloc_lock:
+                active_allocations += 1
+                concurrent_allocations.append(active_allocations)
+            time.sleep(0.1)
+            with alloc_lock:
+                active_allocations -= 1
+            return "proc1_instance"
+
+        def slow_loader_proc2():
+            nonlocal active_allocations
+            with alloc_lock:
+                active_allocations += 1
+                concurrent_allocations.append(active_allocations)
+            time.sleep(0.1)
+            with alloc_lock:
+                active_allocations -= 1
+            return "proc2_instance"
+
+        meta = ModelMetadata(
+            model_id="flux-schnell",
+            family="image",
+            dtype_quant="fp8",
+            approx_vram_gb=13.0,
+            license="Apache-2.0",
+        )
+        reg1.register(meta, loader_handle=slow_loader_proc1)
+        reg2.register(meta, loader_handle=slow_loader_proc2)
+
+        barrier = threading.Barrier(2, timeout=5)
+
+        def worker1():
+            barrier.wait()
+            reg1.load_model("flux-schnell")
+
+        def worker2():
+            barrier.wait()
+            # reg2 waits for reg1 to release lock or attempts load
+            reg2.load_model("flux-schnell")
+
+        t1 = threading.Thread(target=worker1)
+        t2 = threading.Thread(target=worker2)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        # At no point should active_allocations have exceeded 1
+        assert max(concurrent_allocations) == 1
+        assert reg1.is_loaded("flux-schnell")
+        assert reg2.is_loaded("flux-schnell")
+
+
     def test_re_register_unloads_resident_model(self, clean_registry):
         """Re-registering an already-resident model must release its VRAM first."""
         import sys
@@ -642,6 +721,19 @@ class TestCeleryGPUQueueIsolation:
         assert res["degraded"] is True
         assert res["reason"] == DegradedReason.MODEL_NOT_FOUND.value
         assert res["model_id"] == "flux-dev"
+
+    def test_process_gpu_task_executes_under_inference_lock(self, monkeypatch):
+        """process_gpu_task acquires INFERENCE_LOCK during admission check."""
+        from app.ml import registry as registry_module
+
+        mock_lock = MagicMock()
+        mock_lock.__enter__.return_value = mock_lock
+        monkeypatch.setattr(registry_module, "INFERENCE_LOCK", mock_lock)
+
+        self._run_gpu_task("flux-schnell", payload={})
+        mock_lock.__enter__.assert_called_once()
+        mock_lock.__exit__.assert_called_once()
+
 
 
 class TestDegradedContract:
@@ -1010,9 +1102,14 @@ class TestModelEviction:
         assert clean_registry.is_loaded("model-a")
 
     def test_inference_lock_exported_from_app_ml(self):
-        """Inference lock must be an RLock exported from app.ml."""
-        import threading
+        """Inference lock must be an InferenceLockSeam instance exported from app.ml."""
         from app.ml import INFERENCE_LOCK
+        from app.ml.lock import InferenceLockSeam
 
-        assert isinstance(INFERENCE_LOCK, type(threading.RLock()))
+        assert isinstance(INFERENCE_LOCK, InferenceLockSeam)
+        # Duck-typed lock semantics: acquire, release, context manager
+        assert hasattr(INFERENCE_LOCK, "acquire")
+        assert hasattr(INFERENCE_LOCK, "release")
+        assert hasattr(INFERENCE_LOCK, "__enter__")
+        assert hasattr(INFERENCE_LOCK, "__exit__")
 
