@@ -887,7 +887,7 @@ def execute_upscale_job(
         prompt_context = f"{category} upscale: {prompt or 'enhanced image'}"
         embedding_vec = get_embedding(prompt_context)
 
-        record_derivative(
+        deriv_res = record_derivative(
             db=db,
             source_path=image_path,
             file_data=out_bytes,

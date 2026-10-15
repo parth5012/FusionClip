@@ -53,9 +53,11 @@ def sanitize_stem(source_path: str, default: str = DEFAULT_STEM) -> str:
 
 
 def _validate_safe_key(key: str) -> None:
-    """Ensure key contains no path traversal (..) or leading / backslashes."""
-    if not key or ".." in key or key.startswith("/") or "\\" in key:
+    """Ensure key contains no path traversal (..), control chars, or leading/double slashes."""
+    if not key or ".." in key or key.startswith("/") or "\\" in key or "//" in key:
         raise ValueError(f"Insecure or invalid storage key: '{key}'")
+    if any(ord(c) < 32 or ord(c) == 127 for c in key):
+        raise ValueError(f"Storage key contains invalid control characters: '{key}'")
 
 
 DEFAULT_FALLBACK_STEMS: Dict[str, str] = {
@@ -76,12 +78,12 @@ def build_derivative_key(
 ) -> str:
     """Construct standardized derivative key: {folder}/{stem}_{qualifier}_{12hex}.{ext}."""
     folder = PIPELINE_FOLDERS.get(pipeline, pipeline)
-    folder = UNSAFE_STEM_CHARS.sub("_", folder.strip()).strip("._")
+    folder = UNSAFE_STEM_CHARS.sub("_", folder.strip()).strip("._") or "derivatives"
     d_stem = default_stem or DEFAULT_FALLBACK_STEMS.get(pipeline, DEFAULT_STEM)
     stem = sanitize_stem(source_path, default=d_stem)
     tok = token or uuid.uuid4().hex[:12]
     tok = UNSAFE_STEM_CHARS.sub("_", tok.strip()).strip("._")
-    tok = re.sub(r"\.{2,}", "_", tok).strip("._")
+    tok = re.sub(r"\.{2,}", "_", tok).strip("._") or uuid.uuid4().hex[:12]
     ext = extension.lstrip(".")
     ext = re.sub(r"[^a-zA-Z0-9]", "", ext) or "png"
 
@@ -120,7 +122,9 @@ class DerivativeResult:
         deleter = delete_fn or delete_object
         for key in self.uploaded_keys:
             try:
-                deleter(key)
+                del_ok = deleter(key)
+                if del_ok is False:
+                    logger.error(f"Compensating delete returned False for key '{key}' during cleanup")
             except Exception as del_err:
                 logger.warning(f"Failed to delete uploaded key '{key}' during cleanup: {del_err}")
 
@@ -196,6 +200,8 @@ class MediaDerivativeService:
             extension=clean_ext,
         )
         _validate_safe_key(resolved_key)
+        if resolved_key == source_path:
+            raise ValueError(f"Derivative output_path cannot overwrite source_path: '{resolved_key}'")
         if sidecars:
             for s_key in sidecars:
                 _validate_safe_key(s_key)
@@ -203,7 +209,18 @@ class MediaDerivativeService:
         uploaded_keys: List[str] = []
 
         # 1. Upload main derivative
-        if not uploader(data_bytes, resolved_key, content_type=content_type):
+        main_upload_ok = False
+        try:
+            main_upload_ok = bool(uploader(data_bytes, resolved_key, content_type=content_type))
+        except Exception as up_err:
+            logger.error(f"Main derivative upload raised exception for '{resolved_key}': {up_err}")
+            main_upload_ok = False
+
+        if not main_upload_ok:
+            try:
+                deleter(resolved_key)
+            except Exception:
+                pass
             raise RuntimeError(f"Failed to upload derivative to {resolved_key}")
         uploaded_keys.append(resolved_key)
 
@@ -212,13 +229,22 @@ class MediaDerivativeService:
         if sidecars:
             for s_key, s_val in sidecars.items():
                 _validate_safe_key(s_key)
+                if s_key == resolved_key:
+                    raise ValueError(f"Sidecar key '{s_key}' cannot collide with main derivative key")
                 if isinstance(s_val, tuple):
                     s_bytes, s_ctype = s_val
                 else:
                     s_bytes = s_val
                     s_ctype = "application/json" if s_key.endswith(".json") else "application/octet-stream"
 
-                if not uploader(s_bytes, s_key, content_type=s_ctype):
+                upload_ok = False
+                try:
+                    upload_ok = bool(uploader(s_bytes, s_key, content_type=s_ctype))
+                except Exception as up_err:
+                    logger.error(f"Sidecar upload raised exception for '{s_key}': {up_err}")
+                    upload_ok = False
+
+                if not upload_ok:
                     logger.error(f"Failed to upload sidecar '{s_key}', triggering compensating delete")
                     for orphan_key in uploaded_keys:
                         try:
@@ -289,7 +315,11 @@ class MediaDerivativeService:
                             )
                 raise db_exc
 
-        url = generate_url(resolved_key)
+        try:
+            url = generate_url(resolved_key)
+        except Exception as url_err:
+            logger.warning(f"Failed to generate URL for derivative '{resolved_key}': {url_err}")
+            url = ""
         return DerivativeResult(
             asset=asset,
             output_path=resolved_key,

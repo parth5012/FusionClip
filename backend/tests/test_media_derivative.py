@@ -267,6 +267,75 @@ class TestMediaDerivativeService:
         assert "edited/test_tok456.png" in uploaded_keys
         assert "edited/test_tok456.png" in deleted_keys
 
+    def test_record_derivative_sidecar_upload_exception_triggers_compensating_delete(self, db_session, monkeypatch):
+        """If sidecar upload raises an exception (network error), already-uploaded main derivative is deleted."""
+        deleted_keys = []
+        uploaded_keys = []
+
+        def fake_upload(data, name, content_type):
+            if name.endswith(".json"):
+                raise ConnectionError("Network dropped during sidecar upload")
+            uploaded_keys.append(name)
+            return True
+
+        monkeypatch.setattr("app.services.media_derivative.upload_object", fake_upload)
+        monkeypatch.setattr("app.services.media_derivative.delete_object", lambda k: deleted_keys.append(k) or True)
+
+        sidecars = {"editor_recipes/test_recipe.json": b'{"settings": 1}'}
+
+        with pytest.raises(RuntimeError, match="Failed to upload sidecar"):
+            record_derivative(
+                db=db_session,
+                source_path="uploads/test.png",
+                file_data=b"bytes",
+                pipeline="editor",
+                task_token="tok456",
+                sidecars=sidecars,
+            )
+
+        assert "edited/test_tok456.png" in uploaded_keys
+        assert "edited/test_tok456.png" in deleted_keys
+
+    def test_record_derivative_sidecar_colliding_with_main_key_rejected(self, db_session, monkeypatch):
+        """A sidecar whose key equals the main derivative key is rejected."""
+        monkeypatch.setattr("app.services.media_derivative.upload_object", lambda *a, **k: True)
+
+        with pytest.raises(ValueError, match="cannot collide with main derivative key"):
+            record_derivative(
+                db=db_session,
+                source_path="uploads/test.png",
+                file_data=b"bytes",
+                pipeline="editor",
+                output_path="edited/test_tok.png",
+                sidecars={"edited/test_tok.png": b"{}"},
+            )
+
+    def test_validate_safe_key_rejects_control_characters_and_double_slashes(self):
+        """_validate_safe_key rejects control characters, newlines, and double slashes."""
+        from app.services.media_derivative import _validate_safe_key
+
+        with pytest.raises(ValueError, match="invalid control characters"):
+            _validate_safe_key("upscaled/image\ntest.png")
+
+        with pytest.raises(ValueError, match="invalid control characters"):
+            _validate_safe_key("upscaled/image\x00test.png")
+
+        with pytest.raises(ValueError, match="Insecure or invalid storage key"):
+            _validate_safe_key("upscaled//test.png")
+
+    def test_record_derivative_rejects_output_path_equal_to_source_path(self, db_session):
+        """record_derivative prevents mutating source asset if output_path equals source_path."""
+        with pytest.raises(ValueError, match="cannot overwrite source_path"):
+            record_derivative(
+                db=db_session,
+                source_path="uploads/photo.png",
+                file_data=b"bytes",
+                pipeline="editor",
+                output_path="uploads/photo.png",
+            )
+
+
+
     def test_record_derivative_custom_title_and_embedding_honored(self, db_session, monkeypatch):
         """Custom title and pre-computed embedding are saved without recomputing."""
         monkeypatch.setattr("app.services.media_derivative.upload_object", lambda *a, **k: True)
