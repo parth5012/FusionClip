@@ -734,6 +734,21 @@ class TestCeleryGPUQueueIsolation:
         mock_lock.__enter__.assert_called_once()
         mock_lock.__exit__.assert_called_once()
 
+    def test_process_gpu_task_lock_acquisition_failure_returns_degraded(self, monkeypatch):
+        """process_gpu_task returns honest degraded response if lock acquisition fails."""
+        from app.ml import registry as registry_module
+        from app.ml.lock import InferenceLockTimeoutError
+
+        mock_lock = MagicMock()
+        mock_lock.__enter__.side_effect = InferenceLockTimeoutError("Lock timed out")
+        monkeypatch.setattr(registry_module, "INFERENCE_LOCK", mock_lock)
+
+        res = self._run_gpu_task("flux-schnell", payload={})
+        assert isinstance(res, dict)
+        assert res["degraded"] is True
+        assert res["reason"] == DegradedReason.NO_GPU.value
+        assert "GPU admission lock acquisition failed" in res["message"]
+
 
 
 class TestDegradedContract:

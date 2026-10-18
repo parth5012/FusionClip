@@ -201,12 +201,15 @@ class ModelRegistry:
     def __init__(
         self,
         populate_defaults: bool = True,
-        lock: Optional[Any] = None,
+        lock: Optional[InferenceLockSeam] = None,
     ):
         self._models: Dict[str, ModelEntry] = {}
-        # Guards the load/unload/register lifecycle: without it two workers can
-        # both observe `is_loaded == False` and allocate the same model twice.
-        self._lock: Any = lock if lock is not None else INFERENCE_LOCK
+        # Process-local lock guarding registry dict state
+        self._lock = threading.RLock()
+        # Cross-process GPU admission lock guarding model memory allocation
+        self._gpu_lock: InferenceLockSeam = (
+            lock if lock is not None else INFERENCE_LOCK
+        )
         if populate_defaults:
             for meta in PINNED_ROSTER:
                 self.register(meta)
@@ -273,14 +276,27 @@ class ModelRegistry:
 
         Returns existing cached instance if already loaded.
         Otherwise executes loader_handle and caches the result.
-        Serialized so the loader runs at most once across concurrent callers.
+        Serialized across processes via _gpu_lock so only one worker allocates.
         """
+        # Fast path under local process lock
         with self._lock:
             if model_id not in self._models:
                 raise KeyError(
                     f"Model '{model_id}' is not registered in ModelRegistry"
                 )
 
+            entry = self._models[model_id]
+            if entry.is_loaded:
+                return entry.instance
+
+            loader = loader_handle or entry.loader_handle
+            if loader is None:
+                raise ValueError(
+                    f"No loader configured for model '{model_id}'. Provide a loader_handle."
+                )
+
+        # Allocation critical section: acquire GPU lock and re-check under state lock
+        with self._gpu_lock, self._lock:
             entry = self._models[model_id]
             if entry.is_loaded:
                 return entry.instance

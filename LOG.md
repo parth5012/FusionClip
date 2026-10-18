@@ -24,6 +24,18 @@
   - Verified: 140/140 tests passing across all `test_localml_*.py` and `test_inference_lock.py` test suites.
   - Closed; appended to Map #155 Decisions so far.
 
+### Review Gate & Babysit PR (#161):
+- Opened PR #161 for branch `t3/084b170f` against `main`.
+- Linked pull request with T3 Code orchestration thread.
+- Triggered automated reviews via CodeRabbit (`@coderabbitai review`) and parthpr bot (`/review`).
+- Addressed all 4 CodeRabbit findings:
+  1. *Heartbeat premature termination*: `_atomic_extend` now distinguishes transient Redis errors from true ownership loss (token mismatch); heartbeat worker retries transient errors while lease is valid; confirmed ownership loss recorded per thread and exposed via `is_owner()` on `InferenceLockSeam`.
+  2. *Silent fallback to in-memory lock*: added `INFERENCE_LOCK_BACKEND=redis|memory` config; when configured for `redis`, enforces 5s connect/socket timeouts and raises/fails fast rather than silently falling back; default fallback logged at `ERROR` with 2s socket timeouts.
+  3. *Registry state vs GPU admission lock separation*: `ModelRegistry` now uses process-local `threading.RLock()` for dictionary mutations (`register`, `has_loader`) and reserves distributed `_gpu_lock` strictly for model loading and weight allocation critical sections.
+  4. *Celery task lock failure contract*: wrapped `INFERENCE_LOCK` acquisition in `process_gpu_task` with try/except translating lock acquisition timeouts or Redis drops into honest degraded responses matching Decision #3 schema (`reason="no_gpu"`).
+- Extended test suites: 144/144 tests passing across local ML and inference lock suites (`backend/tests/test_localml_*.py` and `backend/tests/test_inference_lock.py`).
+
+
 ## 2026-10-14: Wayfinder Map #151 - Media Derivative & Lineage Service
 
 ### Status: Done (all 3 child tickets closed; no open children remain)

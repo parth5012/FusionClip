@@ -66,6 +66,11 @@ class InferenceLockSeam(abc.ABC):
         """Return True if the lock is currently held."""
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def is_owner(self) -> bool:
+        """Return True if the current thread is the confirmed holder of the lock."""
+        raise NotImplementedError
+
     def __enter__(self) -> "InferenceLockSeam":
         if not self.acquire(blocking=True):
             raise InferenceLockTimeoutError(
@@ -125,6 +130,11 @@ class InMemoryLockAdapter(InferenceLockSeam):
         with self._state_lock:
             return self._owner_thread is not None
 
+    def is_owner(self) -> bool:
+        current_thread = threading.get_ident()
+        with self._state_lock:
+            return self._owner_thread == current_thread
+
     def __enter__(self) -> "InMemoryLockAdapter":
         if not self.acquire(blocking=True):
             raise InferenceLockTimeoutError(
@@ -164,6 +174,7 @@ class RedisDistributedLock(InferenceLockSeam):
         self._instance_token = uuid.uuid4().hex
         self._thread_locals = threading.local()
         self._heartbeat_threads: dict[int, tuple[threading.Thread, threading.Event]] = {}
+        self._lost_threads: dict[int, bool] = {}
         self._state_lock = threading.Lock()
 
         self._lua_extend = None
@@ -240,29 +251,33 @@ class RedisDistributedLock(InferenceLockSeam):
             return False
 
     def _atomic_extend(self, owner_token: str, ttl_ms: int) -> bool:
-        """Extend key TTL atomically if value matches owner_token."""
-        try:
-            if self._lua_extend:
+        """Extend key TTL atomically if value matches owner_token.
+
+        Returns:
+            True if key matched and TTL was extended.
+            False if key does not match owner_token (confirmed ownership loss).
+        Raises:
+            Exception on transient Redis/network errors.
+        """
+        if self._lua_extend:
+            try:
                 res = self._lua_extend(keys=[self.lock_name], args=[owner_token, ttl_ms])
                 return bool(res)
-        except Exception:
-            pass
+            except Exception as e:
+                # If Redis script error occurs or connection failed, fallback or re-raise
+                logger.debug(f"Lua extend error for {self.lock_name}: {e}")
 
-        try:
-            with self.redis_client.pipeline() as pipe:
-                pipe.watch(self.lock_name)
-                val = pipe.get(self.lock_name)
-                if isinstance(val, bytes):
-                    val = val.decode("utf-8")
-                if val == owner_token:
-                    pipe.multi()
-                    pipe.pexpire(self.lock_name, ttl_ms)
-                    pipe.execute()
-                    return True
-                pipe.unwatch()
-                return False
-        except Exception as ex:
-            logger.warning(f"Heartbeat extension error for {self.lock_name}: {ex}")
+        with self.redis_client.pipeline() as pipe:
+            pipe.watch(self.lock_name)
+            val = pipe.get(self.lock_name)
+            if isinstance(val, bytes):
+                val = val.decode("utf-8")
+            if val == owner_token:
+                pipe.multi()
+                pipe.pexpire(self.lock_name, ttl_ms)
+                pipe.execute()
+                return True
+            pipe.unwatch()
             return False
 
     def release(self) -> None:
@@ -290,6 +305,14 @@ class RedisDistributedLock(InferenceLockSeam):
         except Exception:
             return False
 
+    def is_owner(self) -> bool:
+        tid = threading.get_ident()
+        with self._state_lock:
+            if self._lost_threads.get(tid, False):
+                return False
+        reentrancy = getattr(self._thread_locals, "reentrancy", 0)
+        return reentrancy > 0
+
     def _start_heartbeat(self, owner_token: str) -> None:
         tid = threading.get_ident()
         stop_event = threading.Event()
@@ -297,22 +320,34 @@ class RedisDistributedLock(InferenceLockSeam):
 
         def _heartbeat_worker() -> None:
             while not stop_event.wait(timeout=self.heartbeat_interval):
-                success = self._atomic_extend(owner_token, ttl_ms)
-                if not success:
+                try:
+                    success = self._atomic_extend(owner_token, ttl_ms)
+                except Exception as ex:
+                    # Transient error: keep retrying while lease is still valid
                     logger.warning(
+                        f"Transient heartbeat renewal error for {self.lock_name}: {ex}; will retry"
+                    )
+                    continue
+
+                if not success:
+                    logger.error(
                         f"Redis lock {self.lock_name} heartbeat renewal failed (lost lock ownership)"
                     )
+                    with self._state_lock:
+                        self._lost_threads[tid] = True
                     break
 
         hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
         with self._state_lock:
             self._heartbeat_threads[tid] = (hb_thread, stop_event)
+            self._lost_threads[tid] = False
         hb_thread.start()
 
     def _stop_heartbeat(self) -> None:
         tid = threading.get_ident()
         with self._state_lock:
             pair = self._heartbeat_threads.pop(tid, None)
+            self._lost_threads.pop(tid, None)
         if pair:
             _, stop_event = pair
             stop_event.set()
@@ -377,10 +412,15 @@ def get_inference_lock(
 ) -> InferenceLockSeam:
     """Factory creating the appropriate inference lock seam adapter.
 
-    If force_in_memory=True or Redis is unreachable, returns InMemoryLockAdapter.
-    Otherwise returns RedisDistributedLock.
+    Selection rules:
+    - force_in_memory=True or INFERENCE_LOCK_BACKEND='memory': Returns InMemoryLockAdapter.
+    - Explicit redis_client passed: Returns RedisDistributedLock.
+    - INFERENCE_LOCK_BACKEND='redis': Connects to Redis; fails fast (raises error) if unreachable.
+    - Default (no explicit backend configured): Attempts connection with 2s timeout.
+      Falls back to InMemoryLockAdapter with ERROR log if unreachable.
     """
-    if force_in_memory:
+    backend = os.getenv("INFERENCE_LOCK_BACKEND", "").lower()
+    if force_in_memory or backend == "memory":
         return InMemoryLockAdapter(device=device)
 
     if redis_client is not None:
@@ -392,11 +432,31 @@ def get_inference_lock(
             default_timeout=default_timeout,
         )
 
-    # Attempt connecting to Redis from configuration
+    import redis
+    from app.config import settings
+
+    if backend == "redis":
+        client = redis.Redis.from_url(
+            settings.REDIS_URL, socket_connect_timeout=5.0, socket_timeout=5.0
+        )
+        try:
+            client.ping()
+        except redis.RedisError as e:
+            logger.error(f"Inference lock backend 'redis' unreachable for device {device}: {e}")
+            raise
+        return RedisDistributedLock(
+            redis_client=client,
+            device=device,
+            lease_ttl=lease_ttl,
+            heartbeat_interval=heartbeat_interval,
+            default_timeout=default_timeout,
+        )
+
+    # Default fallback mode
     try:
-        import redis
-        from app.config import settings
-        client = redis.Redis.from_url(settings.REDIS_URL)
+        client = redis.Redis.from_url(
+            settings.REDIS_URL, socket_connect_timeout=2.0, socket_timeout=2.0
+        )
         client.ping()
         return RedisDistributedLock(
             redis_client=client,
@@ -406,7 +466,7 @@ def get_inference_lock(
             default_timeout=default_timeout,
         )
     except Exception as e:
-        logger.info(
+        logger.error(
             f"Redis unreachable ({e}); falling back to InMemoryLockAdapter for device {device}"
         )
         return InMemoryLockAdapter(device=device)

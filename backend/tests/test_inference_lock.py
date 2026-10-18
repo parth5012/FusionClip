@@ -195,3 +195,53 @@ def test_get_inference_lock_factory():
     redis_lock = get_inference_lock(device=1, redis_client=fake_client)
     assert isinstance(redis_lock, RedisDistributedLock)
     assert redis_lock.device == 1
+
+
+def test_is_owner_semantics():
+    in_mem = InMemoryLockAdapter(device=0)
+    assert not in_mem.is_owner()
+    with in_mem:
+        assert in_mem.is_owner()
+    assert not in_mem.is_owner()
+
+    fake_client = fakeredis.FakeStrictRedis()
+    redis_lock = RedisDistributedLock(redis_client=fake_client, device=0)
+    assert not redis_lock.is_owner()
+    with redis_lock:
+        assert redis_lock.is_owner()
+    assert not redis_lock.is_owner()
+
+
+def test_heartbeat_ownership_loss_detection():
+    fake_client = fakeredis.FakeStrictRedis()
+    lock = RedisDistributedLock(
+        redis_client=fake_client,
+        device=0,
+        lease_ttl=2.0,
+        heartbeat_interval=0.1,
+    )
+    assert lock.acquire() is True
+    assert lock.is_owner()
+
+    # Simulate another worker forcibly stealing the key in Redis
+    fake_client.set("ml:lock:gpu:0", "other_token")
+
+    # Wait for next heartbeat renewal cycle
+    time.sleep(0.25)
+
+    # is_owner must detect that ownership was lost
+    assert lock.is_owner() is False
+    lock.release()
+
+
+def test_get_inference_lock_env_selection(monkeypatch):
+    monkeypatch.setenv("INFERENCE_LOCK_BACKEND", "memory")
+    lock = get_inference_lock(device=0)
+    assert isinstance(lock, InMemoryLockAdapter)
+
+    # Test redis backend fails fast when unreachable
+    monkeypatch.setenv("INFERENCE_LOCK_BACKEND", "redis")
+    monkeypatch.setenv("REDIS_URL", "redis://invalid-host-that-does-not-exist:6379/0")
+    with pytest.raises(Exception):
+        get_inference_lock(device=0)
+
