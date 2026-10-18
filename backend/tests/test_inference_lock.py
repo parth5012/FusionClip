@@ -259,6 +259,58 @@ def test_heartbeat_lease_deadline_expiry_on_persistent_network_error():
     lock.release()
 
 
+def test_heartbeat_renewal_response_delayed_beyond_ttl():
+    fake_client = fakeredis.FakeStrictRedis()
+    lock = RedisDistributedLock(
+        redis_client=fake_client,
+        device=0,
+        lease_ttl=0.2,
+        heartbeat_interval=0.05,
+    )
+    assert lock.acquire() is True
+    assert lock.is_owner()
+
+    original_extend = lock._atomic_extend
+
+    # Simulate successful Redis extension whose response packet was delayed beyond lease TTL
+    def delayed_extend(owner_token, ttl_ms):
+        res = original_extend(owner_token, ttl_ms)
+        time.sleep(0.25)
+        return res
+
+    lock._atomic_extend = delayed_extend
+
+    # Wait for heartbeat cycle to encounter the delayed response
+    time.sleep(0.35)
+
+    # is_owner must return False because response arrived after the granted lease TTL expired
+    assert lock.is_owner() is False
+    lock.release()
+
+
+def test_acquisition_response_delayed_beyond_ttl():
+    fake_client = fakeredis.FakeStrictRedis()
+    lock = RedisDistributedLock(
+        redis_client=fake_client,
+        device=0,
+        lease_ttl=0.15,
+        default_timeout=0.5,
+    )
+
+    original_set = fake_client.set
+
+    def delayed_set(*args, **kwargs):
+        res = original_set(*args, **kwargs)
+        time.sleep(0.2)
+        return res
+
+    fake_client.set = delayed_set
+
+    # Delayed acquisition response beyond TTL must be rejected
+    assert lock.acquire(blocking=False) is False
+    assert lock.is_owner() is False
+
+
 def test_get_inference_lock_env_selection(monkeypatch):
     monkeypatch.setenv("INFERENCE_LOCK_BACKEND", "memory")
     lock = get_inference_lock(device=0)

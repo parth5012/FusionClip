@@ -206,13 +206,24 @@ class RedisDistributedLock(InferenceLockSeam):
         start_time = time.monotonic()
 
         while True:
+            attempt_start = time.monotonic()
             acquired = bool(
                 self.redis_client.set(self.lock_name, owner_token, nx=True, px=ttl_ms)
             )
             if acquired:
+                now = time.monotonic()
+                deadline = attempt_start + (ttl_ms / 1000.0)
+                if now >= deadline:
+                    # Response arrived after granted lease TTL expired
+                    logger.error(
+                        f"Redis lock {self.lock_name} acquisition response delayed beyond lease TTL"
+                    )
+                    self._atomic_release(owner_token)
+                    return False
+
                 tid = threading.get_ident()
                 with self._state_lock:
-                    self._lease_deadlines[tid] = time.monotonic() + self.lease_ttl
+                    self._lease_deadlines[tid] = deadline
                 self._thread_locals.reentrancy = 1
                 self._start_heartbeat(owner_token)
                 return True
@@ -340,6 +351,7 @@ class RedisDistributedLock(InferenceLockSeam):
                         self._lost_threads[tid] = True
                     break
 
+                req_start = time.monotonic()
                 try:
                     success = self._atomic_extend(owner_token, ttl_ms)
                 except Exception as ex:
@@ -364,9 +376,18 @@ class RedisDistributedLock(InferenceLockSeam):
                         self._lost_threads[tid] = True
                     break
 
-                # Renewal succeeded: advance lease deadline
+                # Renewal succeeded: compute deadline from request start timestamp
+                new_deadline = req_start + (ttl_ms / 1000.0)
+                if time.monotonic() >= new_deadline:
+                    logger.error(
+                        f"Redis lock {self.lock_name} renewal response delayed beyond granted TTL"
+                    )
+                    with self._state_lock:
+                        self._lost_threads[tid] = True
+                    break
+
                 with self._state_lock:
-                    self._lease_deadlines[tid] = time.monotonic() + self.lease_ttl
+                    self._lease_deadlines[tid] = new_deadline
 
         hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
         with self._state_lock:
