@@ -47,6 +47,11 @@ FastAPI Uvicorn workers and Celery prefork child processes run across OS process
 3. **Lease TTL, Heartbeat Auto-Renew & Crash Deadlock Protection**:
    - Mutex lease TTL is set to 60 seconds with a background heartbeat thread auto-renewing the lock every 15 seconds while inference executes.
    - If a worker crashes or is terminated by the OS/OOM-killer mid-inference, the lease auto-expires within 60 seconds, preventing permanent deadlocks.
-   - Default lock acquisition timeout is set to 120 seconds, allowing queued inference jobs to wait without timing out prematurely.
-   - *Alternatives considered*: Static 300s TTL without heartbeat (rejected: leaves cluster hung for up to 5 minutes on unexpected worker death).
+4. **Adversarial Review Invariants & Seam Refinement**:
+   - `_atomic_extend` differentiates between confirmed ownership loss (token mismatch) and transient network/Redis errors. The heartbeat worker retries transient errors while the lease remains valid and only halts renewal if ownership is truly lost.
+   - `is_owner()` provides an active verification check on the seam interface so workers can verify lock status before committing expensive VRAM allocations or output mutations.
+   - Separate process-local state lock (`threading.RLock`) protects `ModelRegistry` dictionary mutations from cross-process contention during startup and queries (`has_loader`), while the distributed `_gpu_lock` strictly wraps actual weight allocations in `load_model`.
+   - Backend selection is explicit via `INFERENCE_LOCK_BACKEND=redis|memory`. When `redis` is configured, connection failures fail fast with configured socket timeouts rather than silently falling back to a split-lock in-memory adapter.
+   - Lock acquisition errors in Celery tasks are caught and translated into the Decision #3 degraded-response contract (`DegradedReason.NO_GPU`), preventing unexpected Celery task failures under lock contention or Redis drops.
+
 
