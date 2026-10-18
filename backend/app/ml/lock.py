@@ -175,6 +175,7 @@ class RedisDistributedLock(InferenceLockSeam):
         self._thread_locals = threading.local()
         self._heartbeat_threads: dict[int, tuple[threading.Thread, threading.Event]] = {}
         self._lost_threads: dict[int, bool] = {}
+        self._lease_deadlines: dict[int, float] = {}
         self._state_lock = threading.Lock()
 
         self._lua_extend = None
@@ -209,6 +210,9 @@ class RedisDistributedLock(InferenceLockSeam):
                 self.redis_client.set(self.lock_name, owner_token, nx=True, px=ttl_ms)
             )
             if acquired:
+                tid = threading.get_ident()
+                with self._state_lock:
+                    self._lease_deadlines[tid] = time.monotonic() + self.lease_ttl
                 self._thread_locals.reentrancy = 1
                 self._start_heartbeat(owner_token)
                 return True
@@ -310,6 +314,9 @@ class RedisDistributedLock(InferenceLockSeam):
         with self._state_lock:
             if self._lost_threads.get(tid, False):
                 return False
+            deadline = self._lease_deadlines.get(tid, 0.0)
+            if deadline and time.monotonic() > deadline:
+                return False
         reentrancy = getattr(self._thread_locals, "reentrancy", 0)
         return reentrancy > 0
 
@@ -320,6 +327,19 @@ class RedisDistributedLock(InferenceLockSeam):
 
         def _heartbeat_worker() -> None:
             while not stop_event.wait(timeout=self.heartbeat_interval):
+                now = time.monotonic()
+                with self._state_lock:
+                    deadline = self._lease_deadlines.get(tid, 0.0)
+
+                # Check if the lease deadline expired while waiting or retrying
+                if deadline and now >= deadline:
+                    logger.error(
+                        f"Redis lock {self.lock_name} lease deadline expired without successful renewal"
+                    )
+                    with self._state_lock:
+                        self._lost_threads[tid] = True
+                    break
+
                 try:
                     success = self._atomic_extend(owner_token, ttl_ms)
                 except Exception as ex:
@@ -327,6 +347,13 @@ class RedisDistributedLock(InferenceLockSeam):
                     logger.warning(
                         f"Transient heartbeat renewal error for {self.lock_name}: {ex}; will retry"
                     )
+                    if time.monotonic() >= deadline:
+                        logger.error(
+                            f"Redis lock {self.lock_name} lease expired during renewal errors"
+                        )
+                        with self._state_lock:
+                            self._lost_threads[tid] = True
+                        break
                     continue
 
                 if not success:
@@ -336,6 +363,10 @@ class RedisDistributedLock(InferenceLockSeam):
                     with self._state_lock:
                         self._lost_threads[tid] = True
                     break
+
+                # Renewal succeeded: advance lease deadline
+                with self._state_lock:
+                    self._lease_deadlines[tid] = time.monotonic() + self.lease_ttl
 
         hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
         with self._state_lock:
@@ -348,6 +379,7 @@ class RedisDistributedLock(InferenceLockSeam):
         with self._state_lock:
             pair = self._heartbeat_threads.pop(tid, None)
             self._lost_threads.pop(tid, None)
+            self._lease_deadlines.pop(tid, None)
         if pair:
             _, stop_event = pair
             stop_event.set()

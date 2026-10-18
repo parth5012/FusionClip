@@ -234,6 +234,31 @@ def test_heartbeat_ownership_loss_detection():
     lock.release()
 
 
+def test_heartbeat_lease_deadline_expiry_on_persistent_network_error():
+    fake_client = fakeredis.FakeStrictRedis()
+    lock = RedisDistributedLock(
+        redis_client=fake_client,
+        device=0,
+        lease_ttl=0.3,
+        heartbeat_interval=0.08,
+    )
+    assert lock.acquire() is True
+    assert lock.is_owner()
+
+    # Simulate persistent Redis connection failure on renewal
+    def failing_extend(*args, **kwargs):
+        raise ConnectionError("Redis connection dropped")
+
+    lock._atomic_extend = failing_extend
+
+    # Wait beyond lease TTL (0.3s)
+    time.sleep(0.45)
+
+    # is_owner must return False because lease deadline expired without renewal
+    assert lock.is_owner() is False
+    lock.release()
+
+
 def test_get_inference_lock_env_selection(monkeypatch):
     monkeypatch.setenv("INFERENCE_LOCK_BACKEND", "memory")
     lock = get_inference_lock(device=0)
