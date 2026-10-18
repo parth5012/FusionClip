@@ -322,3 +322,103 @@ def test_get_inference_lock_env_selection(monkeypatch):
     with pytest.raises(Exception):
         get_inference_lock(device=0)
 
+
+def test_in_memory_lock_nested_reentrancy_depth():
+    lock = InMemoryLockAdapter(device=0)
+    assert lock.acquire() is True
+    assert lock.acquire() is True
+    assert lock.acquire() is True
+    assert lock._reentrancy == 3
+    assert lock.is_owner()
+
+    lock.release()
+    assert lock._reentrancy == 2
+    assert lock.is_owner()
+    assert lock.locked()
+
+    lock.release()
+    assert lock._reentrancy == 1
+    assert lock.is_owner()
+    assert lock.locked()
+
+    lock.release()
+    assert lock._reentrancy == 0
+    assert not lock.is_owner()
+    assert not lock.locked()
+
+
+def test_atomic_extend_watch_error_handling():
+    import redis
+    fake_client = fakeredis.FakeStrictRedis()
+    lock = RedisDistributedLock(redis_client=fake_client, device=0)
+
+    # Disable Lua to force pipeline fallback
+    lock._lua_extend = None
+
+    class PipelineWithWatchError:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+        def watch(self, *args):
+            pass
+
+        def get(self, *args):
+            return lock._get_owner_token()
+
+        def multi(self):
+            pass
+
+        def pexpire(self, *args):
+            pass
+
+        def execute(self):
+            raise redis.WatchError("Simulated concurrent key change")
+
+        def unwatch(self):
+            pass
+
+    fake_client.pipeline = PipelineWithWatchError
+
+    # _atomic_extend should catch WatchError and return False (ownership lost / CAS fail)
+    res = lock._atomic_extend(lock._get_owner_token(), 1000)
+    assert res is False
+
+
+def test_heartbeat_transient_error_backoff_recovery():
+    fake_client = fakeredis.FakeStrictRedis()
+    lock = RedisDistributedLock(
+        redis_client=fake_client,
+        device=0,
+        lease_ttl=1.0,
+        heartbeat_interval=0.2,
+    )
+    assert lock.acquire() is True
+    assert lock.is_owner()
+
+    original_extend = lock._atomic_extend
+    call_count = 0
+
+    def flaky_extend(owner_token, ttl_ms):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ConnectionError("Temporary connection glitch")
+        return original_extend(owner_token, ttl_ms)
+
+    lock._atomic_extend = flaky_extend
+
+    # First attempt at ~0.2s fails with glitch, backoff retries within ~0.2s
+    time.sleep(0.55)
+
+    # Lock must still be owned because short backoff successfully retried
+    assert call_count >= 2
+    assert lock.is_owner() is True
+    lock.release()
+
+

@@ -20,6 +20,12 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    import redis
+    _WATCH_ERROR: tuple[type[Exception], ...] = (redis.WatchError,)
+except ImportError:
+    _WATCH_ERROR = ()
+
 # Channel for cross-worker VRAM eviction broadcast
 EVICTION_CHANNEL = "ml:gpu:evict"
 
@@ -97,11 +103,6 @@ class InMemoryLockAdapter(InferenceLockSeam):
 
     def acquire(self, blocking: bool = True, timeout: Optional[float] = None) -> bool:
         current_thread = threading.get_ident()
-        with self._state_lock:
-            if self._owner_thread == current_thread:
-                self._reentrancy += 1
-                return True
-
         if blocking:
             if timeout is not None and timeout >= 0:
                 acquired = self._lock.acquire(blocking=True, timeout=timeout)
@@ -113,7 +114,7 @@ class InMemoryLockAdapter(InferenceLockSeam):
         if acquired:
             with self._state_lock:
                 self._owner_thread = current_thread
-                self._reentrancy = 1
+                self._reentrancy += 1
         return acquired
 
     def release(self) -> None:
@@ -124,7 +125,7 @@ class InMemoryLockAdapter(InferenceLockSeam):
             self._reentrancy -= 1
             if self._reentrancy == 0:
                 self._owner_thread = None
-                self._lock.release()
+        self._lock.release()
 
     def locked(self) -> bool:
         with self._state_lock:
@@ -282,17 +283,23 @@ class RedisDistributedLock(InferenceLockSeam):
                 # If Redis script error occurs or connection failed, fallback or re-raise
                 logger.debug(f"Lua extend error for {self.lock_name}: {e}")
 
-        with self.redis_client.pipeline() as pipe:
-            pipe.watch(self.lock_name)
-            val = pipe.get(self.lock_name)
-            if isinstance(val, bytes):
-                val = val.decode("utf-8")
-            if val == owner_token:
-                pipe.multi()
-                pipe.pexpire(self.lock_name, ttl_ms)
-                pipe.execute()
-                return True
-            pipe.unwatch()
+        try:
+            with self.redis_client.pipeline() as pipe:
+                pipe.watch(self.lock_name)
+                val = pipe.get(self.lock_name)
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8")
+                if val == owner_token:
+                    pipe.multi()
+                    pipe.pexpire(self.lock_name, ttl_ms)
+                    pipe.execute()
+                    return True
+                pipe.unwatch()
+                return False
+        except _WATCH_ERROR:
+            logger.warning(
+                f"Redis lock {self.lock_name} CAS WatchError during heartbeat extend; ownership lost"
+            )
             return False
 
     def release(self) -> None:
@@ -337,7 +344,8 @@ class RedisDistributedLock(InferenceLockSeam):
         ttl_ms = int(self.lease_ttl * 1000)
 
         def _heartbeat_worker() -> None:
-            while not stop_event.wait(timeout=self.heartbeat_interval):
+            next_interval = self.heartbeat_interval
+            while not stop_event.wait(timeout=next_interval):
                 now = time.monotonic()
                 with self._state_lock:
                     deadline = self._lease_deadlines.get(tid, 0.0)
@@ -359,13 +367,16 @@ class RedisDistributedLock(InferenceLockSeam):
                     logger.warning(
                         f"Transient heartbeat renewal error for {self.lock_name}: {ex}; will retry"
                     )
-                    if time.monotonic() >= deadline:
+                    now = time.monotonic()
+                    if now >= deadline:
                         logger.error(
                             f"Redis lock {self.lock_name} lease expired during renewal errors"
                         )
                         with self._state_lock:
                             self._lost_threads[tid] = True
                         break
+                    # Backoff briefly before retrying rather than waiting the full heartbeat interval
+                    next_interval = min(1.0, max(0.05, (deadline - now) / 4.0))
                     continue
 
                 if not success:
@@ -388,6 +399,7 @@ class RedisDistributedLock(InferenceLockSeam):
 
                 with self._state_lock:
                     self._lease_deadlines[tid] = new_deadline
+                next_interval = self.heartbeat_interval
 
         hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
         with self._state_lock:
